@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Bike Routing — Graz → Copenhagen</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="layout">
+    <aside id="sidebar">
+      <header>
+        <h1>Bike Routing</h1>
+        <p class="subtitle">Graz → Copenhagen tour planner</p>
+      </header>
+
+      <section id="instructions">
+        <p><strong>Click the map</strong> to set <span class="pin start">start</span> and <span class="pin end">end</span>. Click a third time to reset.</p>
+      </section>
+
+      <section id="controls">
+        <div class="row">
+          <label>Profile
+            <select id="profile">
+              <option value="lht" selected>lht (Long Haul Trucker)</option>
+              <option value="trekking">trekking</option>
+              <option value="trekking-noferries">trekking-noferries</option>
+              <option value="gravel">gravel</option>
+              <option value="fastbike-lowtraffic">fastbike-lowtraffic</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <label>Alts
+            <input type="number" id="alternatives" min="0" max="3" value="2" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="rerank" checked />
+            re-rank
+          </label>
+        </div>
+        <div class="row">
+          <button id="route-btn" disabled>Route</button>
+          <button id="stages-btn" disabled>Stages (~100 km)</button>
+          <button id="clear-btn">Clear</button>
+        </div>
+      </section>
+
+      <section id="layers">
+        <h2>POI overlays</h2>
+        <label class="checkbox"><input type="checkbox" data-cat="viewpoint" checked />Viewpoints</label>
+        <label class="checkbox"><input type="checkbox" data-cat="lodging" />Lodging</label>
+        <label class="checkbox"><input type="checkbox" data-cat="food" />Food</label>
+        <label class="checkbox"><input type="checkbox" data-cat="bike_service" />Bike service</label>
+        <label class="checkbox"><input type="checkbox" data-cat="water" />Drinking water</label>
+        <p class="hint">POIs load while you pan / zoom (max 500 in view).</p>
+      </section>
+
+      <section id="results"></section>
+
+      <footer>
+        <p class="hint">api at <code>/api/</code> · BRouter via <code>/api/route</code></p>
+      </footer>
+    </aside>
+
+    <main>
+      <div id="map"></div>
+      <div id="elevation"></div>
+    </main>
+  </div>
+
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

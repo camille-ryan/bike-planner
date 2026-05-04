@@ -1,0 +1,114 @@
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+  color: #1a1a1a;
+  background: #fafaf8;
+}
+
+#layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  height: 100vh;
+}
+
+aside#sidebar {
+  background: #fafaf8;
+  border-right: 1px solid #ddd;
+  overflow-y: auto;
+  padding: 1rem 1.1rem;
+}
+
+aside#sidebar h1 {
+  font-size: 1.1rem;
+  margin: 0 0 0.1rem;
+}
+.subtitle { color: #666; margin: 0 0 1rem; font-size: 0.9rem; }
+
+aside section { margin-bottom: 1rem; }
+aside h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: #555; margin: 0 0 0.4rem; }
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.45rem;
+}
+.row label { display: flex; flex-direction: column; flex: 1; font-size: 0.8rem; color: #555; gap: 0.15rem; }
+.row label.checkbox { flex-direction: row; align-items: center; gap: 0.3rem; }
+
+select, input[type="number"] {
+  font: inherit; padding: 0.25rem 0.4rem;
+  border: 1px solid #bbb; border-radius: 3px; background: white;
+}
+
+.checkbox { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; }
+.checkbox input { margin: 0; }
+
+button {
+  font: inherit; padding: 0.35rem 0.75rem;
+  border: 1px solid #555; border-radius: 3px;
+  background: white; cursor: pointer; flex: 1;
+}
+button:hover:not(:disabled) { background: #efefef; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button#route-btn { background: #2c5; border-color: #2c5; color: white; }
+button#route-btn:hover:not(:disabled) { background: #2a4; }
+
+.pin {
+  display: inline-block; padding: 0 0.3rem; border-radius: 2px; font-weight: bold;
+  color: white;
+}
+.pin.start { background: #2c5; }
+.pin.end   { background: #c52; }
+
+.hint { color: #888; font-size: 0.78rem; margin: 0.3rem 0 0; }
+
+main {
+  display: grid;
+  grid-template-rows: 1fr 140px;
+  height: 100vh;
+}
+
+#map { width: 100%; height: 100%; }
+#elevation {
+  border-top: 1px solid #ddd;
+  background: white;
+  position: relative;
+}
+
+#results {
+  border-top: 1px solid #eee;
+  padding-top: 0.6rem;
+}
+.route-card {
+  padding: 0.4rem 0.5rem;
+  margin-bottom: 0.4rem;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  background: white;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.route-card:hover { border-color: #888; }
+.route-card.active { border-color: #2c5; background: #f3faf3; }
+.route-card .stat { display: flex; justify-content: space-between; color: #555; font-size: 0.78rem; }
+.route-card .name { font-weight: 600; margin-bottom: 0.15rem; }
+
+.leg-card {
+  padding: 0.4rem 0.5rem;
+  margin-bottom: 0.4rem;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  background: white;
+  font-size: 0.82rem;
+}
+.leg-card .leg-num { font-weight: 600; }
+.leg-card .lodging { font-size: 0.78rem; color: #444; margin-top: 0.2rem; }
+.leg-card .lodging-item { display: block; }
+
+footer { color: #888; font-size: 0.75rem; }
+footer code { background: #efefef; padding: 0 0.2rem; border-radius: 2px; }

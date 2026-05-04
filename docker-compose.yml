@@ -44,8 +44,11 @@ services:
       - brouter
     restart: unless-stopped
 
-  # === Phase 4: Web UI ===
-  # web:
-  #   build: ./web
-  #   ports: ["8080:80"]
-  #   depends_on: [api]
+  web:
+    build: ./web
+    container_name: bike-web
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped

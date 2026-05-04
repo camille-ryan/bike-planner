@@ -9,7 +9,7 @@ A self-supported bike-tour planner for the Graz → Copenhagen corridor. OpenStr
 | ingest   | Python + osmium + SpatiaLite   | ✅ Phase 1    |
 | brouter  | OpenJDK + abrensch/brouter 1.7.9 | ✅ Phase 2  |
 | api      | Python + FastAPI + httpx + SpatiaLite | ✅ Phase 3 |
-| web      | MapLibre + nginx               | (Phase 4)     |
+| web      | nginx + MapLibre GL JS         | ✅ Phase 4    |
 
 The corridor data comes from:
 - **Geofabrik** country PBFs (Austria, Czech Republic, Germany, Denmark) for POI extraction.
@@ -270,9 +270,102 @@ The composite score weights live in [`api/app/scoring.py`](api/app/scoring.py) a
 
 ---
 
-## Roadmap
+## Phase 4 — MapLibre web UI ✅
 
-- **Phase 4:** MapLibre web UI for click-to-route, POI overlays, elevation profile, and stage markers.
+A static single-page app that drives the API. nginx serves the page on port `8080` and reverse-proxies `/api/*` to the FastAPI container — so the browser only ever talks to one origin (no CORS gymnastics).
+
+### Bring the whole stack up
+
+```sh
+# Build everything (first time only — ~3 minutes)
+docker compose build
+
+# Bring up brouter + api + web
+docker compose up -d
+
+# Watch logs
+docker compose logs -f
+```
+
+Then open **`http://desktop-nk6flc3.tail9115a7.ts.net:8080`** from your laptop.
+
+### How to use the UI
+
+1. **Click the map** to drop a green start pin.
+2. **Click again** to drop a red end pin.
+3. Pick a profile + number of alternatives + whether to re-rank.
+4. **`Route`** → routes drawn on map; sidebar lists each alternative with distance, climb, time, and (if re-rank is on) the scoring breakdown. Click an alternative card to make it the active route.
+5. **`Stages (~100 km)`** → splits the route into daily legs and drops a numbered marker at each leg-end with up to 5 lodging options nearby.
+6. **POI overlays** — toggle viewpoints / lodging / food / bike services / drinking water. POIs auto-load while you pan and zoom (only at zoom ≥ 9; capped at 500 markers per fetch).
+7. The strip at the bottom is an **elevation profile** of the active route (BRouter's per-coordinate SRTM elevation).
+8. **`Clear`** wipes pins, route, legs, and POI selections.
+
+### Going up / down independently
+
+```sh
+docker compose up -d brouter         # routing only
+docker compose up -d api             # API + brouter (compose pulls in deps)
+docker compose up -d web             # whole stack
+docker compose down                  # stop everything
+docker compose down -v               # plus drop named volumes (no data here, but)
+docker compose restart api           # reload API after editing code
+```
+
+The `api/app/` directory is **not** bind-mounted; editing scoring weights or endpoints requires `docker compose up -d --build api`. The BRouter `lht.brf` profile **is** bind-mounted — edits to `brouter/profiles/lht.brf` apply on the next routing request, no restart.
+
+---
+
+## Project layout
+
+```
+bike/
+├── docker-compose.yml
+├── .gitignore
+├── README.md
+├── ingest/                   # Phase 1 — data pipeline (one-shot)
+│   └── ...
+├── brouter/                  # Phase 2 — routing engine
+│   ├── Dockerfile
+│   └── profiles/
+│       └── lht.brf
+├── api/                      # Phase 3 — FastAPI service
+│   └── ...
+├── web/                      # Phase 4 — static SPA
+│   ├── Dockerfile
+│   ├── nginx.conf
+│   └── public/
+│       ├── index.html
+│       ├── app.js
+│       └── style.css
+└── data/                     # populated by ingest (gitignored)
+    ├── osm/         *.osm.pbf
+    ├── brouter/     *.rd5
+    └── pois/        *.osm.pbf, pois.sqlite
+```
+
+---
+
+## Quick reference: end-to-end test from a fresh clone
+
+```sh
+# 1) Make sure your user can talk to Docker.
+sudo usermod -aG docker $USER
+# (log out + back in OR open a new shell session)
+
+# 2) Smoke-test ingest with a single country (~700 MB download).
+docker compose run --rm ingest --test
+
+# 3) Build + start the routing/api/web stack.
+docker compose up -d --build
+
+# 4) Verify each layer.
+curl -fsS http://localhost:17777/brouter?lonlats=15.43,47.07'|'16.37,48.21'&'profile=lht'&'format=geojson | head -c 200
+curl -fsS http://localhost:8000/health
+curl -fsS 'http://localhost:8000/route?from=15.43,47.07&to=16.37,48.21&profile=lht'
+open http://localhost:8080   # or visit it from your laptop via Tailscale
+```
+
+For the full corridor (Graz → Copenhagen end-to-end), rerun `docker compose run --rm ingest` (no `--test`) — that downloads all 4 country PBFs and 9 BRouter tiles, ~7 GB.
 
 ## Remote access
 
@@ -281,5 +374,5 @@ This stack is designed to run on `desktop-nk6flc3.tail9115a7.ts.net` (over Tails
 | Port  | Service       |
 |-------|---------------|
 | 17777 | BRouter       |
-| 8000  | FastAPI (Phase 3) |
-| 8080  | Web UI (Phase 4)  |
+| 8000  | FastAPI       |
+| 8080  | Web UI        |
