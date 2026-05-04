@@ -1,24 +1,33 @@
 # Bike routing stack — Graz → Copenhagen.
 #
-# Phase 1 (current): ingest pipeline only. Run with:
+# Phase 1 — ingest (one-shot data pipeline):
 #   docker compose run --rm ingest --test     # smoke test (~700 MB)
 #   docker compose run --rm ingest            # full corridor (~7 GB)
 #
-# Later phases (commented below) add the BRouter server, FastAPI, and web UI.
+# Phase 2 — routing engine:
+#   docker compose up -d brouter              # start BRouter on :17777
+#   curl 'http://localhost:17777/brouter?lonlats=15.43,47.07|16.37,48.21&profile=lht&alternativeidx=0&format=geojson'
+#
+# Phases 3 (api) and 4 (web) are added in their respective commits.
 
 services:
   ingest:
     build: ./ingest
     volumes:
       - ./data:/data
+    profiles: ["ingest"]   # only runs when explicitly requested
 
-  # === Phase 2: Routing engine ===
-  # brouter:
-  #   image: nrenner/brouter
-  #   ports: ["17777:17777"]
-  #   volumes:
-  #     - ./data/brouter:/segments4
-  #     - ./brouter/profiles:/profiles2
+  brouter:
+    build:
+      context: ./brouter
+    image: bike-brouter:1.7.9
+    container_name: bike-brouter
+    ports:
+      - "17777:17777"
+    volumes:
+      - ./data/brouter:/opt/brouter/segments4:ro
+      - ./brouter/profiles:/opt/brouter/customprofiles:ro
+    restart: unless-stopped
 
   # === Phase 3: API ===
   # api:
