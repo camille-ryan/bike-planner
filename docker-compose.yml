@@ -29,13 +29,20 @@ services:
       - ./brouter/profiles:/opt/brouter/customprofiles:ro
     restart: unless-stopped
 
-  # === Phase 3: API ===
-  # api:
-  #   build: ./api
-  #   ports: ["8000:8000"]
-  #   volumes:
-  #     - ./data:/data:ro
-  #   depends_on: [brouter]
+  api:
+    build: ./api
+    container_name: bike-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data:ro
+    environment:
+      - BROUTER_URL=http://brouter:17777
+      - DATA_DIR=/data
+      - DEFAULT_PROFILE=lht
+    depends_on:
+      - brouter
+    restart: unless-stopped
 
   # === Phase 4: Web UI ===
   # web:

@@ -8,7 +8,7 @@ A self-supported bike-tour planner for the Graz → Copenhagen corridor. OpenStr
 |----------|--------------------------------|---------------|
 | ingest   | Python + osmium + SpatiaLite   | ✅ Phase 1    |
 | brouter  | OpenJDK + abrensch/brouter 1.7.9 | ✅ Phase 2  |
-| api      | Python + FastAPI               | (Phase 3)     |
+| api      | Python + FastAPI + httpx + SpatiaLite | ✅ Phase 3 |
 | web      | MapLibre + nginx               | (Phase 4)     |
 
 The corridor data comes from:
@@ -154,16 +154,125 @@ bike/
 │   ├── Dockerfile            # OpenJDK + BRouter 1.7.9
 │   └── profiles/
 │       └── lht.brf           # custom Long Haul Trucker profile
+├── api/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── app/
+│       ├── main.py           # FastAPI endpoints
+│       ├── settings.py       # paths, BRouter URL, default profile
+│       ├── geo.py            # haversine + bearing math
+│       ├── brouter.py        # async HTTP client to BRouter
+│       ├── pois.py           # SpatiaLite POI lookups
+│       ├── scoring.py        # curvy-descent + scenic re-rank
+│       └── stages.py         # ~100 km leg splitter + lodging clusters
 └── data/                     # populated by ingest (gitignored)
     ├── osm/         *.osm.pbf
     ├── brouter/     *.rd5    # consumed by brouter container
     └── pois/        *.osm.pbf, pois.sqlite
 ```
 
+---
+
+## Phase 3 — FastAPI service ✅
+
+A small Python service that wraps BRouter and the SpatiaLite POI DB into a clean HTTP API. Adds the curvature×grade penalty and scenic re-rank that BRouter's DSL can't express directly.
+
+### Start the API (brings BRouter up too as a dependency)
+
+```sh
+docker compose up -d api
+docker compose logs -f api
+```
+
+Listens on port `8000`. From the laptop: `http://desktop-nk6flc3.tail9115a7.ts.net:8000`.
+
+### Endpoints
+
+#### `GET /health`
+
+```sh
+curl http://localhost:8000/health
+# {"status":"ok"}
+```
+
+#### `GET /route?from=lon,lat&to=lon,lat&profile=lht&alternatives=N&rerank=true`
+
+Proxies to BRouter and (optionally) re-ranks alternatives by composite score:
+`raw_cost + 5·curvy_descent_penalty − 50·viewpoints_near_route`.
+
+```sh
+# Single route Graz → Vienna
+curl 'http://localhost:8000/route?from=15.43,47.07&to=16.37,48.21&profile=lht'
+
+# Three alternatives, re-ranked for scenicness + curvy-descent avoidance
+curl 'http://localhost:8000/route?from=15.43,47.07&to=16.37,48.21&profile=lht&alternatives=3&rerank=true' \
+  | python3 -m json.tool
+```
+
+Each route in the response gets a `properties.scoring` block:
+```json
+{
+  "track_length_km": 197.4,
+  "ascend_m": 1240,
+  "raw_cost": 4321,
+  "curvy_descent_penalty": 87.3,
+  "viewpoints_near_route": 5,
+  "composite_score": 4506.5
+}
+```
+
+#### `GET /pois?bbox=minlon,minlat,maxlon,maxlat&category=lodging,food&limit=500`
+
+```sh
+# All viewpoints near Graz
+curl 'http://localhost:8000/pois?bbox=15.3,47.0,15.6,47.2&category=viewpoint&limit=200'
+```
+
+Categories: `viewpoint`, `lodging`, `food`, `bike_service`, `water`.
+
+#### `GET /stages?from=lon,lat&to=lon,lat&target_km=100&lodging_radius_m=3000`
+
+Splits a route into legs of about `target_km` each and returns nearby lodging POIs at every leg-end. Useful for daily-stage planning on a multi-day tour.
+
+```sh
+# Graz → Copenhagen, 100km daily stages
+curl 'http://localhost:8000/stages?from=15.43,47.07&to=12.57,55.68&target_km=100' \
+  | python3 -m json.tool
+```
+
+Returns:
+```json
+{
+  "from": [15.43, 47.07],
+  "to": [12.57, 55.68],
+  "profile": "lht",
+  "target_km": 100,
+  "total_legs": 13,
+  "total_length_m": 1287000,
+  "legs": [
+    {
+      "start": [15.43, 47.07],
+      "end":   [14.91, 47.55],
+      "length_m": 100123,
+      "ascend_m": 720,
+      "lodging": [
+        {"name": "Gasthaus ...", "category": "lodging", "subtype": "guest_house",
+         "lon": 14.92, "lat": 47.54, "distance_m": 850, ...}
+      ]
+    }
+  ]
+}
+```
+
+### Scoring weights
+
+The composite score weights live in [`api/app/scoring.py`](api/app/scoring.py) at the top of the file (`W_CURVY_DESCENT`, `W_VIEWPOINT_BONUS`, `VIEWPOINT_BUFFER_M`). They're first-pass guesses — calibrate against a few real Graz → Vienna runs to dial them in.
+
+---
+
 ## Roadmap
 
-- **Phase 3:** FastAPI service exposing `/route`, `/pois?bbox=`, `/stages?route_id=` with a Python re-rank pass for scenic scoring (POI proximity + protected-area containment + curvature×grade penalty on descents).
-- **Phase 4:** MapLibre web UI for click-to-route, POI overlays, elevation profile, and stage markers (~100 km legs).
+- **Phase 4:** MapLibre web UI for click-to-route, POI overlays, elevation profile, and stage markers.
 
 ## Remote access
 
