@@ -39,16 +39,34 @@ def health() -> dict:
 
 @app.get("/route")
 async def route(
-    from_: str = Query(..., alias="from", description="lon,lat"),
-    to: str = Query(..., description="lon,lat"),
+    from_: str | None = Query(None, alias="from", description="lon,lat"),
+    to: str | None = Query(None, description="lon,lat"),
+    lonlats: str | None = Query(
+        None,
+        description="lon,lat|lon,lat|... — a multi-waypoint route. "
+                    "Overrides from+to when set. Use this for long corridors "
+                    "(BRouter scales much better with intermediate via-points).",
+    ),
     profile: str = DEFAULT_PROFILE,
     alternatives: int = Query(0, ge=0, le=3),
     rerank: bool = Query(False, description="Compute scenic + curvature scoring and reorder"),
 ):
-    a = _parse_lonlat(from_, "from")
-    b = _parse_lonlat(to, "to")
+    if lonlats:
+        try:
+            points = []
+            for pair in lonlats.split("|"):
+                lon, lat = (float(x) for x in pair.split(","))
+                points.append((lon, lat))
+            if len(points) < 2:
+                raise ValueError("need at least two points")
+        except Exception as exc:
+            raise HTTPException(400, f"lonlats must be 'lon,lat|lon,lat|...': {exc}")
+    elif from_ and to:
+        points = [_parse_lonlat(from_, "from"), _parse_lonlat(to, "to")]
+    else:
+        raise HTTPException(400, "provide either lonlats=... or from=&to=")
     try:
-        routes = await brouter.fetch_alternatives([a, b], profile, alternatives)
+        routes = await brouter.fetch_alternatives(points, profile, alternatives)
     except RuntimeError as exc:
         raise HTTPException(502, f"BRouter: {exc}")
     if rerank and len(routes) > 1:

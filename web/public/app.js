@@ -30,13 +30,15 @@ map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "
 // --- state -------------------------------------------------------------
 
 const state = {
-  start: null,        // [lon, lat]
-  end: null,          // [lon, lat]
+  // 1st click = start, 2nd = end, every additional click inserts a via-point
+  // at whichever segment midpoint is closest to the click. Required for the
+  // long-corridor case where BRouter can't plan ~1300km point-to-point.
+  waypoints: [],      // [[lon, lat], ...]
   routes: [],         // GeoJSON Features from /route
   activeIdx: 0,
   legs: [],           // from /stages
   poiMarkers: { viewpoint: [], lodging: [], food: [], bike_service: [], water: [] },
-  endpointMarkers: [],
+  waypointMarkers: [],
 };
 
 // --- map sources / layers (initialized once map loads) -----------------
@@ -100,42 +102,62 @@ async function api(path, params) {
   return r.json();
 }
 
-// --- click to place start/end -----------------------------------------
+// --- click to place waypoints -----------------------------------------
 
 map.on("click", (e) => {
-  const lonlat = [e.lngLat.lng, e.lngLat.lat];
-  if (!state.start) {
-    state.start = lonlat;
-    addEndpointMarker(lonlat, "#2c5", "S");
-  } else if (!state.end) {
-    state.end = lonlat;
-    addEndpointMarker(lonlat, "#c52", "E");
-    document.getElementById("route-btn").disabled = false;
-    document.getElementById("stages-btn").disabled = false;
-  } else {
-    clearAll();
-  }
+  insertWaypoint([e.lngLat.lng, e.lngLat.lat]);
+  refreshWaypointMarkers();
+  const ready = state.waypoints.length >= 2;
+  document.getElementById("route-btn").disabled = !ready;
+  document.getElementById("stages-btn").disabled = !ready;
 });
 
-function addEndpointMarker(lonlat, color, label) {
-  const el = document.createElement("div");
-  el.style.cssText = `width:22px;height:22px;border-radius:50%;background:${color};color:white;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:13px;border:2px solid white;box-shadow:0 1px 3px rgba(0,0,0,0.3);`;
-  el.textContent = label;
-  const m = new maplibregl.Marker({ element: el }).setLngLat(lonlat).addTo(map);
-  state.endpointMarkers.push(m);
+// Insert by closest-segment-midpoint: a click between Prague and Berlin lands
+// in the right slot regardless of click order. First two clicks just append
+// (start, end); subsequent clicks pick the segment they're nearest to.
+function insertWaypoint(lonlat) {
+  if (state.waypoints.length < 2) {
+    state.waypoints.push(lonlat);
+    return;
+  }
+  let bestIdx = state.waypoints.length;  // default: append at end
+  let bestDist = Infinity;
+  for (let i = 0; i < state.waypoints.length - 1; i++) {
+    const a = state.waypoints[i], b = state.waypoints[i + 1];
+    const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    const d = haversine(lonlat, mid);
+    if (d < bestDist) { bestDist = d; bestIdx = i + 1; }
+  }
+  state.waypoints.splice(bestIdx, 0, lonlat);
+}
+
+function refreshWaypointMarkers() {
+  state.waypointMarkers.forEach(m => m.remove());
+  state.waypointMarkers = [];
+  state.waypoints.forEach((p, i) => {
+    const isStart = i === 0;
+    const isEnd = i === state.waypoints.length - 1;
+    const color = isStart ? "#2c5" : (isEnd ? "#c52" : "#888");
+    const label = isStart ? "S" : (isEnd ? "E" : String(i));
+    const el = document.createElement("div");
+    el.style.cssText = `width:22px;height:22px;border-radius:50%;background:${color};color:white;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:13px;border:2px solid white;box-shadow:0 1px 3px rgba(0,0,0,0.3);cursor:grab;`;
+    el.textContent = label;
+    const m = new maplibregl.Marker({ element: el, draggable: false }).setLngLat(p).addTo(map);
+    state.waypointMarkers.push(m);
+  });
 }
 
 document.getElementById("clear-btn").addEventListener("click", clearAll);
 
 function clearAll() {
-  state.start = state.end = null;
+  state.waypoints = [];
   state.routes = [];
   state.legs = [];
   state.activeIdx = 0;
   document.getElementById("route-btn").disabled = true;
   document.getElementById("stages-btn").disabled = true;
-  state.endpointMarkers.forEach(m => m.remove());
-  state.endpointMarkers = [];
+  state.waypointMarkers.forEach(m => m.remove());
+  state.waypointMarkers = [];
   if (map.getSource("route-active")) map.getSource("route-active").setData(emptyFC());
   if (map.getSource("route-alts"))   map.getSource("route-alts").setData(emptyFC());
   if (map.getSource("legs"))         map.getSource("legs").setData(emptyFC());
@@ -146,17 +168,14 @@ function clearAll() {
 // --- route ------------------------------------------------------------
 
 document.getElementById("route-btn").addEventListener("click", async () => {
-  if (!state.start || !state.end) return;
+  if (state.waypoints.length < 2) return;
   const profile = document.getElementById("profile").value;
   const alternatives = +document.getElementById("alternatives").value;
   const rerank = document.getElementById("rerank").checked;
-  setBusy("Routing…");
+  const lonlats = state.waypoints.map(p => p.join(",")).join("|");
+  setBusy(`Routing ${state.waypoints.length} waypoints…`);
   try {
-    const r = await api("/route", {
-      from: state.start.join(","),
-      to:   state.end.join(","),
-      profile, alternatives, rerank,
-    });
+    const r = await api("/route", { lonlats, profile, alternatives, rerank });
     state.routes = r.routes;
     state.activeIdx = 0;
     renderRoutes();
@@ -271,13 +290,16 @@ function haversine(p1, p2) {
 // --- stages ------------------------------------------------------------
 
 document.getElementById("stages-btn").addEventListener("click", async () => {
-  if (!state.start || !state.end) return;
+  if (state.waypoints.length < 2) return;
+  // Stages currently splits a single from→to route. With multiple waypoints
+  // we treat the first and last as the corridor endpoints; if you want
+  // stages tied to your via-points, wait for that feature in a later version.
   const profile = document.getElementById("profile").value;
   setBusy("Planning stages…");
   try {
     const r = await api("/stages", {
-      from: state.start.join(","),
-      to:   state.end.join(","),
+      from: state.waypoints[0].join(","),
+      to:   state.waypoints[state.waypoints.length - 1].join(","),
       profile,
       target_km: 100,
       lodging_radius_m: 3000,
