@@ -35,6 +35,23 @@ SELECT DisableSpatialIndex('pois', 'geom');  -- harmless if not present; clears 
 SELECT AddGeometryColumn('pois', 'geom', 4326, 'POINT', 'XY');
 """
 
+# Routing anchors — `place=city|town` nodes used by the API's auto-waypoint
+# pass to break long routes into legs BRouter can handle in reasonable time.
+# Stored in the same DB so a single SpatiaLite connection can serve both.
+ANCHOR_SCHEMA = """
+DROP TABLE IF EXISTS anchors;
+CREATE TABLE anchors (
+    id          INTEGER PRIMARY KEY,
+    osm_id      TEXT,
+    name        TEXT,
+    place       TEXT,    -- 'city' or 'town'
+    population  INTEGER, -- nullable; OSM coverage is patchy
+    country     TEXT
+);
+SELECT DisableSpatialIndex('anchors', 'geom');
+SELECT AddGeometryColumn('anchors', 'geom', 4326, 'POINT', 'XY');
+"""
+
 
 def categorize(props: dict) -> tuple[str, str] | None:
     tourism = props.get("tourism")
@@ -118,20 +135,56 @@ def load_country(conn: sqlite3.Connection, country: str, pois_pbf: Path) -> dict
     return counts
 
 
+def load_anchors(conn: sqlite3.Connection, country: str, anchors_pbf: Path) -> int:
+    """Insert place=city|town nodes from a country anchors PBF."""
+    cur = conn.cursor()
+    n = 0
+    for feat in export_geojsonseq(anchors_pbf):
+        props = feat.get("properties") or {}
+        place = props.get("place")
+        if place not in ("city", "town"):
+            continue
+        pt = feature_point(feat)
+        if not pt:
+            continue
+        lon, lat = pt
+        try:
+            pop = int(props["population"]) if props.get("population") else None
+        except (TypeError, ValueError):
+            pop = None
+        cur.execute(
+            "INSERT INTO anchors (osm_id, name, place, population, country, geom)"
+            " VALUES (?,?,?,?,?, MakePoint(?,?,4326))",
+            (str(props.get("@id") or feat.get("id") or ""),
+             props.get("name"), place, pop, country, lon, lat),
+        )
+        n += 1
+    conn.commit()
+    return n
+
+
 def run(extracts: list[dict]) -> dict:
     conn = open_db()
     conn.executescript(POI_SCHEMA)
+    conn.executescript(ANCHOR_SCHEMA)
     totals: dict[str, int] = {}
+    anchor_total = 0
     for ex in extracts:
         cs = load_country(conn, ex["country"], ex["pois"])
         for k, v in cs.items():
             totals[k] = totals.get(k, 0) + v
-        print(f"[db] {ex['country']}: {cs}")
-    # Build the R-Tree from fully-loaded data. CreateSpatialIndex on a
+        print(f"[db] {ex['country']} pois: {cs}")
+        if ex.get("anchors"):
+            n = load_anchors(conn, ex["country"], ex["anchors"])
+            anchor_total += n
+            print(f"[db] {ex['country']} anchors: {n}")
+    # Build the R-Trees from fully-loaded data. CreateSpatialIndex on a
     # populated table is fast and produces a complete index; doing it before
     # inserts left the R-Tree empty in this setup.
-    print("[db] building spatial index...", flush=True)
+    print("[db] building spatial indexes...", flush=True)
     conn.execute("SELECT CreateSpatialIndex('pois', 'geom')")
+    conn.execute("SELECT CreateSpatialIndex('anchors', 'geom')")
     conn.commit()
     conn.close()
+    totals["_anchors"] = anchor_total
     return totals

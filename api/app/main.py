@@ -9,7 +9,7 @@ Endpoints:
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import brouter, pois, scoring, stages
+from . import anchors, brouter, leg_cache, pois, scoring, stages
 from .settings import DEFAULT_PROFILE
 
 app = FastAPI(title="Bike Routing API", version="0.1.0")
@@ -19,7 +19,7 @@ app = FastAPI(title="Bike Routing API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -50,6 +50,12 @@ async def route(
     profile: str = DEFAULT_PROFILE,
     alternatives: int = Query(0, ge=0, le=3),
     rerank: bool = Query(False, description="Compute scenic + curvature scoring and reorder"),
+    auto_waypoint: bool = Query(
+        True,
+        description="For long 2-point routes, insert place=city|town waypoints "
+                    "along the corridor to keep BRouter's per-leg search bounded. "
+                    "Set false to force the engine to plan end-to-end.",
+    ),
 ):
     if lonlats:
         try:
@@ -65,8 +71,29 @@ async def route(
         points = [_parse_lonlat(from_, "from"), _parse_lonlat(to, "to")]
     else:
         raise HTTPException(400, "provide either lonlats=... or from=&to=")
+    # Auto-waypoint only when caller gave us exactly two points; multi-waypoint
+    # callers have already expressed an opinion about the corridor and we
+    # shouldn't second-guess it.
+    inserted_anchors: list[dict] = []
+    if auto_waypoint and len(points) == 2:
+        picks = anchors.auto_waypoints(points[0], points[1])
+        if picks:
+            points = [points[0]] + [(lon, lat) for lon, lat, _ in picks] + [points[1]]
+            inserted_anchors = [
+                {"lon": lon, "lat": lat, "name": name} for lon, lat, name in picks
+            ]
     try:
-        routes = await brouter.fetch_alternatives(points, profile, alternatives)
+        # Primary route: cached per-leg. Alternatives (if any): full BRouter
+        # call end-to-end uncached, since alt-idx>0 only makes sense over the
+        # whole search and wouldn't compose across cached legs.
+        primary = await brouter.fetch_split_route(points, profile)
+        routes = [primary]
+        if alternatives > 0:
+            for idx in range(1, alternatives + 1):
+                try:
+                    routes.append(await brouter.fetch_route(points, profile, idx))
+                except RuntimeError:
+                    break
     except RuntimeError as exc:
         raise HTTPException(502, f"BRouter: {exc}")
     if rerank and len(routes) > 1:
@@ -78,8 +105,20 @@ async def route(
         "profile": profile,
         "rerank": rerank,
         "count": len(routes),
+        "auto_waypoints": inserted_anchors,
         "routes": routes,
     }
+
+
+@app.get("/cache/stats")
+def cache_stats() -> dict:
+    return leg_cache.stats()
+
+
+@app.post("/cache/clear")
+def cache_clear(profile: str | None = Query(None)) -> dict:
+    deleted = leg_cache.clear(profile)
+    return {"deleted": deleted, "profile": profile}
 
 
 @app.get("/pois")

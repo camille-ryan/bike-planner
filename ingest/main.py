@@ -22,6 +22,16 @@ def summarize(db_path: Path) -> None:
     print(f"  total POIs: {total}")
     for cat, n in sorted(rows):
         print(f"    {cat:14s} {n:>7d}")
+    try:
+        anchor_rows = conn.execute(
+            "SELECT place, COUNT(*) FROM anchors GROUP BY place"
+        ).fetchall()
+        if anchor_rows:
+            print(f"  routing anchors:")
+            for place, n in sorted(anchor_rows):
+                print(f"    {place:14s} {n:>7d}")
+    except sqlite3.OperationalError:
+        pass  # older DB without anchors table
     conn.close()
 
 

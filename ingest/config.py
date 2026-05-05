@@ -35,3 +35,9 @@ PROTECTED_AREA_FILTERS = [
 ]
 # Cycle networks: tagged route relations.
 BIKE_ROUTE_FILTERS = ["r/route=bicycle"]
+
+# Routing anchors — `place=city|town` populated places used as auto-waypoints
+# for long routes. Filtering on the `place` tag (rather than a population
+# threshold) avoids dropping towns whose `population=*` tag is missing,
+# which is common in OSM. Yields ~hundreds–low-thousands per country.
+ANCHOR_FILTERS = ["n/place=city,town"]

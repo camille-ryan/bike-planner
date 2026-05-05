@@ -2,7 +2,7 @@
 import subprocess
 from pathlib import Path
 
-from config import POI_FILTERS, PROTECTED_AREA_FILTERS, BIKE_ROUTE_FILTERS, DATA_DIR
+from config import POI_FILTERS, PROTECTED_AREA_FILTERS, BIKE_ROUTE_FILTERS, ANCHOR_FILTERS, DATA_DIR
 
 
 def filter_pbf(input_pbf: Path, output_pbf: Path, filters: list[str]) -> Path:
@@ -24,5 +24,6 @@ def run(country_pbfs: list[Path]) -> list[dict]:
             "pois":      filter_pbf(pbf, out_dir / f"{name}-pois.osm.pbf",      POI_FILTERS),
             "protected": filter_pbf(pbf, out_dir / f"{name}-protected.osm.pbf", PROTECTED_AREA_FILTERS),
             "routes":    filter_pbf(pbf, out_dir / f"{name}-routes.osm.pbf",    BIKE_ROUTE_FILTERS),
+            "anchors":   filter_pbf(pbf, out_dir / f"{name}-anchors.osm.pbf",   ANCHOR_FILTERS),
         })
     return results
