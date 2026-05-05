@@ -13,6 +13,12 @@ from config import DATA_DIR
 
 DB_PATH = DATA_DIR / "pois" / "pois.sqlite"
 
+# Schema is created in two phases: table + geometry column up front, and the
+# R-Tree spatial index *after* bulk insert. Calling CreateSpatialIndex before
+# data exists left the R-Tree empty in practice — the SpatiaLite triggers that
+# are supposed to keep it in sync did not populate it during executemany loads
+# in this stack. Building the index post-load is also faster (no per-row
+# trigger overhead) and gives a fresh, complete R-Tree.
 POI_SCHEMA = """
 DROP TABLE IF EXISTS pois;
 CREATE TABLE pois (
@@ -25,8 +31,8 @@ CREATE TABLE pois (
     country   TEXT,
     tags      TEXT
 );
+SELECT DisableSpatialIndex('pois', 'geom');  -- harmless if not present; clears stale RTree from prior runs
 SELECT AddGeometryColumn('pois', 'geom', 4326, 'POINT', 'XY');
-SELECT CreateSpatialIndex('pois', 'geom');
 """
 
 
@@ -121,5 +127,11 @@ def run(extracts: list[dict]) -> dict:
         for k, v in cs.items():
             totals[k] = totals.get(k, 0) + v
         print(f"[db] {ex['country']}: {cs}")
+    # Build the R-Tree from fully-loaded data. CreateSpatialIndex on a
+    # populated table is fast and produces a complete index; doing it before
+    # inserts left the R-Tree empty in this setup.
+    print("[db] building spatial index...", flush=True)
+    conn.execute("SELECT CreateSpatialIndex('pois', 'geom')")
+    conn.commit()
     conn.close()
     return totals

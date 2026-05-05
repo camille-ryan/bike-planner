@@ -112,6 +112,17 @@ Useful URL params:
 | `alternativeidx` | `0`–`3`                     | get up to four ranked alternative routes                  |
 | `format`         | `geojson` / `gpx` / `kml`   | response format                                            |
 
+### Long routes need via-points
+
+BRouter's search is roughly exponential in straight-line distance. Point-to-point routes longer than ~600 km tend to exceed the 1800 s `maxRunningTime` cap (and even with more time, hold the JVM in heavy memory). The corridor target is ~1300 km Graz → Copenhagen — to plan that end-to-end, pass intermediate via-points:
+
+```sh
+# Single shot: Graz → Prague → Berlin → Copenhagen
+curl -fsS 'http://localhost:17777/brouter?lonlats=15.43,47.07|14.42,50.08|13.40,52.52|12.57,55.68&profile=lht&format=geojson'
+```
+
+Two or three via-points across the corridor lets BRouter plan each segment in tens of seconds instead of timing out. The web UI takes any number of clicks: 1st = start, 2nd = end, every subsequent click inserts an intermediate via-point between them. Each leg is solved by BRouter and the results are stitched into one continuous polyline.
+
 ### Compare profiles
 
 The Dockerfile bundles BRouter's standard profiles too — `trekking`, `trekking-noferries`, `gravel`, `fastbike-lowtraffic`. Swap `profile=lht` for any of those to see how routing changes.

@@ -24,7 +24,10 @@ RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
 # RouteServer args: <segments-dir> <profiles-dir> <customprofiles-dir> <port> <max-threads>
-# Classpath includes lib/* in case the -all jar is not actually a fat jar in this release.
-CMD ["java", "-Xmx512M", "-Xms64M", "-DmaxRunningTime=300", \
+# Heap + maxRunningTime are bumped well past the upstream defaults (512M / 300s)
+# because the corridor here can plan multi-hundred-km legs across 9 segment
+# tiles. Long routes (>~600 km point-to-point) should still use intermediate
+# via-points in the URL — BRouter's search is exponential in distance.
+CMD ["java", "-Xmx4G", "-Xms256M", "-DmaxRunningTime=1800", \
      "-cp", "brouter.jar:lib/*", "btools.server.RouteServer", \
      "segments4", "profiles2", "customprofiles", "17777", "4"]

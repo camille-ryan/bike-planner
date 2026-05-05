@@ -25,7 +25,9 @@ async def fetch_route(
         "alternativeidx": str(alternativeidx),
         "format": "geojson",
     }
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    # Long multi-leg routes (point-to-point ~hundreds of km) can take BRouter
+    # several minutes; the engine's own maxRunningTime cap is 1800s.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=1800.0, write=10.0, pool=10.0)) as client:
         r = await client.get(f"{BROUTER_URL}/brouter", params=params)
     body = r.text
     if not body or not body.lstrip().startswith("{"):
