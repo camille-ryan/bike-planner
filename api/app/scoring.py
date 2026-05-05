@@ -90,7 +90,9 @@ def score_route(feature: dict) -> dict:
     coords = _coords(feature)
     props = feature.get("properties", {})
     track_len_km = _num(props, "track-length") / 1000.0
-    ascend_m = _num(props, "filtered-ascend")
+    # BRouter spells these with a space, not a dash. The frontend used to use
+    # the dashed form too; both keys are now read so older clients keep working.
+    ascend_m = _num(props, "filtered ascend") or _num(props, "filtered-ascend")
     raw_cost = _num(props, "cost")
     curvy = curvy_descent_penalty(coords)
     viewpoints = viewpoints_near_route(coords)

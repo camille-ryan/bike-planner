@@ -33,7 +33,7 @@ services:
     build: ./api
     container_name: bike-api
     ports:
-      - "8000:8000"
+      - "8001:8000"   # 8000 collides with another local service; map to 8001 on the host
     volumes:
       - ./data:/data:ro
     environment:

@@ -122,7 +122,7 @@ for p in lht trekking gravel fastbike-lowtraffic; do
   curl -s "http://localhost:17777/brouter?lonlats=15.43,47.07|16.37,48.21&profile=$p&format=geojson" \
     | python3 -c "import json,sys;d=json.load(sys.stdin);
 p=d['features'][0]['properties'];
-print(f\"  distance: {p['track-length']} m, duration: {p['total-time']} s, climb: {p['filtered-ascend']} m\")"
+print(f\"  distance: {p['track-length']} m, duration: {p['total-time']} s, climb: {p['filtered ascend']} m\")"
 done
 ```
 
@@ -191,7 +191,7 @@ Listens on port `8000`. From the laptop: `http://desktop-nk6flc3.tail9115a7.ts.n
 #### `GET /health`
 
 ```sh
-curl http://localhost:8000/health
+curl http://localhost:8001/health
 # {"status":"ok"}
 ```
 
@@ -202,10 +202,10 @@ Proxies to BRouter and (optionally) re-ranks alternatives by composite score:
 
 ```sh
 # Single route Graz → Vienna
-curl 'http://localhost:8000/route?from=15.43,47.07&to=16.37,48.21&profile=lht'
+curl 'http://localhost:8001/route?from=15.43,47.07&to=16.37,48.21&profile=lht'
 
 # Three alternatives, re-ranked for scenicness + curvy-descent avoidance
-curl 'http://localhost:8000/route?from=15.43,47.07&to=16.37,48.21&profile=lht&alternatives=3&rerank=true' \
+curl 'http://localhost:8001/route?from=15.43,47.07&to=16.37,48.21&profile=lht&alternatives=3&rerank=true' \
   | python3 -m json.tool
 ```
 
@@ -225,7 +225,7 @@ Each route in the response gets a `properties.scoring` block:
 
 ```sh
 # All viewpoints near Graz
-curl 'http://localhost:8000/pois?bbox=15.3,47.0,15.6,47.2&category=viewpoint&limit=200'
+curl 'http://localhost:8001/pois?bbox=15.3,47.0,15.6,47.2&category=viewpoint&limit=200'
 ```
 
 Categories: `viewpoint`, `lodging`, `food`, `bike_service`, `water`.
@@ -236,7 +236,7 @@ Splits a route into legs of about `target_km` each and returns nearby lodging PO
 
 ```sh
 # Graz → Copenhagen, 100km daily stages
-curl 'http://localhost:8000/stages?from=15.43,47.07&to=12.57,55.68&target_km=100' \
+curl 'http://localhost:8001/stages?from=15.43,47.07&to=12.57,55.68&target_km=100' \
   | python3 -m json.tool
 ```
 
@@ -360,8 +360,8 @@ docker compose up -d --build
 
 # 4) Verify each layer.
 curl -fsS http://localhost:17777/brouter?lonlats=15.43,47.07'|'16.37,48.21'&'profile=lht'&'format=geojson | head -c 200
-curl -fsS http://localhost:8000/health
-curl -fsS 'http://localhost:8000/route?from=15.43,47.07&to=16.37,48.21&profile=lht'
+curl -fsS http://localhost:8001/health
+curl -fsS 'http://localhost:8001/route?from=15.43,47.07&to=16.37,48.21&profile=lht'
 open http://localhost:8080   # or visit it from your laptop via Tailscale
 ```
 
@@ -374,5 +374,5 @@ This stack is designed to run on `desktop-nk6flc3.tail9115a7.ts.net` (over Tails
 | Port  | Service       |
 |-------|---------------|
 | 17777 | BRouter       |
-| 8000  | FastAPI       |
+| 8001  | FastAPI (API container exposes 8000 internally; mapped to 8001 because port 8000 is taken by another local service) |
 | 8080  | Web UI        |

@@ -181,7 +181,7 @@ function renderRoutes() {
     const p = r.properties;
     const km = fmtKm(+p["track-length"] || 0);
     const t  = fmtH(+p["total-time"] || 0);
-    const climb = `${Math.round(+p["filtered-ascend"] || 0)} m`;
+    const climb = `${Math.round(+(p["filtered ascend"] || p["filtered-ascend"]) || 0)} m`;
     const sc = p.scoring;
     const cls = i === state.activeIdx ? "active" : "";
     const name = sc ? `Alt ${p.alternativeidx} · score ${sc.composite_score}` : `Alt ${p.alternativeidx}`;

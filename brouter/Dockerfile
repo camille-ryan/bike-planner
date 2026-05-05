@@ -19,6 +19,10 @@ RUN apk add --no-cache --virtual .build-deps curl unzip \
 
 EXPOSE 17777
 
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+
 # RouteServer args: <segments-dir> <profiles-dir> <customprofiles-dir> <port> <max-threads>
 # Classpath includes lib/* in case the -all jar is not actually a fat jar in this release.
 CMD ["java", "-Xmx512M", "-Xms64M", "-DmaxRunningTime=300", \
