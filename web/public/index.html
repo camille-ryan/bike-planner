@@ -41,6 +41,14 @@
           </label>
         </div>
         <div class="row">
+          <label>Engine
+            <select id="engine">
+              <option value="brouter" selected>BRouter (live)</option>
+              <option value="spt">SPT (precomputed)</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
           <button id="route-btn" disabled>Route</button>
           <button id="stages-btn" disabled>Stages (~100 km)</button>
           <button id="clear-btn">Clear</button>
@@ -55,6 +63,12 @@
         <label class="checkbox"><input type="checkbox" data-cat="bike_service" />Bike service</label>
         <label class="checkbox"><input type="checkbox" data-cat="water" />Drinking water</label>
         <p class="hint">POIs load while you pan / zoom (max 500 in view).</p>
+      </section>
+
+      <section id="cells-section">
+        <h2>Voronoi cells</h2>
+        <label class="checkbox"><input type="checkbox" id="show-anchors" />Show city anchors</label>
+        <p class="hint">Click an anchor to display its precomputed cell (graph-Voronoi: every road node that routes here fastest under the chosen profile).</p>
       </section>
 
       <section id="results"></section>

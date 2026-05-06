@@ -1,0 +1,4 @@
+osmium==4.1.1
+scipy==1.13.1
+numpy==1.26.4
+shapely==2.0.6

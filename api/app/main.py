@@ -9,7 +9,7 @@ Endpoints:
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import anchors, brouter, leg_cache, pois, scoring, stages
+from . import anchors, brouter, cells_api, leg_cache, pois, scoring, spt_router, stages
 from .settings import DEFAULT_PROFILE
 
 app = FastAPI(title="Bike Routing API", version="0.1.0")
@@ -108,6 +108,52 @@ async def route(
         "auto_waypoints": inserted_anchors,
         "routes": routes,
     }
+
+
+@app.get("/spt/route")
+async def spt_route(
+    from_: str = Query(..., alias="from", description="lon,lat"),
+    to: str = Query(..., description="lon,lat"),
+    profile: str = DEFAULT_PROFILE,
+) -> dict:
+    """Pure SPT-based routing — no BRouter, no leg cache.
+
+    Snaps endpoints to the precomputed road graph, plans a city
+    sequence on the city graph, and walks per-city SPT parent
+    pointers to assemble the full path. Sub-second cold for any
+    start/end where SPT data exists.
+    """
+    a = _parse_lonlat(from_, "from")
+    b = _parse_lonlat(to, "to")
+    try:
+        feat = spt_router.route(a, b, profile)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(500, f"SPT route: {exc}")
+    return {"profile": profile, "route": feat}
+
+
+@app.get("/cells/cities")
+def cells_cities(profile: str = DEFAULT_PROFILE) -> dict:
+    """List the cities for which we have a precomputed Voronoi cell.
+
+    Frontend uses this to draw clickable markers for each anchor.
+    Returns 404 if the preprocess hasn't been run for the profile.
+    """
+    items = cells_api.list_cities(profile)
+    if items is None:
+        raise HTTPException(404, f"no SPT data for profile '{profile}' — run preprocess first")
+    return {"profile": profile, "count": len(items), "cities": items}
+
+
+@app.get("/cells/{city_idx}")
+def cells_one(city_idx: int, profile: str = DEFAULT_PROFILE) -> dict:
+    """Return the Voronoi cell polygon for a city, plus its neighbor list."""
+    out = cells_api.cell_for(profile, city_idx)
+    if out is None:
+        raise HTTPException(404, f"no cell for city_idx={city_idx} (profile '{profile}')")
+    return out
 
 
 @app.get("/cache/stats")

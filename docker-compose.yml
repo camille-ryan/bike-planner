@@ -17,6 +17,22 @@ services:
       - ./data:/data
     profiles: ["ingest"]   # only runs when explicitly requested
 
+  preprocess:
+    # SPT preprocess: PBF -> graph -> multi-source Dijkstra -> Voronoi
+    # cells. One-shot, run via `docker compose run --rm preprocess`.
+    build: ./preprocess
+    volumes:
+      - ./data:/data
+    profiles: ["preprocess"]
+    # SciPy's dijkstra holds the graph + working set in memory.
+    shm_size: "2g"
+    # Hard cap so an over-large corridor merge gets OOM-killed by the
+    # container instead of dragging WSL2 down with it. Austria currently
+    # peaks ~7 GB before optimization (Python dict overhead — see
+    # extract_graph.py); that headroom is intentional. Lower this once
+    # we move to numpy-streaming + graph simplification.
+    mem_limit: "8g"
+
   brouter:
     build:
       context: ./brouter

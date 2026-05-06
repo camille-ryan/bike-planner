@@ -39,6 +39,10 @@ const state = {
   legs: [],           // from /stages
   poiMarkers: { viewpoint: [], lodging: [], food: [], bike_service: [], water: [] },
   waypointMarkers: [],
+  // Voronoi cells (Phase 3 SPT preprocess output).
+  cities: null,            // [{city_idx, name, lon, lat, ...}]
+  anchorMarkers: [],       // maplibre Markers for each city anchor
+  shownCellIdx: null,      // currently displayed cell, null when none
 };
 
 // --- map sources / layers (initialized once map loads) -----------------
@@ -60,6 +64,22 @@ map.on("load", () => {
     source: "route-active",
     paint: { "line-color": "#2c5", "line-width": 5, "line-opacity": 0.95 },
   });
+  map.addSource("cell-active", { type: "geojson", data: emptyFC() });
+  // Cell fill goes *under* route lines so the active route stays readable
+  // when a cell is shown. Adding before the line layers below.
+  map.addLayer({
+    id: "cell-active-fill",
+    type: "fill",
+    source: "cell-active",
+    paint: { "fill-color": "#3b82f6", "fill-opacity": 0.18 },
+  }, "route-alts-line");
+  map.addLayer({
+    id: "cell-active-outline",
+    type: "line",
+    source: "cell-active",
+    paint: { "line-color": "#1d4ed8", "line-width": 1.5, "line-opacity": 0.85 },
+  }, "route-alts-line");
+
   map.addLayer({
     id: "legs-points",
     type: "circle",
@@ -170,6 +190,32 @@ function clearAll() {
 document.getElementById("route-btn").addEventListener("click", async () => {
   if (state.waypoints.length < 2) return;
   const profile = document.getElementById("profile").value;
+  const engine  = document.getElementById("engine").value;
+  if (engine === "spt") {
+    // Precomputed SPT engine: takes a single from/to pair, returns one path.
+    // Intermediate via-points are ignored by design — the city-graph plan
+    // already chooses the corridor.
+    const from = state.waypoints[0].join(",");
+    const to   = state.waypoints[state.waypoints.length - 1].join(",");
+    setBusy("Routing via SPT…");
+    try {
+      const r = await api("/spt/route", { from, to, profile });
+      // Adapt to the route-card renderer's expected shape.
+      const f = r.route;
+      f.properties = { ...f.properties,
+        "alternativeidx": 0,
+        "total-time": 0,
+        "filtered ascend": 0,
+      };
+      state.routes = [f];
+      state.activeIdx = 0;
+      renderRoutes();
+    } catch (e) {
+      setError(e.message);
+    }
+    return;
+  }
+  // BRouter path (existing behavior).
   const alternatives = +document.getElementById("alternatives").value;
   const rerank = document.getElementById("rerank").checked;
   const lonlats = state.waypoints.map(p => p.join(",")).join("|");
@@ -377,6 +423,96 @@ map.on("moveend", () => {
 document.querySelectorAll('#layers input[type=checkbox]').forEach(c => {
   c.addEventListener("change", refreshPois);
 });
+
+// --- Voronoi cells (SPT preprocess) -----------------------------------
+//
+// Anchor markers + click-to-show cells. Profile-aware: if the user
+// changes the routing profile we drop the markers and refetch (cells
+// are profile-specific because cost functions differ). The /cells
+// endpoints return 404 when preprocess hasn't been run for a profile —
+// in that case we silently leave the layer empty.
+
+async function loadCitiesForProfile() {
+  const profile = document.getElementById("profile").value;
+  try {
+    const r = await api("/cells/cities", { profile });
+    state.cities = r.cities;
+    document.getElementById("show-anchors").disabled = false;
+    if (document.getElementById("show-anchors").checked) renderAnchors();
+  } catch (e) {
+    state.cities = null;
+    document.getElementById("show-anchors").checked = false;
+    document.getElementById("show-anchors").disabled = true;
+    clearAnchorMarkers();
+  }
+}
+
+function clearAnchorMarkers() {
+  state.anchorMarkers.forEach(m => m.remove());
+  state.anchorMarkers = [];
+}
+
+function renderAnchors() {
+  clearAnchorMarkers();
+  if (!state.cities) return;
+  for (const c of state.cities) {
+    const el = document.createElement("div");
+    const isCity = c.place === "city";
+    const size = isCity ? 12 : 8;
+    el.style.cssText = `width:${size}px;height:${size}px;border-radius:50%;background:#1d4ed8;border:1.5px solid white;box-shadow:0 0 2px rgba(0,0,0,0.4);cursor:pointer;`;
+    el.title = c.name;
+    el.addEventListener("click", (ev) => {
+      ev.stopPropagation();   // don't let the map click handler add a waypoint
+      toggleCell(c.city_idx);
+    });
+    const m = new maplibregl.Marker({ element: el }).setLngLat([c.lon, c.lat]).addTo(map);
+    state.anchorMarkers.push(m);
+  }
+}
+
+async function toggleCell(idx) {
+  if (state.shownCellIdx === idx) {
+    map.getSource("cell-active").setData(emptyFC());
+    state.shownCellIdx = null;
+    return;
+  }
+  const profile = document.getElementById("profile").value;
+  try {
+    const r = await api(`/cells/${idx}`, { profile });
+    map.getSource("cell-active").setData({
+      type: "FeatureCollection",
+      features: [r.polygon],
+    });
+    state.shownCellIdx = idx;
+    showCellInfo(r);
+  } catch (e) {
+    setError(e.message);
+  }
+}
+
+function showCellInfo(r) {
+  const nbrs = r.neighbors.slice(0, 8);
+  document.getElementById("results").innerHTML = `
+    <div class="route-card">
+      <div class="name">Cell: ${r.city.name}</div>
+      <div class="stat"><span>node count</span><span>${(r.polygon.properties.node_count || 0).toLocaleString()}</span></div>
+      <div class="stat"><span>neighbors</span><span>${r.neighbors.length}</span></div>
+      <div class="lodging">${nbrs.map(n => `<span class="lodging-item">${n.name} · ${Math.round(n.weight)}</span>`).join("")}</div>
+    </div>
+  `;
+}
+
+document.getElementById("show-anchors").addEventListener("change", (e) => {
+  if (e.target.checked) renderAnchors();
+  else { clearAnchorMarkers(); map.getSource("cell-active").setData(emptyFC()); state.shownCellIdx = null; }
+});
+document.getElementById("profile").addEventListener("change", () => {
+  // Cells are profile-specific; drop the active one and refetch the city list.
+  map.getSource("cell-active")?.setData(emptyFC());
+  state.shownCellIdx = null;
+  loadCitiesForProfile();
+});
+map.on("load", loadCitiesForProfile);
 
 // --- status helpers ---------------------------------------------------
 
