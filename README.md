@@ -4,12 +4,18 @@ A self-supported bike-tour planner for the Graz → Copenhagen corridor. OpenStr
 
 ## Architecture
 
-| Service  | Stack                          | Status        |
-|----------|--------------------------------|---------------|
-| ingest   | Python + osmium + SpatiaLite   | ✅ Phase 1    |
-| brouter  | OpenJDK + abrensch/brouter 1.7.9 | ✅ Phase 2  |
-| api      | Python + FastAPI + httpx + SpatiaLite | ✅ Phase 3 |
-| web      | nginx + MapLibre GL JS         | ✅ Phase 4    |
+| Service     | Stack                                       | Status        |
+|-------------|---------------------------------------------|---------------|
+| ingest      | Python + osmium + SpatiaLite                | ✅ Phase 1    |
+| brouter     | OpenJDK + abrensch/brouter 1.7.9            | ✅ Phase 2    |
+| api         | Python + FastAPI + httpx + SpatiaLite + numpy/scipy | ✅ Phase 3 |
+| web         | nginx + MapLibre GL JS                      | ✅ Phase 4    |
+| preprocess  | Python + pyosmium + scipy + shapely         | ✅ Phase 5    |
+
+The runtime layers stack:
+
+- **Phase 1-4** are the original BRouter-backed system. BRouter is a battle-tested cycle-routing engine; this gets you correct routes for any (start, end) at the cost of multi-minute wall time on continental distances.
+- **Phase 5 (long-distance optimization)** layers two things on top: (a) auto-waypoint insertion + per-leg routing cache, both transparent to BRouter; (b) a parallel SPT-based router built on a Python road graph, no BRouter at query time, sub-second on any distance once the per-profile preprocess has run.
 
 The corridor data comes from:
 - **Geofabrik** country PBFs (Austria, Czech Republic, Germany, Denmark) for POI extraction.
@@ -356,6 +362,141 @@ bike/
 
 ---
 
+## Phase 5 — long-distance routing optimization ✅
+
+Two layered optimizations on top of the BRouter stack, plus a parallel
+SPT engine that bypasses BRouter entirely for long routes. The full
+empirical numbers are in [`PERF_NOTES.md`](PERF_NOTES.md).
+
+### 5a. Auto-waypoint insertion + per-leg cache
+
+These two are transparent to existing BRouter callers — same `/route`
+endpoint, just faster. Auto-waypoint kicks in on long 2-point routes
+(>250 km) by inserting `place=city|town` anchors along the great-circle
+corridor. Per-leg cache keys each `(profile, from, to)` segment to disk
+in `data/cache/legs.sqlite`.
+
+#### Check it's working
+
+```sh
+# A) Direct point-to-point goes through auto-waypointing automatically.
+#    First call is cold; second hits the cache.
+curl -s "http://localhost:8001/route?from=15.43,47.07&to=12.57,55.68" \
+  -o /tmp/route1.json -w "first call: %{time_total}s\n"
+
+curl -s "http://localhost:8001/route?from=15.43,47.07&to=12.57,55.68" \
+  -o /tmp/route2.json -w "second call: %{time_total}s\n"
+# Expect: first ~100s cold, second ~0.6s warm.
+
+# B) See which anchors got inserted.
+python3 -c "import json; d=json.load(open('/tmp/route2.json')); \
+  print(d['routes'][0]['properties']['cache-hits']); \
+  [print(f'  {a[\"name\"]}') for a in d.get('auto_waypoints', [])]"
+
+# C) Inspect / clear the leg cache.
+curl -s http://localhost:8001/cache/stats | python3 -m json.tool
+curl -s -X POST http://localhost:8001/cache/clear        # nuke all
+curl -s -X POST 'http://localhost:8001/cache/clear?profile=lht'
+```
+
+### 5b. SPT preprocess + graph-Voronoi router
+
+A separate, optional engine. Run a per-profile preprocess that builds:
+- A Python routable road graph from the same Geofabrik PBFs.
+- Multi-source Dijkstra labeling every road node with its nearest
+  anchor city (graph-Voronoi cell assignment).
+- One per-city SPT covering each city's `cell ∪ adjacent cells`.
+- Concave-hull polygons per cell for the click-to-show UI.
+
+At query time the API plans a city sequence on the small city graph,
+then walks per-cell gradient pointers across the SPTs — no BRouter, no
+runtime search. Sub-second on any distance once preprocess has run.
+
+#### Run the preprocess
+
+Smoke (Austria, ~6 min, ~1.5 GB output):
+```sh
+docker compose --profile preprocess run --rm preprocess --profile lht --countries austria
+```
+
+Full corridor (~30-60 min, ~7-10 GB output, requires PBFs from Phase 1):
+```sh
+docker compose --profile preprocess run --rm preprocess \
+  --profile lht --countries austria,czech-republic,germany,denmark
+```
+
+Output lands at `data/spt/lht/`:
+```
+graph_nodes.npz          dense (lon, lat, osm_id) for every road node
+graph_edges.npz          (src, dst, cost, length_m) directed
+spt_fwd.npz              global multi-source forward SPT (cost, parent, city_idx)
+spt_rev.npz              global multi-source reverse SPT
+global_assignment.npz    int32 city_idx per node (cell membership)
+cities.json              anchor list with lon/lat/place/population
+city_graph.json          (from_city, to_city, weight) adjacency
+cells.geojson            FeatureCollection of cell polygons
+spt/<idx>.npz            per-city SPT over (cell + neighbors)
+```
+
+#### Check it's working
+
+```sh
+# A) Verify the SPT engine is registered.
+curl -s 'http://localhost:8001/cells/cities?profile=lht' \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); \
+                print(f'profile={d[\"profile\"]} cities={d[\"count\"]}')"
+
+# B) Route an Austrian pair via SPT. Expect ~50ms warm.
+curl -s 'http://localhost:8001/spt/route?from=15.43,47.07&to=14.29,48.30&profile=lht' \
+  -o /tmp/spt.json -w "time=%{time_total}s\n"
+
+python3 -c "
+import json
+d = json.load(open('/tmp/spt.json'))
+p = d['route']['properties']
+print(f'cities: {p[\"cities\"]}')
+print(f'track-length: {p[\"track-length\"]/1000:.1f} km, {p[\"node-count\"]:,} nodes')
+"
+
+# C) Cell polygon for a specific anchor (Graz is city_idx 2 in Austria).
+curl -s 'http://localhost:8001/cells/2?profile=lht' \
+  | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(f\"city: {d['city']['name']}\")
+print(f\"polygon: {d['polygon']['geometry']['type']}, \"
+      f\"node_count={d['polygon']['properties']['node_count']:,}\")
+print(f'top neighbors:')
+for n in d['neighbors'][:5]:
+    print(f\"  {n['name']:30s} weight={n['weight']:.0f}\")
+"
+```
+
+#### Use it from the UI
+
+In the controls panel:
+- **Engine** select: switch to **SPT (precomputed)**. Click the map for start + end points (intermediate via-points are ignored — the city graph plans the corridor). Click **Route**.
+- **Voronoi cells** panel: enable **Show city anchors**. Blue dots appear at every anchor; click any one to overlay its Voronoi cell polygon and see its neighbor list.
+
+Switching the **Profile** select reloads anchors / cells for that profile (only `lht` exists today; v2 will add scenic / fast variants once the cost function ports more of `.brf`).
+
+### Concurrent reads + the atomic-swap
+
+The preprocess writes to `data/spt/<profile>.tmp/` and atomically
+renames to `data/spt/<profile>/` on completion, so a live API mmap'd
+to the previous output keeps serving from the (now-renamed) old
+directory until clients trigger fresh loads. If you hit "Failed to
+fetch" mid-preprocess anyway, just wait for it to finish and reload.
+
+### Known v1 gaps
+
+- **No elevation in the SPT cost function.** Cells reflect flat-distance topology. Routes don't penalize climbs the way BRouter's `lht.brf` does. Adding SRTM ingest is the v2 priority.
+- **No scenic biases** (`estimated_*_class` BRouter terms are computed during BRouter's own preprocess; we don't replicate them).
+- **One profile only.** v1 cost function is hardcoded in `preprocess/cost.py`. The `--profile` flag currently only renames the output dir.
+- **Edge cases on disconnected components.** Some rural islands in the road graph aren't reachable from any anchor; those nodes have `cost=inf` and are excluded from cells.
+
+---
+
 ## Quick reference: end-to-end test from a fresh clone
 
 ```sh
@@ -374,9 +515,15 @@ curl -fsS http://localhost:17777/brouter?lonlats=15.43,47.07'|'16.37,48.21'&'pro
 curl -fsS http://localhost:8001/health
 curl -fsS 'http://localhost:8001/route?from=15.43,47.07&to=16.37,48.21&profile=lht'
 open http://localhost:8080   # or visit it from your laptop via Tailscale
+
+# 5) (Optional) Build the SPT engine for instant long-distance routing.
+docker compose --profile preprocess run --rm preprocess --profile lht --countries austria
+curl -fsS 'http://localhost:8001/spt/route?from=15.43,47.07&to=14.29,48.30&profile=lht' \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); \
+    print('SPT route:', d['route']['properties']['cities'])"
 ```
 
-For the full corridor (Graz → Copenhagen end-to-end), rerun `docker compose run --rm ingest` (no `--test`) — that downloads all 4 country PBFs and 9 BRouter tiles, ~7 GB.
+For the full corridor (Graz → Copenhagen end-to-end), rerun `docker compose run --rm ingest` (no `--test`) — that downloads all 4 country PBFs and 9 BRouter tiles, ~7 GB. Then optionally run the SPT preprocess against all four countries (`--countries austria,czech-republic,germany,denmark`) for sub-second long-distance routing.
 
 ## Remote access
 
@@ -387,3 +534,40 @@ This stack is designed to run on `desktop-nk6flc3.tail9115a7.ts.net` (over Tails
 | 17777 | BRouter       |
 | 8001  | FastAPI (API container exposes 8000 internally; mapped to 8001 because port 8000 is taken by another local service) |
 | 8080  | Web UI        |
+
+## Project layout (current)
+
+```
+bike/
+├── docker-compose.yml
+├── README.md
+├── PERF_NOTES.md          # empirical timings + tradeoffs
+├── ingest/                # Phase 1 — POI + BRouter tile pipeline
+├── brouter/               # Phase 2 — routing engine container + lht.brf
+├── api/                   # Phase 3 — FastAPI service
+│   └── app/
+│       ├── main.py
+│       ├── brouter.py     # BRouter HTTP client + per-leg cache wrapper
+│       ├── leg_cache.py   # SQLite-backed routing leg cache (Phase 5a)
+│       ├── anchors.py     # auto-waypoint selector (Phase 5a)
+│       ├── cells_api.py   # /cells/* endpoints (Phase 5b)
+│       ├── spt_router.py  # SPT-based routing engine (Phase 5b)
+│       ├── pois.py
+│       ├── scoring.py     # curvy-descent + scenic re-rank (BRouter only)
+│       └── stages.py
+├── web/                   # Phase 4 — static SPA + nginx proxy
+├── preprocess/            # Phase 5b — SPT preprocess pipeline
+│   ├── extract_graph.py   # pyosmium streaming PBF -> graph
+│   ├── cost.py            # per-edge cost function (port of lht.brf)
+│   ├── spt.py             # global multi-source Dijkstra
+│   ├── cells.py           # alpha-shape polygons + city graph
+│   ├── per_city_spt.py    # per-city subgraph SPTs
+│   ├── save.py
+│   └── main.py
+└── data/                  # populated by ingest + preprocess (gitignored)
+    ├── osm/      *.osm.pbf
+    ├── brouter/  *.rd5
+    ├── pois/     *.osm.pbf, pois.sqlite
+    ├── cache/    legs.sqlite
+    └── spt/      <profile>/(graph_nodes.npz, spt/*.npz, cells.geojson, ...)
+```

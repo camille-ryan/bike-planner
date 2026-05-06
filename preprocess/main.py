@@ -16,6 +16,7 @@ Pipeline:
   5. save.write_all
 """
 import argparse
+import shutil
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -134,8 +135,17 @@ def main():
     args = p.parse_args()
 
     countries = [c.strip() for c in args.countries.split(",") if c.strip()]
-    out_dir = config.SPT_DIR / args.profile
-    print(f"[preprocess] profile={args.profile} countries={countries} -> {out_dir}")
+    final_dir = config.SPT_DIR / args.profile
+    # Stage all output under <profile>.tmp/ and atomically swap at the end.
+    # Without this, a live API mmap'd to <profile>/* races with the writer
+    # and intermittently 500s. (Linux rename of a populated dir keeps the
+    # old inode alive for any open mmaps, so already-warm caches in the
+    # API stay valid until they're naturally evicted.)
+    staging_dir = config.SPT_DIR / (args.profile + ".tmp")
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    out_dir = staging_dir
+    print(f"[preprocess] profile={args.profile} countries={countries} -> {final_dir} (via {staging_dir})")
 
     graphs = []
     for c in countries:
@@ -170,6 +180,18 @@ def main():
     # walk in C's SPT.
     per_city_spt.build_per_city_spts(out_dir, graph, fwd, city_graph, anchors)
 
+    # Atomic-ish swap: move existing <profile>/ aside, promote <profile>.tmp/
+    # into place, then drop the old. Linux keeps mmap'd inodes alive after
+    # rename so any in-flight API requests stay consistent.
+    backup_dir = config.SPT_DIR / (args.profile + ".old")
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+    if final_dir.exists():
+        final_dir.rename(backup_dir)
+    out_dir.rename(final_dir)
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    print(f"[preprocess] swapped {staging_dir.name} -> {final_dir.name}")
     print("[preprocess] done")
 
 
