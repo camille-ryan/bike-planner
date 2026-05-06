@@ -100,8 +100,21 @@ def bike_edge_cost(
     cycleway: str,
     access: str,
     bicycle_road: str,
+    is_ferry: bool = False,
 ) -> float | None:
     """Return a unitless per-meter costfactor, or None to exclude the edge."""
+    # Ferries are tagged `route=ferry` in OSM and typically don't carry
+    # a `highway=*` tag. They're the only way across the Baltic for
+    # Graz->Copenhagen, so we accept them with a bumped per-meter cost.
+    # BRouter's lht.brf uses ~5.7 plus a 10000 initial cost penalty for
+    # boarding; we don't model the initial cost, so we bump the per-meter
+    # factor a bit higher (~8) to compensate. Bicycles explicitly excluded
+    # from a particular ferry are still rejected.
+    if is_ferry:
+        if bicycle in ("no", "private"):
+            return None
+        return 8.0
+
     if not highway or highway in EXCLUDE:
         return None
     if access in ("private", "no") and bicycle not in ("yes", "designated", "permissive"):

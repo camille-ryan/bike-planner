@@ -106,7 +106,11 @@ class _Extractor(osmium.SimpleHandler):
     def way(self, w):
         tags = w.tags
         hw = tags.get("highway") or ""
-        if not hw:
+        is_ferry = tags.get("route") == "ferry"
+        # Accept either highway=* OR route=ferry. Without the ferry
+        # branch the city graph splits at the Baltic and Denmark is
+        # unreachable from Germany under the SPT engine.
+        if not hw and not is_ferry:
             self._skipped_no_highway += 1
             return
         if hw in EXCLUDE:
@@ -120,6 +124,7 @@ class _Extractor(osmium.SimpleHandler):
             cycleway=tags.get("cycleway", "") or "",
             access=tags.get("access", "") or "",
             bicycle_road=tags.get("bicycle_road", "") or "",
+            is_ferry=is_ferry,
         )
         if cost_factor is None:
             self._skipped_no_cost += 1
