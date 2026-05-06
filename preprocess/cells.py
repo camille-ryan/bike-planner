@@ -73,24 +73,57 @@ def build_city_graph(graph, fwd_spt) -> CityGraph:
 def build_polygons(graph, fwd_spt, city_names: list[str]) -> dict:
     """Concave hull (alpha-shape) per city. Returns a GeoJSON FeatureCollection.
 
-    Uses shapely 2.0's `concave_hull` method with a tunable ratio. Cells
-    with too few points (<4) fall back to a small buffered point — these
-    are typically rural anchors with sparse local road density.
-    """
-    by_city: dict[int, list[tuple[float, float]]] = defaultdict(list)
-    for i in range(len(graph.node_lon)):
-        c = int(fwd_spt.city_idx[i])
-        if c < 0:
-            continue
-        by_city[c].append((float(graph.node_lon[i]), float(graph.node_lat[i])))
+    Uses shapely 2.0's `concave_hull` with a tunable ratio. Cells with
+    too few points (<4) fall back to a small buffered point — these are
+    typically rural anchors with sparse local road density.
 
-    print(f"[cells] cells with >= 1 node: {len(by_city):,}")
+    Implementation note: at corridor scale (114M nodes) the obvious
+    `defaultdict(list)` of (lon, lat) tuples eats ~6 GB of pure Python
+    object overhead and OOMs the container. Instead we group node
+    indices by city via a single argsort and process each city's slice
+    with numpy — only the few-thousand-element coordinate lists for the
+    current city are ever Python-side at once.
+    """
+    city_idx = fwd_spt.city_idx
+    n = len(city_idx)
+
+    # Index of every node that has a city assignment, sorted by which
+    # city. Memory: int32 arrays of length n_valid, plus argsort temp.
+    valid_mask = city_idx >= 0
+    valid_count = int(valid_mask.sum())
+    print(f"[cells] {valid_count:,}/{n:,} nodes have a city assignment")
+    if valid_count == 0:
+        return {"type": "FeatureCollection", "features": []}
+
+    valid_node_idx = np.flatnonzero(valid_mask).astype(np.int32)
+    sort_perm = np.argsort(city_idx[valid_node_idx], kind="stable")
+    nodes_by_city = valid_node_idx[sort_perm]
+    cities_sorted = city_idx[nodes_by_city]
+    del valid_mask, valid_node_idx, sort_perm
+
+    # Boundaries between cities in the sorted array.
+    breaks = np.concatenate(
+        [[0], np.flatnonzero(np.diff(cities_sorted)) + 1, [len(nodes_by_city)]]
+    ).astype(np.int64)
+    n_cells = len(breaks) - 1
+    print(f"[cells] cells with >= 1 node: {n_cells:,}")
 
     features = []
-    for c, pts in by_city.items():
-        name = city_names[c] if c < len(city_names) else f"city_{c}"
+    node_lon = graph.node_lon
+    node_lat = graph.node_lat
+    for i in range(n_cells):
+        s = int(breaks[i]); e = int(breaks[i + 1])
+        c = int(cities_sorted[s])
+        idx_slice = nodes_by_city[s:e]
+        # Materialize coordinates only for this city's nodes. For an
+        # average corridor cell of ~35k nodes this is ~280 KB.
+        lons = node_lon[idx_slice]
+        lats = node_lat[idx_slice]
+        n_pts = len(idx_slice)
+        # MultiPoint takes an iterable of (x, y) — pass the column-stack.
+        pts = np.column_stack([lons, lats])
         mp = MultiPoint(pts)
-        if len(pts) < 4:
+        if n_pts < 4:
             geom = mp.buffer(0.01)
         else:
             # ratio=0.4 gives a moderately tight hull. Higher = smoother
@@ -98,12 +131,13 @@ def build_polygons(graph, fwd_spt, city_names: list[str]) -> dict:
             geom = concave_hull(mp, ratio=0.4)
             if geom.is_empty or geom.geom_type == "Point":
                 geom = mp.buffer(0.005)
+        name = city_names[c] if c < len(city_names) else f"city_{c}"
         features.append({
             "type": "Feature",
             "properties": {
                 "city_idx": c,
                 "name": name,
-                "node_count": len(pts),
+                "node_count": n_pts,
             },
             "geometry": mapping(geom),
         })

@@ -66,18 +66,53 @@ def snap_cities_to_nodes(
     return idx.astype(np.int32)
 
 
-def compute_spt(graph, city_node_ids: np.ndarray) -> tuple[SPTResult, SPTResult]:
-    """Compute forward + reverse multi-source SPTs.
+def compute_spt(graph, city_node_ids: np.ndarray,
+                directions: tuple[str, ...] = ("forward", "reverse"),
+                free_edges_after_csr: bool = False,
+                ) -> tuple[SPTResult, SPTResult | None]:
+    """Compute multi-source SPTs over the road graph.
 
     `city_node_ids` is an int32 array of length C — the dense node id for
     each city, in the order the caller wants preserved as `city_idx`.
+
+    `directions` controls which SPTs to build. At corridor scale the CSR
+    + working state for the reverse Dijkstra adds ~5 GB peak; until any
+    routing code actually consumes the reverse SPT, building it costs
+    memory we don't have. Pass `("forward",)` to skip it (`rev` will be
+    None in the return tuple).
+
+    `free_edges_after_csr=True` mutates `graph` by setting its edge_*
+    arrays to None right after CSR construction. At corridor scale this
+    is required to fit the Dijkstra in 14 GB — the original arrays
+    (~3 GB) and the CSR (~3 GB) are otherwise alive simultaneously and
+    leave too little headroom for scipy's working state. Caller must
+    reload from disk before any later step that needs the edge arrays.
     """
+    import gc
+
     csr_fwd = build_csr(graph)
-    csr_rev = csr_fwd.transpose().tocsr()
     n = csr_fwd.shape[0]
+    if free_edges_after_csr:
+        graph.edge_src = None
+        graph.edge_dst = None
+        graph.edge_cost = None
+        graph.edge_length_m = None
+        gc.collect()
 
     fwd = _one_direction(csr_fwd, city_node_ids, n, label="forward")
-    rev = _one_direction(csr_rev, city_node_ids, n, label="reverse")
+    # Free the forward CSR before constructing the reverse one — at
+    # corridor scale these are ~2.5 GB each and overlapping them is
+    # what tipped the 14 GB cap on the prior run.
+    del csr_fwd
+    gc.collect()
+
+    if "reverse" in directions:
+        csr_rev = build_csr(graph).transpose().tocsr()
+        rev = _one_direction(csr_rev, city_node_ids, n, label="reverse")
+        del csr_rev
+        gc.collect()
+    else:
+        rev = None
     return fwd, rev
 
 

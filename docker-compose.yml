@@ -26,12 +26,16 @@ services:
     profiles: ["preprocess"]
     # SciPy's dijkstra holds the graph + working set in memory.
     shm_size: "2g"
-    # Hard cap so an over-large corridor merge gets OOM-killed by the
-    # container instead of dragging WSL2 down with it. Austria currently
-    # peaks ~7 GB before optimization (Python dict overhead — see
-    # extract_graph.py); that headroom is intentional. Lower this once
-    # we move to numpy-streaming + graph simplification.
-    mem_limit: "8g"
+    # Hard cap so an over-large run gets cgroup-OOM-killed cleanly
+    # rather than draining the WSL VM and bringing down the docker
+    # daemon + every other container with it. Empirically: extract
+    # streaming peaks ~1.5 GB / country, disk-spilled merge stays
+    # bounded, global Dijkstra peaks ~9 GB on the corridor, per-city
+    # phase peaks ~7 GB after we free node arrays + global SPT
+    # cost/parent. 11 GB gives ~2 GB headroom and leaves enough RAM
+    # in WSL for the kernel + docker + VS Code remote-server. Bump
+    # only if your host has more than 16 GB total.
+    mem_limit: "11g"
 
   brouter:
     build:

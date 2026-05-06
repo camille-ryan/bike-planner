@@ -37,10 +37,11 @@ def write_all(
              src=graph.edge_src, dst=graph.edge_dst,
              cost=graph.edge_cost, length=graph.edge_length_m)
 
-    np.savez(out_dir / "spt_fwd.npz",
-             cost=fwd_spt.cost, parent=fwd_spt.parent, city_idx=fwd_spt.city_idx)
-    np.savez(out_dir / "spt_rev.npz",
-             cost=rev_spt.cost, parent=rev_spt.parent, city_idx=rev_spt.city_idx)
+    # spt_fwd.npz / spt_rev.npz aren't read by any downstream code —
+    # the API uses global_assignment.npz (city_idx only) and the
+    # per-city SPTs. Writing the full forward SPT was costing ~1.4 GB
+    # of disk per profile and forcing us to keep the parent array alive
+    # in memory through the cells phase. Skip it.
 
     with open(out_dir / "cities.json", "w") as fh:
         json.dump(cities, fh, ensure_ascii=False, indent=1)
