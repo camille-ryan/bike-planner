@@ -1,53 +1,75 @@
 # Bike routing stack — Graz → Copenhagen.
 #
-# Phase 1 — ingest (one-shot data pipeline):
-#   docker compose run --rm ingest --test     # smoke test (~700 MB)
-#   docker compose run --rm ingest            # full corridor (~7 GB)
-#
-# Phase 2 — routing engine:
-#   docker compose up -d brouter              # start BRouter on :17777
-#   curl 'http://localhost:17777/brouter?lonlats=15.43,47.07|16.37,48.21&profile=lht&alternativeidx=0&format=geojson'
-#
-# Phases 3 (api) and 4 (web) are added in their respective commits.
+#   docker compose run --rm ingest --test                   # smoke ingest (~700 MB)
+#   docker compose run --rm ingest                          # full corridor (~7 GB)
+#   docker compose --profile preprocess run --rm pgrouting all \
+#       --countries austria,czech-republic,germany,denmark  # SPT preprocess
+#   docker compose up -d api web                            # serve
 
 services:
+  postgres:
+    # PostGIS + pgRouting: persistent, on-disk, spatially-indexed road
+    # graph. Memory profile is constant regardless of total graph size
+    # because the SPT pass is a streaming SQL Bellman-Ford wave (see
+    # pgrouting/compute_spts.py), not pgr_drivingDistance — Postgres
+    # only ever holds the per-wave frontier, not the whole graph.
+    image: pgrouting/pgrouting:16-3.5-3.7.3
+    container_name: bike-postgres
+    environment:
+      POSTGRES_USER:     bike
+      POSTGRES_PASSWORD: bike
+      POSTGRES_DB:       bike
+    volumes:
+      # Named volume on WSL2 ext4 — NOT a bind mount on /mnt/e. Postgres
+      # needs proper fsync semantics + low-latency I/O; the Windows
+      # filesystem via 9P breaks both. Cost: less inspectable from
+      # the host. Worth it.
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    shm_size: "1g"
+    # Cgroup cap so a runaway query gets killed inside the container
+    # rather than taking down the entire WSL VM. 6 GB leaves room for
+    # shared_buffers + per-backend allocations + working set for the
+    # wave-relaxation queries.
+    mem_limit: "6g"
+    command: >
+      postgres
+      -c shared_buffers=1GB
+      -c work_mem=256MB
+      -c maintenance_work_mem=512MB
+      -c max_wal_size=4GB
+      -c effective_cache_size=4GB
+      -c synchronous_commit=off
+    restart: unless-stopped
+
   ingest:
     build: ./ingest
     volumes:
       - ./data:/data
     profiles: ["ingest"]   # only runs when explicitly requested
 
-  preprocess:
-    # SPT preprocess: PBF -> graph -> multi-source Dijkstra -> Voronoi
-    # cells. One-shot, run via `docker compose run --rm preprocess`.
-    build: ./preprocess
+  pgrouting:
+    # SQL-backed SPT preprocess: stream PBFs into Postgres, snap anchors
+    # to graph vertices, run a multi-source Bellman-Ford wave relaxation
+    # (one CTE per wave) until convergence, then materialize per-city
+    # SPTs as npz under /data/spt/<profile>/. Memory stays bounded by
+    # the per-wave frontier regardless of graph size.
+    build: ./pgrouting
+    depends_on:
+      - postgres
     volumes:
       - ./data:/data
     profiles: ["preprocess"]
-    # SciPy's dijkstra holds the graph + working set in memory.
-    shm_size: "2g"
-    # Hard cap so an over-large run gets cgroup-OOM-killed cleanly
-    # rather than draining the WSL VM and bringing down the docker
-    # daemon + every other container with it. Empirically: extract
-    # streaming peaks ~1.5 GB / country, disk-spilled merge stays
-    # bounded, global Dijkstra peaks ~9 GB on the corridor, per-city
-    # phase peaks ~7 GB after we free node arrays + global SPT
-    # cost/parent. 11 GB gives ~2 GB headroom and leaves enough RAM
-    # in WSL for the kernel + docker + VS Code remote-server. Bump
-    # only if your host has more than 16 GB total.
-    mem_limit: "11g"
-
-  brouter:
-    build:
-      context: ./brouter
-    image: bike-brouter:1.7.9
-    container_name: bike-brouter
-    ports:
-      - "17777:17777"
-    volumes:
-      - ./data/brouter:/opt/brouter/segments4:ro
-      - ./brouter/profiles:/opt/brouter/customprofiles:ro
-    restart: unless-stopped
+    environment:
+      - PGHOST=postgres
+      - PGUSER=bike
+      - PGPASSWORD=bike
+      - PGDATABASE=bike
+      - DATA_DIR=/data
+    # No mem_limit needed — Python heap stays small (streaming PBF
+    # ingest, batched COPY into Postgres). All the heavy lifting is
+    # inside Postgres which has its own bounded shared_buffers config.
 
   api:
     build: ./api
@@ -55,15 +77,10 @@ services:
     ports:
       - "8001:8000"   # 8000 collides with another local service; map to 8001 on the host
     volumes:
-      # rw because the API persists a per-leg routing cache under /data/cache.
-      # POI and BRouter subdirs are still treated as read-only by the API code.
-      - ./data:/data
+      - ./data:/data:ro
     environment:
-      - BROUTER_URL=http://brouter:17777
       - DATA_DIR=/data
       - DEFAULT_PROFILE=lht
-    depends_on:
-      - brouter
     restart: unless-stopped
 
   web:
@@ -74,3 +91,6 @@ services:
     depends_on:
       - api
     restart: unless-stopped
+
+volumes:
+  postgres_data:

@@ -12,6 +12,5 @@ COPY . .
 
 EXPOSE 8000
 ENV DATA_DIR=/data
-ENV BROUTER_URL=http://brouter:17777
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

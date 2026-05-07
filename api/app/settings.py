@@ -4,7 +4,5 @@ from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 POIS_DB = DATA_DIR / "pois" / "pois.sqlite"
-LEG_CACHE_DB = DATA_DIR / "cache" / "legs.sqlite"
 SPT_DIR = DATA_DIR / "spt"     # per-profile subdir is appended at use time
-BROUTER_URL = os.environ.get("BROUTER_URL", "http://brouter:17777")
 DEFAULT_PROFILE = os.environ.get("DEFAULT_PROFILE", "lht")

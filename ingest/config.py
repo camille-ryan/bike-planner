@@ -11,15 +11,6 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 GEOFABRIK_BASE = "https://download.geofabrik.de/europe"
 COUNTRIES = ["austria", "czech-republic", "germany", "denmark"]
 
-# --- BRouter segment tiles (5°×5°, named by SW corner) ---
-# Corridor span: lon 5°E–20°E × lat 45°N–60°N.
-BROUTER_BASE = "https://brouter.de/brouter/segments4"
-BROUTER_TILES = [
-    f"E{lon}_N{lat}"
-    for lon in (5, 10, 15)
-    for lat in (45, 50, 55)
-]
-
 # --- POI extraction filters (osmium tags-filter syntax) ---
 # Node-only filters keep POIs as point markers — sufficient for
 # overlay rendering and proximity scoring.
@@ -36,8 +27,9 @@ PROTECTED_AREA_FILTERS = [
 # Cycle networks: tagged route relations.
 BIKE_ROUTE_FILTERS = ["r/route=bicycle"]
 
-# Routing anchors — `place=city|town` populated places used as auto-waypoints
-# for long routes. Filtering on the `place` tag (rather than a population
-# threshold) avoids dropping towns whose `population=*` tag is missing,
-# which is common in OSM. Yields ~hundreds–low-thousands per country.
+# Routing anchors — `place=city|town` populated places. Consumed by the
+# pgrouting preprocess to seed the multi-source SPT. Filtering on the
+# `place` tag (rather than a population threshold) avoids dropping towns
+# whose `population=*` tag is missing, which is common in OSM. Yields
+# ~hundreds–low-thousands per country.
 ANCHOR_FILTERS = ["n/place=city,town"]
