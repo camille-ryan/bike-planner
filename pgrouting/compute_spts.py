@@ -237,36 +237,37 @@ def _build_city_graph(
 
 def _priority_anchor_ids(
     conn: psycopg.Connection,
-    line_endpoints: tuple[float, float, float, float] | None,
+    polyline_points: list[tuple[float, float]] | None,
 ) -> list[int]:
     """Return anchor.id values sorted by priority order.
 
-    If `line_endpoints` is `(lon1, lat1, lon2, lat2)`, anchors closer to
-    the great-circle line between those points come first — useful for
-    "process the cities along the Graz->Copenhagen corridor before the
-    rest" so we can test routing while the long tail is still running.
+    If `polyline_points` is a list of (lon, lat) waypoints, anchors
+    closer to the polyline through those points come first — pass a
+    multi-waypoint polyline (e.g. Graz, Wien, Brno, Praha, Berlin,
+    Hamburg, København) so anchors along the actual cycle-tour route
+    finish ahead of the long tail. A simple straight line works too —
+    just pass two points.
 
-    If `line_endpoints` is None, falls back to plain id order.
+    If `polyline_points` is None, falls back to plain id order.
     """
-    if line_endpoints is None:
+    if not polyline_points:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM anchors WHERE snap_vertex_id IS NOT NULL ORDER BY id")
             return [int(r[0]) for r in cur.fetchall()]
 
-    lon1, lat1, lon2, lat2 = line_endpoints
+    pts_sql = ", ".join(
+        f"ST_MakePoint({lon}, {lat})" for lon, lat in polyline_points
+    )
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             WITH route AS (
-                SELECT ST_SetSRID(ST_MakeLine(
-                    ST_MakePoint(%s, %s),
-                    ST_MakePoint(%s, %s)
-                ), 4326) AS line
+                SELECT ST_SetSRID(ST_MakeLine(ARRAY[{pts_sql}]), 4326) AS line
             )
             SELECT a.id
             FROM   anchors a, route r
             WHERE  a.snap_vertex_id IS NOT NULL
             ORDER  BY ST_Distance(a.geom::geography, r.line::geography) ASC, a.id ASC
-        """, (lon1, lat1, lon2, lat2))
+        """)
         return [int(r[0]) for r in cur.fetchall()]
 
 
@@ -290,18 +291,19 @@ def run(conn: psycopg.Connection, out_dir: Path) -> dict:
     by_id = {a["anchor_id"]: a for a in anchors}
 
     line_env = os.environ.get("SPT_PRIORITY_LINE")
-    line_endpoints = None
+    polyline_points: list[tuple[float, float]] | None = None
     if line_env:
         try:
             parts = [float(x) for x in line_env.split(",")]
-            if len(parts) == 4:
-                line_endpoints = tuple(parts)
-                print(f"[spts] priority line: ({parts[0]},{parts[1]}) -> "
-                      f"({parts[2]},{parts[3]})  — corridor cities first")
+            if len(parts) >= 4 and len(parts) % 2 == 0:
+                polyline_points = list(zip(parts[0::2], parts[1::2]))
+                pretty = " -> ".join(f"({lo},{la})" for lo, la in polyline_points)
+                print(f"[spts] priority polyline ({len(polyline_points)} waypoints): "
+                      f"{pretty}  — anchors near this line first")
         except ValueError:
             pass
 
-    ordered_ids = _priority_anchor_ids(conn, line_endpoints)
+    ordered_ids = _priority_anchor_ids(conn, polyline_points)
 
     node_global, csr = _load_graph(conn)
 
