@@ -235,22 +235,83 @@ def _build_city_graph(
     print(f"[spts] wrote city_graph.json with {len(edges):,} directed edges")
 
 
+def _priority_anchor_ids(
+    conn: psycopg.Connection,
+    line_endpoints: tuple[float, float, float, float] | None,
+) -> list[int]:
+    """Return anchor.id values sorted by priority order.
+
+    If `line_endpoints` is `(lon1, lat1, lon2, lat2)`, anchors closer to
+    the great-circle line between those points come first — useful for
+    "process the cities along the Graz->Copenhagen corridor before the
+    rest" so we can test routing while the long tail is still running.
+
+    If `line_endpoints` is None, falls back to plain id order.
+    """
+    if line_endpoints is None:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM anchors WHERE snap_vertex_id IS NOT NULL ORDER BY id")
+            return [int(r[0]) for r in cur.fetchall()]
+
+    lon1, lat1, lon2, lat2 = line_endpoints
+    with conn.cursor() as cur:
+        cur.execute("""
+            WITH route AS (
+                SELECT ST_SetSRID(ST_MakeLine(
+                    ST_MakePoint(%s, %s),
+                    ST_MakePoint(%s, %s)
+                ), 4326) AS line
+            )
+            SELECT a.id
+            FROM   anchors a, route r
+            WHERE  a.snap_vertex_id IS NOT NULL
+            ORDER  BY ST_Distance(a.geom::geography, r.line::geography) ASC, a.id ASC
+        """, (lon1, lat1, lon2, lat2))
+        return [int(r[0]) for r in cur.fetchall()]
+
+
 def run(conn: psycopg.Connection, out_dir: Path) -> dict:
-    """Top-level: load graph, per-city Dijkstra, write metadata + adjacency."""
+    """Top-level: load graph, per-city Dijkstra, write metadata + adjacency.
+
+    Anchors are processed in priority order if SPT_PRIORITY_LINE is set
+    in the env — value is "lon1,lat1,lon2,lat2" defining a great-circle
+    line. Anchors closer to that line get processed first; the rest
+    follow in id order. The npz file name is always `<id - 1>.npz`
+    regardless of processing order, so resume + city_graph derivation
+    work the same.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     spt_dir = out_dir / "spt"
     spt_dir.mkdir(parents=True, exist_ok=True)
 
-    anchors = _fetch_anchors(conn)
+    anchors = _fetch_anchors(conn)   # canonical id order
     print(f"[spts] {len(anchors):,} anchors to process")
+
+    by_id = {a["anchor_id"]: a for a in anchors}
+
+    line_env = os.environ.get("SPT_PRIORITY_LINE")
+    line_endpoints = None
+    if line_env:
+        try:
+            parts = [float(x) for x in line_env.split(",")]
+            if len(parts) == 4:
+                line_endpoints = tuple(parts)
+                print(f"[spts] priority line: ({parts[0]},{parts[1]}) -> "
+                      f"({parts[2]},{parts[3]})  — corridor cities first")
+        except ValueError:
+            pass
+
+    ordered_ids = _priority_anchor_ids(conn, line_endpoints)
 
     node_global, csr = _load_graph(conn)
 
-    # Pre-fetch polygon vertex sets — used both as Dijkstra sources for
-    # each city and as targets for the post-hoc adjacency derivation.
+    # Pre-fetch polygon vertex sets — keyed by ci = anchor.id - 1 so
+    # the file naming and city_graph indexing stay stable regardless
+    # of processing order.
     print("[spts] fetching polygon vertex sets...")
     polygon_sets: dict[int, np.ndarray] = {}
-    for ci, a in enumerate(anchors):
+    for a in anchors:
+        ci = a["anchor_id"] - 1
         if a["has_polygon"]:
             polygon_sets[ci] = _polygon_vertices(conn, a["anchor_id"])
         else:
@@ -259,10 +320,12 @@ def run(conn: psycopg.Connection, out_dir: Path) -> dict:
     print(f"[spts]   {total_poly_v:,} total polygon vertices across "
           f"{sum(1 for a in anchors if a['has_polygon']):,} polygons")
 
-    # Per-city Dijkstra.
+    # Per-city Dijkstra in priority order.
     written = 0
     skipped = 0
-    for ci, anchor in enumerate(anchors):
+    for processed_idx, aid in enumerate(ordered_ids):
+        anchor = by_id[aid]
+        ci = aid - 1
         out_path = spt_dir / f"{ci}.npz"
         if out_path.exists():
             skipped += 1
@@ -278,8 +341,8 @@ def run(conn: psycopg.Connection, out_dir: Path) -> dict:
                  parent_local=parent,
                  cost=cost)
         written += 1
-        if written % 25 == 0 or ci + 1 == len(anchors):
-            print(f"[spts] dijkstra {ci+1:,}/{len(anchors):,}  "
+        if written % 25 == 0 or processed_idx + 1 == len(ordered_ids):
+            print(f"[spts] dijkstra {processed_idx + 1:,}/{len(ordered_ids):,}  "
                   f"last: {anchor['name']} (sources={len(sources):,}, "
                   f"reached={len(node_arr):,})")
     print(f"[spts] wrote {written:,} per-city SPTs (skipped {skipped:,})")
