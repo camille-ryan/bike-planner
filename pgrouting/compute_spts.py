@@ -50,33 +50,59 @@ def _load_graph(conn: psycopg.Connection) -> tuple[np.ndarray, csr_matrix]:
 
     Returned `node_global` is sorted ascending; `csr` is indexed by
     local positions = `searchsorted(node_global, vid)`.
+
+    Memory: rows are streamed via a server-side cursor in chunks and
+    converted to typed numpy arrays per chunk. fetchall() on the full
+    ways table would create ~80 bytes/row × N tuples — ~8 GB at AT
+    scale, ~40 GB at corridor — and OOM the container. Chunked fetch
+    keeps the per-chunk Python tuple buffer tiny and lets the typed
+    numpy chunks dominate (4 bytes/edge end-state).
     """
-    print("[spts] loading edges into CSR...")
+    print("[spts] loading edges into CSR (chunked fetch)...")
+    src_chunks: list[np.ndarray] = []
+    dst_chunks: list[np.ndarray] = []
+    fwd_chunks: list[np.ndarray] = []
+    rev_chunks: list[np.ndarray] = []
+    total_rows = 0
+    CHUNK = 200_000
+
     with conn.cursor(name="edge_cur") as cur:
-        cur.itersize = 200_000
+        cur.itersize = CHUNK
         cur.execute("""
             SELECT source, target, cost, reverse_cost
             FROM   ways
             WHERE  cost >= 0 OR reverse_cost >= 0
         """)
-        rows = cur.fetchall()
-    print(f"[spts]   fetched {len(rows):,} ways rows")
+        while True:
+            rows = cur.fetchmany(CHUNK)
+            if not rows:
+                break
+            chunk = np.asarray(rows, dtype=np.float64)
+            src_chunks.append(chunk[:, 0].astype(np.int64))
+            dst_chunks.append(chunk[:, 1].astype(np.int64))
+            fwd_chunks.append(chunk[:, 2].astype(np.float32))
+            rev_chunks.append(chunk[:, 3].astype(np.float32))
+            total_rows += len(rows)
+            del rows, chunk
+    print(f"[spts]   fetched {total_rows:,} ways rows in chunks")
 
-    arr = np.asarray(rows, dtype=np.float64)
-    src   = arr[:, 0].astype(np.int64)
-    dst   = arr[:, 1].astype(np.int64)
-    fwd_c = arr[:, 2].astype(np.float32)
-    rev_c = arr[:, 3].astype(np.float32)
+    src   = np.concatenate(src_chunks);  src_chunks.clear()
+    dst   = np.concatenate(dst_chunks);  dst_chunks.clear()
+    fwd_c = np.concatenate(fwd_chunks);  fwd_chunks.clear()
+    rev_c = np.concatenate(rev_chunks);  rev_chunks.clear()
+
     fwd_mask = fwd_c >= 0
     rev_mask = rev_c >= 0
     e_src  = np.concatenate([src[fwd_mask], dst[rev_mask]])
     e_dst  = np.concatenate([dst[fwd_mask], src[rev_mask]])
     e_cost = np.concatenate([fwd_c[fwd_mask], rev_c[rev_mask]])
+    del src, dst, fwd_c, rev_c, fwd_mask, rev_mask
 
     node_global = np.unique(np.concatenate([e_src, e_dst]))
     n = len(node_global)
     src_local = np.searchsorted(node_global, e_src).astype(np.int32)
     dst_local = np.searchsorted(node_global, e_dst).astype(np.int32)
+    del e_src, e_dst
     csr = csr_matrix((e_cost, (src_local, dst_local)), shape=(n, n), dtype=np.float32)
     print(f"[spts]   {n:,} unique vertices, {len(e_cost):,} directed edges, "
           f"CSR ~{(csr.data.nbytes + csr.indices.nbytes + csr.indptr.nbytes) // (1024*1024)} MB")

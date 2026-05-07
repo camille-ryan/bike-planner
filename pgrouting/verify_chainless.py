@@ -13,6 +13,20 @@ Reports:
 
 Edge costs are derived from SPT cost differences along parent chains:
 edge(parent[v], v) = npz.cost[v] - npz.cost[parent[v]].
+
+Future optimizations (not yet applied):
+  2. Vectorize the entire per-city walk in one numpy pass — build the
+     full parent chain via repeated `parent_local` indexing, then
+     `np.isin` against end_node_global to find the crossover. Sub-ms
+     for any practical walk length.
+  3. Pre-compute a global "(vid -> [city_idx, local_idx]) coverage"
+     table so the per-step "farthest reachable" check is O(1) instead
+     of O(K) cities × O(log N) searchsorted. Memory ~5-10 GB at
+     corridor scale (each vid in ~5-10 SPTs).
+  4. Cython/numba JIT the inner walk loop. ~1 ns/step. Combined with
+     opt 1 below, a 1100 km gradient walk becomes <1 ms.
+  5. mmap the npz files for the routing API hot path so per-query
+     memory footprint reflects only touched pages.
 """
 import heapq
 import json
@@ -73,17 +87,19 @@ def gradient_walk(
     `V_star_vid` is the first vertex on the gradient walk that's in
     end_npz_set. Stops early at the start city's polygon (parent=-9999)
     if we never reach end's SPT.
+
+    Optimization 1: locate current vid via searchsorted only when we
+    enter a new city segment; thereafter, `parent_local[i]` IS the next
+    vertex's local index — no per-step searchsorted needed.
     """
     current = S_vid
     path = [current]
     total_cost = 0.0
+    chain = list(chain)
 
-    while True:
-        # Found end's SPT — return V_star here.
-        if current in end_npz_set:
-            return current, path, total_cost
-
-        # Find farthest Xi in remaining chain whose SPT contains current.
+    while chain:
+        # Find farthest Xi reachable from current (one searchsorted per
+        # candidate city; runs once per city segment, not per step).
         best_ci = None
         best_idx = None
         for ci in reversed(chain):
@@ -94,23 +110,33 @@ def gradient_walk(
                 best_idx = i
                 break
         if best_ci is None:
-            # Stuck — current vertex not in any chain city's SPT.
-            return -1, path, total_cost
+            return -1, path, total_cost  # stuck
 
+        # Walk this city's gradient with O(1) per step. The membership
+        # check against end_npz_set runs every step; everything else is
+        # an array index.
         npz = npzs[best_ci]
-        par = int(npz["parent_local"][best_idx])
-        if par == -9999:
-            # Reached this city's polygon. Drop it and re-evaluate.
-            chain = [c for c in chain if c != best_ci]
-            if not chain:
-                return current, path, total_cost
-            continue
+        node_global = npz["node_global"]
+        parent_local = npz["parent_local"]
+        cost_arr = npz["cost"]
+        local_idx = best_idx
 
-        next_v = int(npz["node_global"][par])
-        edge_cost = float(npz["cost"][best_idx]) - float(npz["cost"][par])
-        total_cost += edge_cost
-        current = next_v
-        path.append(current)
+        while True:
+            cur_vid = int(node_global[local_idx])
+            if cur_vid in end_npz_set:
+                return cur_vid, path, total_cost
+            par = int(parent_local[local_idx])
+            if par == -9999:
+                # Reached this city's polygon. Drop it and re-evaluate.
+                chain = [c for c in chain if c != best_ci]
+                break
+            edge_cost = float(cost_arr[local_idx]) - float(cost_arr[par])
+            total_cost += edge_cost
+            local_idx = par
+            current = int(node_global[par])
+            path.append(current)
+
+    return current, path, total_cost
 
 
 def main():
