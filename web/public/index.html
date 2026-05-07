@@ -66,9 +66,9 @@
       </section>
 
       <section id="cells-section">
-        <h2>Voronoi cells</h2>
+        <h2>Cells &amp; gradients</h2>
         <label class="checkbox"><input type="checkbox" id="show-anchors" />Show city anchors</label>
-        <p class="hint">Click an anchor to display its precomputed cell (graph-Voronoi: every road node that routes here fastest under the chosen profile).</p>
+        <p class="hint">Click an anchor to overlay its <em>cost gradient</em> — every road node assigned to that anchor in the multi-source SPT, colored by routing cost from the anchor. Updates live as the preprocess wave loop progresses.</p>
       </section>
 
       <section id="results"></section>

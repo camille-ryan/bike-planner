@@ -9,7 +9,7 @@ Endpoints:
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import cells_api, pois, spt_router
+from . import cells_api, db, live, pois, spt_router
 from .settings import DEFAULT_PROFILE
 
 app = FastAPI(title="Bike Routing API", version="0.2.0")
@@ -72,6 +72,32 @@ def cells_one(city_idx: int, profile: str = DEFAULT_PROFILE) -> dict:
     if out is None:
         raise HTTPException(404, f"no cell for city_idx={city_idx} (profile '{profile}')")
     return out
+
+
+@app.get("/live/cities")
+def live_cities() -> dict:
+    """Anchor list, queried straight from Postgres.
+
+    Works while the preprocess wave loop is running — the legacy
+    `/cells/cities` endpoint requires a fully-built `cities.json`
+    on disk, which only appears after convergence.
+    """
+    with db.connect() as conn:
+        cities = live.list_cities(conn)
+    return {"count": len(cities), "cities": cities}
+
+
+@app.get("/live/cell/{city_idx}/gradient")
+def live_cell_gradient(city_idx: int) -> dict:
+    """Cost-from-anchor at every node assigned to `city_idx`.
+
+    GeoJSON FeatureCollection of Points; each point has a `cost`
+    property (cost units, ~meters for cycleway). Subsampled to
+    MAX_POINTS so the frontend can render without choking. As the
+    wave loop runs, refreshing this endpoint shows the cell expanding.
+    """
+    with db.connect() as conn:
+        return live.gradient_for(conn, city_idx)
 
 
 @app.get("/pois")

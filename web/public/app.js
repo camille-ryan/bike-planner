@@ -10,15 +10,25 @@ const map = new maplibregl.Map({
   style: {
     version: 8,
     sources: {
-      osm: {
+      basemap: {
+        // CartoDB Dark Matter — free, no API key, designed for data
+        // overlays. Four subdomains in the tile list let MapLibre
+        // parallelise tile requests across them.
         type: "raster",
-        tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+        tiles: [
+          "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+          "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+          "https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+          "https://d.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+        ],
         tileSize: 256,
-        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+        attribution:
+          '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · ' +
+          '© <a href="https://carto.com/attributions">CARTO</a>',
         maxzoom: 19,
       },
     },
-    layers: [{ id: "osm", type: "raster", source: "osm" }],
+    layers: [{ id: "basemap", type: "raster", source: "basemap" }],
   },
   center: [13.5, 51],
   zoom: 5,
@@ -64,20 +74,39 @@ map.on("load", () => {
     source: "route-active",
     paint: { "line-color": "#2c5", "line-width": 5, "line-opacity": 0.95 },
   });
-  map.addSource("cell-active", { type: "geojson", data: emptyFC() });
-  // Cell fill goes *under* route lines so the active route stays readable
-  // when a cell is shown. Adding before the line layers below.
+  map.addSource("cell-gradient", { type: "geojson", data: emptyFC() });
+  // Cost-from-anchor heatmap: every cell-internal road edge as a
+  // LineString colored by cost. Lives below the route lines so an
+  // active route stays readable on top. Color stops are set per-fetch
+  // via setPaintProperty so the ramp stretches across the actual
+  // cost range of the cell (varies by city size + wave progress).
   map.addLayer({
-    id: "cell-active-fill",
-    type: "fill",
-    source: "cell-active",
-    paint: { "fill-color": "#3b82f6", "fill-opacity": 0.18 },
-  }, "route-alts-line");
-  map.addLayer({
-    id: "cell-active-outline",
+    id: "cell-gradient-lines",
     type: "line",
-    source: "cell-active",
-    paint: { "line-color": "#1d4ed8", "line-width": 1.5, "line-opacity": 0.85 },
+    source: "cell-gradient",
+    layout: {
+      // butt cap (not round) — each edge is its own 2-point LineString,
+      // round caps would draw a small dot at every endpoint and the
+      // overall network would look stippled.
+      "line-cap": "butt",
+      "line-join": "miter",
+    },
+    paint: {
+      "line-width": [
+        "interpolate", ["linear"], ["zoom"],
+        6,  1,
+        10, 1.5,
+        13, 2.5,
+        16, 4,
+      ],
+      "line-color": [
+        "interpolate", ["linear"], ["get", "cost"],
+        0,       "#10b981",
+        50000,   "#facc15",
+        100000,  "#dc2626",
+      ],
+      "line-opacity": 0.7,
+    },
   }, "route-alts-line");
 
   map.addLayer({
@@ -424,18 +453,17 @@ document.querySelectorAll('#layers input[type=checkbox]').forEach(c => {
   c.addEventListener("change", refreshPois);
 });
 
-// --- Voronoi cells (SPT preprocess) -----------------------------------
+// --- Anchors + cost-gradient overlay ----------------------------------
 //
-// Anchor markers + click-to-show cells. Profile-aware: if the user
-// changes the routing profile we drop the markers and refetch (cells
-// are profile-specific because cost functions differ). The /cells
-// endpoints return 404 when preprocess hasn't been run for a profile —
-// in that case we silently leave the layer empty.
+// Anchor list comes from /live/cities (Postgres-backed; works even
+// while the preprocess wave loop is still running). Click an anchor
+// to overlay /live/cell/<idx>/gradient — every road node assigned to
+// that anchor in the multi-source SPT, colored by cost-from-anchor.
+// Refresh the same anchor to see updated coverage as waves progress.
 
-async function loadCitiesForProfile() {
-  const profile = document.getElementById("profile").value;
+async function loadCities() {
   try {
-    const r = await api("/cells/cities", { profile });
+    const r = await api("/live/cities");
     state.cities = r.cities;
     document.getElementById("show-anchors").disabled = false;
     if (document.getElementById("show-anchors").checked) renderAnchors();
@@ -462,57 +490,66 @@ function renderAnchors() {
     el.style.cssText = `width:${size}px;height:${size}px;border-radius:50%;background:#1d4ed8;border:1.5px solid white;box-shadow:0 0 2px rgba(0,0,0,0.4);cursor:pointer;`;
     el.title = c.name;
     el.addEventListener("click", (ev) => {
-      ev.stopPropagation();   // don't let the map click handler add a waypoint
-      toggleCell(c.city_idx);
+      ev.stopPropagation();
+      toggleGradient(c.city_idx, c.name);
     });
     const m = new maplibregl.Marker({ element: el }).setLngLat([c.lon, c.lat]).addTo(map);
     state.anchorMarkers.push(m);
   }
 }
 
-async function toggleCell(idx) {
+async function toggleGradient(idx, name) {
   if (state.shownCellIdx === idx) {
-    map.getSource("cell-active").setData(emptyFC());
+    map.getSource("cell-gradient").setData(emptyFC());
     state.shownCellIdx = null;
+    document.getElementById("results").innerHTML = "";
     return;
   }
-  const profile = document.getElementById("profile").value;
+  setBusy(`Loading cost gradient for ${name}…`);
   try {
-    const r = await api(`/cells/${idx}`, { profile });
-    map.getSource("cell-active").setData({
-      type: "FeatureCollection",
-      features: [r.polygon],
-    });
+    const r = await api(`/live/cell/${idx}/gradient`);
+    map.getSource("cell-gradient").setData(r);
     state.shownCellIdx = idx;
-    showCellInfo(r);
+    // Re-stretch the color ramp to the actual cost range of this cell
+    // so we always see contrast even when the cell is small or huge.
+    const lo = r.cost_min ?? 0;
+    const hi = r.cost_max ?? 100000;
+    const mid = lo + (hi - lo) / 2;
+    map.setPaintProperty("cell-gradient-lines", "line-color", [
+      "interpolate", ["linear"], ["get", "cost"],
+      lo,  "#10b981",
+      mid, "#facc15",
+      hi,  "#dc2626",
+    ]);
+    showGradientInfo(name, r);
   } catch (e) {
     setError(e.message);
   }
 }
 
-function showCellInfo(r) {
-  const nbrs = r.neighbors.slice(0, 8);
+function showGradientInfo(name, r) {
+  const lo = r.cost_min, hi = r.cost_max;
+  const km = (n) => (n / 1000).toFixed(1) + " km-equiv";
   document.getElementById("results").innerHTML = `
     <div class="route-card">
-      <div class="name">Cell: ${r.city.name}</div>
-      <div class="stat"><span>node count</span><span>${(r.polygon.properties.node_count || 0).toLocaleString()}</span></div>
-      <div class="stat"><span>neighbors</span><span>${r.neighbors.length}</span></div>
-      <div class="lodging">${nbrs.map(n => `<span class="lodging-item">${n.name} · ${Math.round(n.weight)}</span>`).join("")}</div>
+      <div class="name">${name}: cost gradient</div>
+      <div class="stat"><span>visited nodes</span><span>${r.total_visited.toLocaleString()}</span></div>
+      <div class="stat"><span>shown (subsampled)</span><span>${r.features.length.toLocaleString()}</span></div>
+      <div class="stat"><span>cost range</span><span>${lo == null ? "—" : km(lo) + " → " + km(hi)}</span></div>
+      <p class="hint">Refresh to see updated coverage as the wave loop runs.</p>
     </div>
   `;
 }
 
 document.getElementById("show-anchors").addEventListener("change", (e) => {
   if (e.target.checked) renderAnchors();
-  else { clearAnchorMarkers(); map.getSource("cell-active").setData(emptyFC()); state.shownCellIdx = null; }
+  else {
+    clearAnchorMarkers();
+    map.getSource("cell-gradient").setData(emptyFC());
+    state.shownCellIdx = null;
+  }
 });
-document.getElementById("profile").addEventListener("change", () => {
-  // Cells are profile-specific; drop the active one and refetch the city list.
-  map.getSource("cell-active")?.setData(emptyFC());
-  state.shownCellIdx = null;
-  loadCitiesForProfile();
-});
-map.on("load", loadCitiesForProfile);
+map.on("load", loadCities);
 
 // --- status helpers ---------------------------------------------------
 

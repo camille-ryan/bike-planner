@@ -1,0 +1,5 @@
+psycopg[binary]==3.2.3
+osmium==4.1.1
+numpy==1.26.4
+scipy==1.13.1
+shapely==2.0.6

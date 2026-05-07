@@ -81,6 +81,15 @@ services:
     environment:
       - DATA_DIR=/data
       - DEFAULT_PROFILE=lht
+      # /live/* endpoints query Postgres directly (anchors list, live
+      # cost-gradient view of the multi-source SPT). Postgres is optional
+      # — those endpoints just 503 if the DB is unreachable.
+      - PGHOST=postgres
+      - PGUSER=bike
+      - PGPASSWORD=bike
+      - PGDATABASE=bike
+    depends_on:
+      - postgres
     restart: unless-stopped
 
   web:
