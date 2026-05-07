@@ -109,6 +109,34 @@ def _load_graph(conn: psycopg.Connection) -> tuple[np.ndarray, csr_matrix]:
     return node_global, csr
 
 
+def _bbox_vertices(
+    conn: psycopg.Connection, lon: float, lat: float, radius_m: float = 1000.0,
+) -> np.ndarray:
+    """All vertex ids within `radius_m` meters of (lon, lat).
+
+    Used as a fallback "synthetic polygon" for anchors without an OSM
+    admin_level boundary — instead of seeding the SPT from the single
+    nearest vertex (which often lands on a disconnected stub when the
+    nearest is a parking-lot fragment or excluded private road), seed
+    from every vertex in a small bbox around the place=town node so the
+    multi-source Dijkstra has many entry points into the routable
+    network. Robust to bad snap geometry the same way polygon seeding
+    is for major cities.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT v.id FROM ways_vertices_pgr v
+            WHERE ST_DWithin(
+                v.the_geom::geography,
+                ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+                %s
+            )
+        """, (lon, lat, radius_m))
+        return np.asarray(
+            sorted(int(r[0]) for r in cur.fetchall()), dtype=np.int64,
+        )
+
+
 def _polygon_vertices(conn: psycopg.Connection, anchor_id: int) -> np.ndarray:
     """All vertex ids inside the given anchor's polygon (sorted)."""
     with conn.cursor() as cur:
@@ -325,18 +353,32 @@ def run(conn: psycopg.Connection, out_dir: Path) -> dict:
 
     # Pre-fetch polygon vertex sets — keyed by ci = anchor.id - 1 so
     # the file naming and city_graph indexing stay stable regardless
-    # of processing order.
-    print("[spts] fetching polygon vertex sets...")
+    # of processing order. Anchors without an OSM admin boundary fall
+    # back to a 1 km bbox of vertices around the place node, so the
+    # multi-source Dijkstra still has many entry points into the
+    # routable network and avoids the trapped-snap-vertex failure
+    # mode (single-vertex seeds land on a parking-lot stub etc.).
+    print("[spts] fetching polygon / bbox vertex sets...")
     polygon_sets: dict[int, np.ndarray] = {}
+    bbox_count = 0
     for a in anchors:
         ci = a["anchor_id"] - 1
         if a["has_polygon"]:
             polygon_sets[ci] = _polygon_vertices(conn, a["anchor_id"])
         else:
-            polygon_sets[ci] = np.asarray([a["snap_vertex_id"]], dtype=np.int64)
+            polygon_sets[ci] = _bbox_vertices(conn, a["lon"], a["lat"])
+            bbox_count += 1
+            # If even the bbox returned nothing (anchor in a black-hole
+            # region of the graph), keep the single-vertex fallback so
+            # the script doesn't crash on an empty source set.
+            if len(polygon_sets[ci]) == 0:
+                polygon_sets[ci] = np.asarray(
+                    [a["snap_vertex_id"]], dtype=np.int64,
+                )
     total_poly_v = sum(len(v) for v in polygon_sets.values())
-    print(f"[spts]   {total_poly_v:,} total polygon vertices across "
-          f"{sum(1 for a in anchors if a['has_polygon']):,} polygons")
+    print(f"[spts]   {total_poly_v:,} total source vertices across "
+          f"{sum(1 for a in anchors if a['has_polygon']):,} polygons + "
+          f"{bbox_count:,} bbox-fallbacks")
 
     # Per-city Dijkstra in priority order.
     written = 0
