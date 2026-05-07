@@ -258,6 +258,13 @@ def _priority_anchor_ids(
     pts_sql = ", ".join(
         f"ST_MakePoint({lon}, {lat})" for lon, lat in polyline_points
     )
+    # Bucket-based priority: every anchor within 30 km of the polyline
+    # ties at bucket 0, sorted by along-line position so we sweep
+    # from start to end. 30-80 km is bucket 1, 80-150 km bucket 2,
+    # rest bucket 3. This pulls "in-corridor" towns to the front
+    # regardless of their exact perpendicular distance to the line —
+    # so a town 25 km off the segment (a real cycle-tour stopover) is
+    # priority along with a hamlet directly under the line.
     with conn.cursor() as cur:
         cur.execute(f"""
             WITH route AS (
@@ -266,7 +273,16 @@ def _priority_anchor_ids(
             SELECT a.id
             FROM   anchors a, route r
             WHERE  a.snap_vertex_id IS NOT NULL
-            ORDER  BY ST_Distance(a.geom::geography, r.line::geography) ASC, a.id ASC
+            ORDER  BY
+                CASE
+                    WHEN ST_Distance(a.geom::geography, r.line::geography) <  30000 THEN 0
+                    WHEN ST_Distance(a.geom::geography, r.line::geography) <  80000 THEN 1
+                    WHEN ST_Distance(a.geom::geography, r.line::geography) < 150000 THEN 2
+                    ELSE 3
+                END ASC,
+                -- within bucket, sweep along the line from start to end
+                ST_LineLocatePoint(r.line, a.geom) ASC,
+                a.id ASC
         """)
         return [int(r[0]) for r in cur.fetchall()]
 
