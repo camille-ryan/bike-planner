@@ -68,14 +68,12 @@ SEED_BBOX_RADIUS_M = 1000.0
 
 def _load_global_graph(
     conn: psycopg.Connection,
-) -> tuple[np.ndarray, np.ndarray, csr_matrix, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, csr_matrix]:
     """Stream all vertices + edges from postgres into RAM.
 
-    Returns (node_global, coords_xyz, csr, lon, lat):
-      node_global  int64[N], sorted ascending. Local-index → OSM vertex id.
-      coords_xyz   float32[N, 3], 3D unit-sphere embedding (for kdtree).
-      csr          float32[N, N], directed edge costs.
-      lon, lat     float32[N], raw geographic coords (for topology output).
+    Returns (node_global, coords_xyz, csr). Raw lon/lat are NOT kept
+    globally (~900 MB) — for topology saves we recover lon/lat from
+    coords_xyz on demand per anchor (cheap, only kept vertices).
     """
     print("[spts] loading global vertex set...", flush=True)
     t0 = time.time()
@@ -106,7 +104,8 @@ def _load_global_graph(
           flush=True)
 
     # 3D unit-sphere embedding so euclidean ball queries = great-circle chords.
-    # Keep raw lon/lat alongside for topology output (Phase C).
+    # We discard raw lon/lat after embedding — recovered on demand from
+    # coords_xyz in the per-anchor topology save.
     print("[spts] computing 3D-spherical embedding...", flush=True)
     t1 = time.time()
     lat_r = np.radians(lat, dtype=np.float32)
@@ -116,7 +115,7 @@ def _load_global_graph(
     coords_xyz[:, 0] = coslat * np.cos(lon_r)
     coords_xyz[:, 1] = coslat * np.sin(lon_r)
     coords_xyz[:, 2] = np.sin(lat_r)
-    del lat_r, lon_r, coslat
+    del lat, lon, lat_r, lon_r, coslat
     print(f"[spts]   embedding done in {time.time()-t1:.1f}s "
           f"({coords_xyz.nbytes / 1e9:.2f} GB)", flush=True)
 
@@ -175,7 +174,7 @@ def _load_global_graph(
           f"(data {csr.data.nbytes / 1e9:.2f} GB + "
           f"indices {csr.indices.nbytes / 1e9:.2f} GB + "
           f"indptr {csr.indptr.nbytes / 1e9:.2f} GB)", flush=True)
-    return node_global, coords_xyz, csr, lon, lat
+    return node_global, coords_xyz, csr
 
 
 def _build_kdtree(coords_xyz: np.ndarray) -> cKDTree:
@@ -487,19 +486,14 @@ def run(conn: psycopg.Connection, out_dir: Path) -> dict:
         print(f"[spts] all {len(ordered_ids):,} SPTs already on disk; "
               f"skipping global graph load", flush=True)
         node_global = coords_xyz = csr = kdtree = None
-        global_lon = global_lat = None
     else:
         print(f"[spts] {len(pending):,}/{len(ordered_ids):,} SPTs pending; "
               f"loading global graph...", flush=True)
-        node_global, coords_xyz, csr, global_lon, global_lat = _load_global_graph(conn)
+        node_global, coords_xyz, csr = _load_global_graph(conn)
         kdtree = _build_kdtree(coords_xyz)
-
-        # Pre-compute global out-degree for is_frontier byproduct: a kept
-        # vertex is at the geographic frontier iff its original out-degree
-        # exceeds its sub_csr out-degree (i.e., some road edge from it
-        # leads outside the 30 km region — the road CONTINUES past A's
-        # reach). Computed once globally; per-anchor lookup is one slice.
-        global_out_deg = np.diff(csr.indptr)
+        # Per-anchor `orig_out_deg` is computed on demand from
+        # csr.indptr[sub_idx + 1] - csr.indptr[sub_idx]. We don't keep
+        # a global out-degree array (would be another ~456 MB).
 
     # Phase C: topology output directory (one shared file per anchor;
     # profile-specific data goes under spt_dir/<anchor>.npz).
@@ -530,7 +524,7 @@ def run(conn: psycopg.Connection, out_dir: Path) -> dict:
 
         # is_frontier per subgraph vertex (precise: orig out-degree > slice).
         sub_out_deg = np.diff(sub_csr.indptr)
-        orig_out_deg_local = global_out_deg[sub_idx]
+        orig_out_deg_local = csr.indptr[sub_idx + 1] - csr.indptr[sub_idx]
         is_frontier_subgraph = orig_out_deg_local > sub_out_deg
 
         # Seeds: 1 km bbox + snap_vertex_id (uniform across all anchors).
@@ -571,14 +565,20 @@ def run(conn: psycopg.Connection, out_dir: Path) -> dict:
         # Phase C: shared topology file (lon/lat per kept vertex). One
         # per anchor, reused across profiles. Topology has no cost data.
         # Skip if it already exists from a prior run.
+        # Lon/lat are recovered from coords_xyz (the 3D unit-sphere
+        # embedding) rather than kept globally as separate arrays —
+        # saves ~900 MB of host memory during the cKDTree build.
         topology_path = topology_dir / f"{ci}.npz"
         if not topology_path.exists():
             kept_global_idx = sub_idx[keep_in_subgraph]
+            xyz_kept = coords_xyz[kept_global_idx]
+            kept_lon = np.degrees(np.arctan2(xyz_kept[:, 1], xyz_kept[:, 0])).astype(np.float32)
+            kept_lat = np.degrees(np.arcsin(np.clip(xyz_kept[:, 2], -1.0, 1.0))).astype(np.float32)
             np.savez(
                 topology_path,
                 node_global=node_arr,
-                lon=global_lon[kept_global_idx].astype(np.float32),
-                lat=global_lat[kept_global_idx].astype(np.float32),
+                lon=kept_lon,
+                lat=kept_lat,
             )
 
         written += 1
