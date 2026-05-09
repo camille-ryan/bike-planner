@@ -18,6 +18,7 @@ to Postgres every BATCH_SIZE rows. Process RSS stays under ~1 GB
 regardless of PBF size. Postgres's working memory is governed by the
 service's shared_buffers / work_mem (set in docker-compose).
 """
+import os
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Iterable
@@ -186,11 +187,28 @@ def _stream_pbf(conn: psycopg.Connection, pbf: Path) -> dict:
     print(f"[ingest] streaming {pbf.name}")
     h = _PgIngestHandler(conn)
     # Disk-backed node-location index: scales to corridor / continent-sized
-    # PBFs without ballooning RAM. flex_mem holds the whole node->coord
-    # table in memory (~5-8 GB for a 4-country corridor); sparse_file_array
-    # spills to disk and stays bounded. Trade-off: ~2x slower PBF parse.
-    h.apply_file(str(pbf), locations=True,
-                 idx="sparse_file_array,/tmp/osmium-locations.idx")
+    # PBFs without ballooning RAM. sparse_file_array spills to disk and
+    # stays bounded.
+    #
+    # Per-PBF index path: an earlier version shared
+    # `/tmp/osmium-locations.idx` across all four country PBFs. When
+    # processing the corridor in May 2026, the last-processed country
+    # (Denmark, after a 4.5 GB Germany PBF) ended up with ~12% of its
+    # expected edge count and a road graph fragmented into thousands of
+    # tiny disconnected components — Helsingør → Mørdrup wasn't routable
+    # in our graph despite being trivially routable on osm.org. Root
+    # cause: pyosmium silently swallows InvalidLocationError on missing
+    # node locations, and reusing the index file across PBFs led to
+    # nodes failing to resolve for the last country. Per-PBF idx files
+    # eliminate the failure mode; we also unlink each file when its
+    # PBF is done so /tmp doesn't grow unboundedly.
+    idx_path = f"/tmp/osmium-locations-{pbf.stem}.idx"
+    try:
+        h.apply_file(str(pbf), locations=True,
+                     idx=f"sparse_file_array,{idx_path}")
+    finally:
+        if os.path.exists(idx_path):
+            os.unlink(idx_path)
     h.finalize()
     print(f"[ingest]   {pbf.name}: nodes_written={h.nodes_written:,} "
           f"edges_written={h.edges_written:,} "
