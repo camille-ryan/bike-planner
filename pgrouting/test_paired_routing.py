@@ -282,20 +282,23 @@ def hit_production(start, end, profile="lht"):
 
 
 if __name__ == "__main__":
+    import os
+    # Default Graz→Wien; override with CHAIN env or args.
     GRAZ = (15.4395, 47.0707)
     WIEN = (16.3725, 48.2082)
+    CPH  = (12.5683, 55.6761)
+    pair = os.environ.get("CHAIN", "Graz,Wien")
+    if pair == "Graz,København":
+        START, END, chain_names = GRAZ, CPH, ["Graz", "København"]
+    else:
+        START, END, chain_names = GRAZ, WIEN, ["Graz", "Wien"]
 
-    # Hold globals once, then run 3 times in the same process so we see
-    # cold-vs-warm behaviour — same as production's lru_cache pattern.
-    print("PAIRED-SPT walk (3 runs, same process):")
+    print(f"PAIRED-SPT walk for {chain_names[0]} → {chain_names[-1]} (3 runs):")
     print("=" * 64)
     out_dir = config.SPT_DIR / "lht"
     spt_dir = out_dir / "spt"
     paired_dir = out_dir / "paired"
     cities, chain_adj = _load_meta(out_dir)
-
-    # Resolve chain once.
-    chain_names = ["Graz", "Wien"]
     name_to_idx = {c["name"]: c["city_idx"] for c in cities}
     waypoints = [name_to_idx[n] for n in chain_names]
     chain: list[int] = []
@@ -303,24 +306,22 @@ if __name__ == "__main__":
         leg = _chain_dijkstra(chain_adj, waypoints[i], waypoints[i + 1])
         chain.extend(leg if i == 0 else leg[1:])
 
-    # Pre-load: the destination's SPT (used for the final inbound walk
-    # to Wien-seed AND the e_vid → root segment), plus all paired SPTs
-    # for chain edges (i, i+1) with i = 1..N-2. The start city's SPT
-    # is NOT loaded.
-    #
-    # Some paired SPTs may not exist (e.g. final pair when the
-    # destination is a 100 km city — Mödling's whole reach lives
-    # inside Wien, so paired_(Mödling, Wien) has |kept| = 0). Those
-    # are loaded as None and the walker falls back to the
-    # destination's full SPT for that leg.
+    # Pre-load: paired SPTs for chain edges (i, i+1) with i=1..N-2,
+    # plus a "next-city SPT" sidecar per pair to use as a fallback
+    # when paired is degenerate (target is a 100 km city) or when
+    # current vertex isn't on the paired trunk. Final destination's
+    # SPT is loaded as the e_vid → root final segment's gradient.
     _t = time.time()
     chainN_spt = _load_spt(spt_dir, chain[-1])
-    paired = []
+    paired: list[dict | None] = []
+    fallback_spts: list[dict] = []
     for i in range(1, len(chain) - 1):
         path = paired_dir / f"{chain[i]}_{chain[i + 1]}.npz"
         paired.append(_load_paired(paired_dir, chain[i], chain[i + 1])
                       if path.exists() else None)
-    print(f"  pre-load (Wien SPT + {len(paired)} paired): {(time.time()-_t)*1000:.1f} ms")
+        fallback_spts.append(_load_spt(spt_dir, chain[i + 1]))
+    print(f"  pre-load (dest SPT + {len(paired)} paired + {len(fallback_spts)} "
+          f"fallback SPTs): {(time.time()-_t)*1000:.1f} ms")
     print()
 
     # Use the start city's anchor snap_vertex_id directly — guaranteed
@@ -334,26 +335,27 @@ if __name__ == "__main__":
         t0 = time.time()
         with psycopg.connect(config.PG_DSN) as conn:
             t_open = time.time()
-            e_vid = _snap(conn, WIEN[0], WIEN[1])
+            e_vid = _snap(conn, END[0], END[1])
             t_snap = time.time()
 
             full_path = [s_vid]
             current = s_vid
             t_app = time.time()
 
-            for p in paired:
+            for i, p in enumerate(paired):
                 cur_local = _local_idx(p["node_global"], current) if p is not None else -1
                 if cur_local < 0:
-                    # Either paired SPT was degenerate (None) or
-                    # current vertex isn't on this paired's trunk.
-                    # Falls back to the destination SPT's gradient,
-                    # which by construction reaches all chain
-                    # cities' regions. This case is the city-radius
-                    # tail of the chain (Mödling→Wien for Graz→Wien).
-                    cur_local = _local_idx(chainN_spt["node_global"], current)
+                    # Paired degenerate or current off-trunk. Fall
+                    # back to walking the next chain city's full SPT
+                    # toward its seeds.
+                    fb = fallback_spts[i]
+                    cur_local = _local_idx(fb["node_global"], current)
                     if cur_local < 0:
-                        raise RuntimeError(f"current {current} not in dest SPT for fallback")
-                    leg, _ = _walk_to_seed(chainN_spt, cur_local)
+                        raise RuntimeError(
+                            f"leg {i}: current {current} not in fallback "
+                            f"({cities[chain[i+1]]['name']})"
+                        )
+                    leg, _ = _walk_to_seed(fb, cur_local)
                     full_path.extend(leg[1:])
                     current = leg[-1]
                     continue
@@ -392,7 +394,7 @@ if __name__ == "__main__":
     print("=" * 64)
     for run in range(3):
         try:
-            p = hit_production(GRAZ, WIEN)
+            p = hit_production(START, END)
             print(f"  run {run+1}:  total={p['total_s']*1000:>7.1f} ms  pts={p['vertex_count']:,}")
         except Exception as e:
             print(f"  run {run+1}:  ERROR  {e}")
