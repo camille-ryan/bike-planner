@@ -247,7 +247,13 @@ def _per_anchor_spt(
     local_to_kept = np.full(len(sub_node_global), -9999, dtype=np.int32)
     local_to_kept[keep] = np.arange(len(keep), dtype=np.int32)
     pred = predecessors[keep]
-    parent_kept = np.where(pred >= 0, local_to_kept[pred], -9999).astype(np.int32)
+    # `np.where(cond, a, b)` evaluates BOTH branches everywhere, so
+    # `local_to_kept[pred]` indexes with -9999 in entries where
+    # pred < 0 (vertex has no predecessor — it's a seed). For small
+    # subgraphs that's out of range. Mask pred to a safe value before
+    # indexing, then overlay -9999 where the original was negative.
+    pred_safe = np.where(pred >= 0, pred, 0)
+    parent_kept = np.where(pred >= 0, local_to_kept[pred_safe], -9999).astype(np.int32)
     cost_kept = cost[keep].astype(np.float32)
     # Return `keep` (positions in sub_node_global of reachable vertices)
     # so callers can index per-subgraph arrays (is_frontier, edge_cost
