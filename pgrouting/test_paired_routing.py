@@ -44,11 +44,15 @@ def _load_spt(spt_dir: Path, city_idx: int) -> dict[str, np.ndarray]:
 
 def _load_paired(paired_dir: Path, a: int, b: int) -> dict[str, np.ndarray]:
     with np.load(paired_dir / f"{a}_{b}.npz") as d:
-        return {
+        out = {
             "node_global":  np.asarray(d["node_global"]),
             "parent_local": np.asarray(d["parent_local"]),
             "cost":         np.asarray(d["cost"]),
         }
+        if "lon" in d.files:
+            out["lon"] = np.asarray(d["lon"])
+            out["lat"] = np.asarray(d["lat"])
+        return out
 
 
 def _load_meta(out_dir: Path):
@@ -139,6 +143,25 @@ def _walk_to_seed(spt: dict, start_local: int, max_steps: int = 200_000):
             break
         cur = nxt
         out.append(int(node_global[cur]))
+    return out, cur
+
+
+def _walk_locals(spt: dict, start_local: int, max_steps: int = 200_000):
+    """Walk parent_local; return list of LOCAL indices visited
+    (start ... seed). Caller can directly index spt['lon']/spt['lat']
+    arrays without per-vertex conversion."""
+    parent = spt["parent_local"]
+    cost = spt["cost"]
+    out = [int(start_local)]
+    cur = int(start_local)
+    for _ in range(max_steps):
+        if cost[cur] == 0.0:
+            break
+        nxt = int(parent[cur])
+        if nxt < 0 or nxt == cur:
+            break
+        cur = nxt
+        out.append(cur)
     return out, cur
 
 
@@ -333,21 +356,38 @@ if __name__ == "__main__":
 
     for run in range(3):
         t0 = time.time()
+        deferred_vids: list[int] = []
+        deferred_pos: list[tuple[int, int]] = []  # (slot_start, count)
         with psycopg.connect(config.PG_DSN) as conn:
             t_open = time.time()
-            e_vid = _snap(conn, END[0], END[1])
+            # Snap end coord; start coord taken from the chain anchor
+            # (s_vid is the chain[0] anchor's snap_vertex_id by setup).
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT v.id, ST_X(v.the_geom), ST_Y(v.the_geom)
+                    FROM ways_vertices_pgr v
+                    WHERE v.the_geom && ST_Expand(ST_SetSRID(ST_MakePoint(%s, %s), 4326), 0.25)
+                    ORDER BY v.the_geom <-> ST_SetSRID(ST_MakePoint(%s, %s), 4326) LIMIT 1
+                """, (END[0], END[1], END[0], END[1]))
+                r = cur.fetchone()
+                e_vid = int(r[0])
             t_snap = time.time()
 
-            full_path = [s_vid]
+            lons: list[float] = []
+            lats: list[float] = []
+            full_path: list[int] = [s_vid]
             current = s_vid
+            lons.append(float(cities[chain[0]]["lon"]))
+            lats.append(float(cities[chain[0]]["lat"]))
             t_app = time.time()
 
             for i, p in enumerate(paired):
                 cur_local = _local_idx(p["node_global"], current) if p is not None else -1
+                used_paired = (cur_local >= 0 and "lon" in p)
                 if cur_local < 0:
-                    # Paired degenerate or current off-trunk. Fall
-                    # back to walking the next chain city's full SPT
-                    # toward its seeds.
+                    # Fallback to next chain city's full SPT — we
+                    # don't have embedded coords there, so we'll
+                    # re-look-up after the walk ends.
                     fb = fallback_spts[i]
                     cur_local = _local_idx(fb["node_global"], current)
                     if cur_local < 0:
@@ -355,29 +395,62 @@ if __name__ == "__main__":
                             f"leg {i}: current {current} not in fallback "
                             f"({cities[chain[i+1]]['name']})"
                         )
-                    leg, _ = _walk_to_seed(fb, cur_local)
-                    full_path.extend(leg[1:])
-                    current = leg[-1]
+                    leg_locals, end_loc = _walk_locals(fb, cur_local)
+                    leg_vids = fb["node_global"][np.asarray(leg_locals[1:], dtype=np.int32)]
+                    full_path.extend(int(v) for v in leg_vids)
+                    # Defer coords lookup — collect at end.
+                    deferred_vids.extend(int(v) for v in leg_vids)
+                    deferred_pos.append((len(lons), len(leg_vids)))
+                    lons.extend([float("nan")] * len(leg_vids))
+                    lats.extend([float("nan")] * len(leg_vids))
+                    current = int(fb["node_global"][end_loc])
                     continue
-                leg, _ = _walk_to_seed(p, cur_local)
-                full_path.extend(leg[1:])
-                current = leg[-1]
+
+                leg_locals, end_loc = _walk_locals(p, cur_local)
+                la = np.asarray(leg_locals[1:], dtype=np.int32)
+                lons.extend(p["lon"][la].tolist())
+                lats.extend(p["lat"][la].tolist())
+                full_path.extend(int(v) for v in p["node_global"][la])
+                current = int(p["node_global"][end_loc])
             t_paired = time.time()
 
+            # Final segment: walk chainN_spt parent from e_vid back to root.
             e_local = _local_idx(chainN_spt["node_global"], e_vid)
-            e_chain = []
-            cur = e_local
+            e_chain_locals: list[int] = []
+            cur_l = e_local
             for _ in range(200_000):
-                e_chain.append(cur)
-                if chainN_spt["cost"][cur] == 0.0: break
-                nxt = int(chainN_spt["parent_local"][cur])
-                if nxt < 0 or nxt == cur: break
-                cur = nxt
-            for li in reversed(e_chain):
-                full_path.append(int(chainN_spt["node_global"][li]))
+                e_chain_locals.append(cur_l)
+                if chainN_spt["cost"][cur_l] == 0.0: break
+                nxt = int(chainN_spt["parent_local"][cur_l])
+                if nxt < 0 or nxt == cur_l: break
+                cur_l = nxt
+            final_vids = chainN_spt["node_global"][np.asarray(e_chain_locals, dtype=np.int32)][::-1]
+            full_path.extend(int(v) for v in final_vids)
+            # Defer the final-segment coords too (no embedded coords).
+            deferred_vids.extend(int(v) for v in final_vids)
+            deferred_pos.append((len(lons), len(final_vids)))
+            lons.extend([float("nan")] * len(final_vids))
+            lats.extend([float("nan")] * len(final_vids))
             t_final = time.time()
 
-            coords = _coords_for(conn, full_path)
+            # One small postgres lookup for any deferred (= fallback +
+            # final-segment) vertices. Should be O(hundreds) total.
+            if deferred_vids:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id, ST_X(the_geom), ST_Y(the_geom)
+                        FROM ways_vertices_pgr
+                        WHERE id = ANY(%s::bigint[])
+                    """, (deferred_vids,))
+                    coord_map = {int(r[0]): (float(r[1]), float(r[2])) for r in cur.fetchall()}
+                # Fill in deferred coord slots.
+                k = 0
+                for slot_start, count in deferred_pos:
+                    for j in range(count):
+                        lon, lat = coord_map.get(deferred_vids[k], (float("nan"), float("nan")))
+                        lons[slot_start + j] = lon
+                        lats[slot_start + j] = lat
+                        k += 1
             t_coords = time.time()
 
         total = t_coords - t0
@@ -385,7 +458,7 @@ if __name__ == "__main__":
             f"  run {run+1}:  total={total*1000:>7.1f} ms  "
             f"connect={ (t_open-t0)*1000:>5.1f}  snap={(t_snap-t_open)*1000:>5.1f}  "
             f"approach={(t_app-t_snap)*1000:>5.1f}  paired={(t_paired-t_app)*1000:>5.1f}  "
-            f"final={(t_final-t_paired)*1000:>5.1f}  coords={(t_coords-t_final)*1000:>5.1f}  "
+            f"final={(t_final-t_paired)*1000:>5.1f}  defer={(t_coords-t_final)*1000:>5.1f}  "
             f"|  pts={len(full_path):,}"
         )
 

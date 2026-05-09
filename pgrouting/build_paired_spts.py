@@ -29,6 +29,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+import psycopg
 
 import config
 
@@ -79,6 +80,36 @@ def _load_spt(spt_dir: Path, city_idx: int) -> dict[str, np.ndarray]:
             "parent_local": np.asarray(d["parent_local"]),
             "cost":         np.asarray(d["cost"]),
         }
+
+
+def _fetch_coords(conn: psycopg.Connection, vids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Fetch (lon, lat) for a sorted-ascending int32/64 vid array.
+
+    Returns parallel float32 arrays, same length as vids. Postgres
+    returns rows ORDER BY id; since vids is already sorted, we just
+    align positionally — no extra dict map.
+    """
+    vid_list = vids.astype(np.int64).tolist()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, ST_X(the_geom), ST_Y(the_geom)
+            FROM   ways_vertices_pgr
+            WHERE  id = ANY(%s::bigint[])
+            ORDER  BY id
+            """,
+            (vid_list,),
+        )
+        rows = cur.fetchall()
+    if len(rows) != len(vids):
+        # Defensive: build a map and fill missing with NaN.
+        m = {int(r[0]): (float(r[1]), float(r[2])) for r in rows}
+        lon = np.array([m.get(int(v), (float("nan"),))[0] for v in vids], dtype=np.float32)
+        lat = np.array([m.get(int(v), (0.0, float("nan")))[1] for v in vids], dtype=np.float32)
+    else:
+        lon = np.array([r[1] for r in rows], dtype=np.float32)
+        lat = np.array([r[2] for r in rows], dtype=np.float32)
+    return lon, lat
 
 
 def _build_pair(a_spt: dict, b_spt: dict) -> dict | None:
@@ -172,40 +203,50 @@ def main(chain_names: list[str], profile: str = "lht") -> None:
             spt_cache[idx] = _load_spt(spt_dir, idx)
         return spt_cache[idx]
 
-    # Build paired_(chain[i], chain[i+1]) for i = 1..N-2 (skip i=0).
-    for i in range(1, len(chain) - 1):
-        a, b = chain[i], chain[i + 1]
-        t0 = time.time()
-        a_spt = get_spt(a); b_spt = get_spt(b)
-        t_load = time.time() - t0
+    # Open postgres for fetching (lon, lat) of kept vertices. Embedding
+    # coords directly in the paired SPT npz eliminates the postgres
+    # roundtrip during routing — ~300 ms saved per Graz→Cph query.
+    with psycopg.connect(config.PG_DSN) as conn:
+        # Build paired_(chain[i], chain[i+1]) for i = 1..N-2 (skip i=0).
+        for i in range(1, len(chain) - 1):
+            a, b = chain[i], chain[i + 1]
+            t0 = time.time()
+            a_spt = get_spt(a); b_spt = get_spt(b)
+            t_load = time.time() - t0
 
-        t1 = time.time()
-        pair = _build_pair(a_spt, b_spt)
-        t_build = time.time() - t1
+            t1 = time.time()
+            pair = _build_pair(a_spt, b_spt)
+            t_build = time.time() - t1
 
-        if pair is None:
-            print(f"[paired] {cities[a]['name']} → {cities[b]['name']}: degenerate (skipped)")
-            continue
+            if pair is None:
+                print(f"[paired] {cities[a]['name']} → {cities[b]['name']}: degenerate (skipped)")
+                continue
 
-        path = paired_dir / f"{a}_{b}.npz"
-        np.savez(path,
-                 node_global=pair["node_global"],
-                 parent_local=pair["parent_local"],
-                 cost=pair["cost"])
-        sz = path.stat().st_size
-        total_kept += pair["kept_size"]
-        total_a += pair["a_size"]
-        total_bytes += sz
-        print(
-            f"[paired] {cities[a]['name']:<22} → {cities[b]['name']:<22} "
-            f"|A|={pair['a_size']:>9,}  "
-            f"f_only={pair['f_only_size']:>9,}  "
-            f"frontier={pair['frontier_size']:>5,}  "
-            f"|kept|={pair['kept_size']:>9,} "
-            f"({100*pair['kept_size']/max(1,pair['a_size']):4.1f}% of A) "
-            f"{sz/1024:>7.1f} KB  "
-            f"build={t_load+t_build:.2f}s"
-        )
+            t2 = time.time()
+            lon, lat = _fetch_coords(conn, pair["node_global"])
+            t_coords = time.time() - t2
+
+            path = paired_dir / f"{a}_{b}.npz"
+            np.savez(path,
+                     node_global=pair["node_global"],
+                     parent_local=pair["parent_local"],
+                     cost=pair["cost"],
+                     lon=lon,
+                     lat=lat)
+            sz = path.stat().st_size
+            total_kept += pair["kept_size"]
+            total_a += pair["a_size"]
+            total_bytes += sz
+            print(
+                f"[paired] {cities[a]['name']:<22} → {cities[b]['name']:<22} "
+                f"|A|={pair['a_size']:>9,}  "
+                f"f_only={pair['f_only_size']:>9,}  "
+                f"frontier={pair['frontier_size']:>5,}  "
+                f"|kept|={pair['kept_size']:>9,} "
+                f"({100*pair['kept_size']/max(1,pair['a_size']):4.1f}% of A) "
+                f"{sz/1024:>7.1f} KB  "
+                f"build={t_load+t_build:.2f}s coords={t_coords:.2f}s"
+            )
 
     print(
         f"[paired] DONE in {time.time()-t_total:.1f}s. "
