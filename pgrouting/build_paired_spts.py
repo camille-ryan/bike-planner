@@ -162,6 +162,127 @@ def _filter_spt_to_radius(
     }
 
 
+def _identify_ferry_chain_pairs(
+    conn: psycopg.Connection, cities: list[dict], spt_dir: Path,
+    chain: list[int],
+) -> dict[tuple[int, int], int]:
+    """Find chain edges that cross a long ferry edge.
+
+    Returns dict {(a_idx, b_idx): b_terminal_vid}, where b_terminal_vid
+    is the vertex ID of the B-side ferry terminal — the endpoint where
+    a fake paired SPT walk should terminate.
+
+    Method: query postgres for long ferry edges (length ≥ 5 km — same
+    threshold compute_spts.py uses to flag a ferry-touching anchor).
+    For each ferry's two endpoints, find which chain anchor's SPT
+    covers it with minimum cost — that anchor "owns" the terminal.
+    Distinct owners → a ferry chain pair, in both directions.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT source, target, length_m
+            FROM   ways
+            WHERE  is_ferry AND length_m >= 5000
+              AND  (cost >= 0 OR reverse_cost >= 0)
+        """)
+        ferries = [(int(r[0]), int(r[1]), float(r[2])) for r in cur.fetchall()]
+    if not ferries:
+        return {}
+
+    ferry_endpoints = set()
+    for s, t, _ in ferries:
+        ferry_endpoints.add(s); ferry_endpoints.add(t)
+
+    # For each chain anchor, scan its SPT for ferry-endpoint membership.
+    # Keep the (anchor, cost) with the lowest cost per endpoint.
+    owners: dict[int, tuple[int, float]] = {}
+    for c in chain:
+        path = spt_dir / f"{c}.npz"
+        if not path.exists():
+            continue
+        with np.load(path) as d:
+            ng = np.asarray(d["node_global"])
+            cost = np.asarray(d["cost"])
+        for vt in ferry_endpoints:
+            pos = int(np.searchsorted(ng, vt))
+            if pos < len(ng) and int(ng[pos]) == vt:
+                cv = float(cost[pos])
+                if vt not in owners or cv < owners[vt][1]:
+                    owners[vt] = (c, cv)
+
+    pairs: dict[tuple[int, int], int] = {}
+    for s, t, _ in ferries:
+        a_owner = owners.get(s, (None,))[0]
+        b_owner = owners.get(t, (None,))[0]
+        if a_owner is None or b_owner is None or a_owner == b_owner:
+            continue
+        pairs[(a_owner, b_owner)] = t   # walking from a → terminate at t
+        pairs[(b_owner, a_owner)] = s
+    return pairs
+
+
+def _build_ferry_pair_fake(
+    a_spt: dict, b_spt_full: dict, b_terminal_vid: int,
+) -> dict | None:
+    """Build a 'fake' paired SPT for a ferry chain edge.
+
+    Uses B's full (unfiltered, 100 km) SPT — which contains the ferry
+    edge in its parent_local because B is ferry-touching — restricted
+    to vertices in A's filtered region plus the B-side terminal.
+    Walking parent_local from any A-region vertex traverses the ferry
+    and lands at b_terminal_vid, where the walk terminates because
+    b_terminal's parent in B.SPT lives in B's interior (which we
+    cut out).
+
+    The result is a slice of B.SPT, walked using B.SPT.parent — a
+    different gradient direction from the regular paired_(A, B) which
+    is a slice of A.SPT walked using A.SPT.parent. For ferry crossings
+    A.SPT.parent leads toward A's center, away from the ferry, so the
+    regular construction can't help.
+    """
+    a_ng = a_spt["node_global"].astype(np.int64)
+    b_ng = b_spt_full["node_global"]
+    b_par = b_spt_full["parent_local"]
+    b_cost = b_spt_full["cost"]
+
+    pos = np.searchsorted(b_ng, a_ng)
+    in_range = pos < len(b_ng)
+    in_a = np.zeros(len(b_ng), dtype=bool)
+    matched = pos[in_range]
+    in_a[matched] = (b_ng[matched].astype(np.int64) == a_ng[in_range])
+
+    # Explicitly include the B-side terminal (it might already be in A's
+    # region for short ferries, but safe to add).
+    bt_pos = int(np.searchsorted(b_ng, b_terminal_vid))
+    if bt_pos < len(b_ng) and int(b_ng[bt_pos]) == b_terminal_vid:
+        in_a[bt_pos] = True
+
+    kept_idx = np.flatnonzero(in_a)
+    if len(kept_idx) == 0:
+        return None
+
+    n = len(b_ng)
+    remap = np.full(n, -1, dtype=np.int32)
+    remap[kept_idx] = np.arange(len(kept_idx), dtype=np.int32)
+    parent_in_b = b_par[kept_idx]
+    parent_kept = remap[parent_in_b.clip(0)]
+    parent_local = np.where(
+        (parent_in_b >= 0) & (parent_kept >= 0),
+        parent_kept, np.int32(-9999),
+    ).astype(np.int32)
+
+    return {
+        "node_global":   b_ng[kept_idx].astype(np.int32),
+        "parent_local":  parent_local,
+        "cost":          b_cost[kept_idx].astype(np.float32),
+        "kept_size":     int(len(kept_idx)),
+        "a_size":        int(len(a_ng)),
+        "f_only_size":   int(len(a_ng)),  # all of A is kept
+        "frontier_size": 1,                # just b_terminal
+        "ferry":         True,
+    }
+
+
 def _build_pair(a_spt: dict, b_spt: dict) -> dict | None:
     """Slice A.SPT to keep F-only vertices plus B's frontier in A.
 
@@ -259,6 +380,19 @@ def main(chain_names: list[str], profile: str = "lht") -> None:
     # coords directly in the paired SPT npz eliminates the postgres
     # roundtrip during routing — ~300 ms saved per Graz→Cph query.
     with psycopg.connect(config.PG_DSN) as conn:
+        # Identify ferry chain edges up-front. These get a different
+        # construction (slice of B's full SPT walked via B.parent)
+        # because A.SPT.parent leads away from the ferry toward A-seed.
+        ferry_pairs = _identify_ferry_chain_pairs(conn, cities, spt_dir, chain)
+        if ferry_pairs:
+            print(f"[paired] ferry chain pairs detected: {len(ferry_pairs)//2}")
+            seen = set()
+            for (a, b), bt in ferry_pairs.items():
+                key = tuple(sorted((a, b)))
+                if key in seen: continue
+                seen.add(key)
+                print(f"[paired]   {cities[a]['name']} ↔ {cities[b]['name']}  "
+                      f"(B-terminal vid={bt})")
 
         def get_filtered_spt(idx: int) -> dict:
             """Return the 30 km-filtered version of an SPT if it's
@@ -283,14 +417,32 @@ def main(chain_names: list[str], profile: str = "lht") -> None:
                     )
             return filtered_cache[idx] or spt
         # Build paired_(chain[i], chain[i+1]) for i = 1..N-2 (skip i=0).
+        # Strategy: always try regular construction first; only fall
+        # back to the ferry-fake when (a) regular is degenerate
+        # (filtered A and B don't meaningfully overlap) AND (b) the
+        # pair was flagged as a ferry by the auto-detector. This
+        # avoids false positives from coastal anchors that happen to
+        # own ferry endpoints but are connected by land.
+        REGULAR_DEGENERATE_THRESHOLD = 200    # |kept| below this triggers ferry fallback
         for i in range(1, len(chain) - 1):
             a, b = chain[i], chain[i + 1]
             t0 = time.time()
-            a_spt = get_filtered_spt(a); b_spt = get_filtered_spt(b)
+            a_filt = get_filtered_spt(a)
+            b_filt = get_filtered_spt(b)
             t_load = time.time() - t0
 
             t1 = time.time()
-            pair = _build_pair(a_spt, b_spt)
+            pair = _build_pair(a_filt, b_filt)
+            is_ferry = False
+            if (pair is None or pair["kept_size"] < REGULAR_DEGENERATE_THRESHOLD) \
+               and (a, b) in ferry_pairs:
+                # Regular degenerate AND a real ferry crossing.
+                # Build the ferry-fake using B's full (unfiltered) SPT
+                # so the gradient carries the ferry edge.
+                pair = _build_ferry_pair_fake(
+                    a_filt, get_spt(b), ferry_pairs[(a, b)],
+                )
+                is_ferry = pair is not None
             t_build = time.time() - t1
 
             if pair is None:
@@ -312,8 +464,9 @@ def main(chain_names: list[str], profile: str = "lht") -> None:
             total_kept += pair["kept_size"]
             total_a += pair["a_size"]
             total_bytes += sz
+            kind = "FERRY" if is_ferry else "     "
             print(
-                f"[paired] {cities[a]['name']:<22} → {cities[b]['name']:<22} "
+                f"[paired] {kind} {cities[a]['name']:<22} → {cities[b]['name']:<22} "
                 f"|A|={pair['a_size']:>9,}  "
                 f"f_only={pair['f_only_size']:>9,}  "
                 f"frontier={pair['frontier_size']:>5,}  "
