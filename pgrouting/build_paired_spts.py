@@ -82,11 +82,32 @@ def _resolve_chain_by_name(cities, chain_adj, names: list[str]) -> list[int]:
 
 
 def _load_spt(spt_dir: Path, city_idx: int) -> dict[str, np.ndarray]:
+    """Load a per-anchor SPT npz. Newer npzs (Phase A+) include
+    `is_frontier` and CSR edge arrays; older npzs lack them and the
+    consumer must fall back to heuristics (e.g. cost-percentile)."""
     with np.load(spt_dir / f"{city_idx}.npz") as d:
-        return {
+        out = {
             "node_global":  np.asarray(d["node_global"]),
             "parent_local": np.asarray(d["parent_local"]),
             "cost":         np.asarray(d["cost"]),
+        }
+        for opt in ("is_frontier", "edge_indptr", "edge_indices", "edge_cost"):
+            if opt in d.files:
+                out[opt] = np.asarray(d[opt])
+        return out
+
+
+def _load_topology(topology_dir: Path, city_idx: int) -> dict | None:
+    """Load shared topology (lon/lat per kept vertex) for an anchor.
+    Returns None if the topology file doesn't exist (older builds)."""
+    p = topology_dir / f"{city_idx}.npz"
+    if not p.exists():
+        return None
+    with np.load(p) as d:
+        return {
+            "node_global": np.asarray(d["node_global"]),
+            "lon":         np.asarray(d["lon"]),
+            "lat":         np.asarray(d["lat"]),
         }
 
 
@@ -283,18 +304,27 @@ def _build_ferry_pair_fake(
     }
 
 
-def _build_pair(a_spt: dict, b_spt: dict) -> dict | None:
+def _build_pair(a_spt: dict, b_spt: dict, prune: bool = False) -> dict | None:
     """Slice A.SPT to keep F-only vertices plus B's frontier in A.
 
     F-only:      v ∈ A.SPT \\ B.SPT
     B-frontier:  v ∈ A.SPT ∩ B.SPT, and ∃ u ∈ F-only with
                  A.SPT.parent_local[u] == v's local position in A.
 
-    Kept = F-only ∪ B-frontier. Routing walks A.SPT.parent_local
-    within the kept set: parent_local is remapped so that any kept
-    vertex whose A-parent is in B's interior (which we excluded) gets
-    parent_local = -9999, naturally terminating the walk at the
-    B-frontier vertex on the way out.
+    Kept = F-only ∪ B-frontier (unpruned, default).
+
+    If `prune=True`, kept is further restricted to vertices whose
+    A.SPT.parent chain eventually reaches a B-frontier vertex — i.e.,
+    the optimal-path subset from F-only-leaves to B-frontier. F-only
+    vertices whose parent chain leads only to A-seed without crossing
+    B-frontier are excluded. Computed by vectorized fixpoint upward
+    propagation along parent_local; converges in O(SPT depth)
+    iterations.
+
+    Routing walks A.SPT.parent_local within the kept set: parent_local
+    is remapped so that any kept vertex whose A-parent is in B's
+    interior (which we excluded) gets parent_local = -9999, naturally
+    terminating the walk at the B-frontier vertex on the way out.
     """
     a_ng = a_spt["node_global"]
     a_par = a_spt["parent_local"]
@@ -317,8 +347,44 @@ def _build_pair(a_spt: dict, b_spt: dict) -> dict | None:
     candidates = f_only_parents[valid]
     b_frontier = np.unique(candidates[in_b[candidates]])
 
-    kept_mask = f_only.copy()
-    kept_mask[b_frontier] = True
+    if prune:
+        valid_par_mask = a_par >= 0
+        # Geographic frontier leaves on F-only side. PRECISE if A.SPT
+        # has the `is_frontier` byproduct (Phase A onwards): a vertex
+        # is at the geographic frontier iff its original road-graph
+        # out-degree exceeds its sub_csr out-degree (= some road edge
+        # leaves the 30 km region). HEURISTIC otherwise: top-20% A.cost.
+        if "is_frontier" in a_spt:
+            f_frontier_leaves = a_spt["is_frontier"].astype(bool) & f_only
+        else:
+            has_child = np.zeros(n, dtype=bool)
+            has_child[a_par[valid_par_mask]] = True
+            all_leaves = ~has_child & valid_par_mask
+            f_only_costs = a_cost[f_only]
+            if len(f_only_costs) == 0:
+                return None
+            cost_threshold = float(np.percentile(f_only_costs, 80))
+            f_frontier_leaves = all_leaves & f_only & (a_cost >= cost_threshold)
+
+        # Ancestors-of-frontier-leaves via vectorized fixpoint.
+        in_ancestors = f_frontier_leaves.copy()
+        prev_count = -1
+        for _ in range(2000):
+            cur_count = int(in_ancestors.sum())
+            if cur_count == prev_count:
+                break
+            prev_count = cur_count
+            marked = np.flatnonzero(in_ancestors & valid_par_mask)
+            if len(marked) == 0:
+                break
+            in_ancestors[a_par[marked]] = True
+
+        kept_mask = f_only & in_ancestors
+        kept_mask[b_frontier] = True
+    else:
+        kept_mask = f_only.copy()
+        kept_mask[b_frontier] = True
+
     kept_idx = np.flatnonzero(kept_mask)
     if len(kept_idx) == 0:
         return None
@@ -347,7 +413,7 @@ def _build_pair(a_spt: dict, b_spt: dict) -> dict | None:
     }
 
 
-def main(chain_names: list[str], profile: str = "lht") -> None:
+def main(chain_names: list[str], profile: str = "lht", prune: bool = False) -> None:
     out_dir = config.SPT_DIR / profile
     spt_dir = out_dir / "spt"
     paired_dir = out_dir / "paired"
@@ -432,13 +498,10 @@ def main(chain_names: list[str], profile: str = "lht") -> None:
             t_load = time.time() - t0
 
             t1 = time.time()
-            pair = _build_pair(a_filt, b_filt)
+            pair = _build_pair(a_filt, b_filt, prune=prune)
             is_ferry = False
             if (pair is None or pair["kept_size"] < REGULAR_DEGENERATE_THRESHOLD) \
                and (a, b) in ferry_pairs:
-                # Regular degenerate AND a real ferry crossing.
-                # Build the ferry-fake using B's full (unfiltered) SPT
-                # so the gradient carries the ferry edge.
                 pair = _build_ferry_pair_fake(
                     a_filt, get_spt(b), ferry_pairs[(a, b)],
                 )
@@ -489,6 +552,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--chain", default="Graz,Wien")
     p.add_argument("--profile", default="lht")
+    p.add_argument("--prune", action="store_true",
+        help="Prune kept set to vertices on optimal A-leaf → B-frontier paths")
     args = p.parse_args()
     names = [s.strip() for s in args.chain.split(",")]
-    main(names, profile=args.profile)
+    main(names, profile=args.profile, prune=args.prune)
