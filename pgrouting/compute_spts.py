@@ -178,9 +178,16 @@ def _load_global_graph(
 
 
 def _build_kdtree(coords_xyz: np.ndarray) -> cKDTree:
+    """Build a cKDTree on the 3D-spherical embedding of all vertices.
+
+    leafsize=64 (vs default 16) gives a smaller in-memory tree by
+    keeping more points per leaf (~4× fewer internal nodes). Marginally
+    slower per-query but saves significant RAM at 114 M points scale.
+    Default balanced_tree=True / compact_nodes=True for a compact tree.
+    """
     print("[spts] building cKDTree on 3D-spherical coords...", flush=True)
     t0 = time.time()
-    tree = cKDTree(coords_xyz, balanced_tree=False, compact_nodes=False)
+    tree = cKDTree(coords_xyz, leafsize=64)
     print(f"[spts]   cKDTree built in {time.time()-t0:.1f}s", flush=True)
     return tree
 
@@ -485,12 +492,19 @@ def run(conn: psycopg.Connection, out_dir: Path) -> dict:
     if not pending:
         print(f"[spts] all {len(ordered_ids):,} SPTs already on disk; "
               f"skipping global graph load", flush=True)
-        node_global = coords_xyz = csr = kdtree = None
+        node_global = csr = kdtree = None
     else:
         print(f"[spts] {len(pending):,}/{len(ordered_ids):,} SPTs pending; "
               f"loading global graph...", flush=True)
         node_global, coords_xyz, csr = _load_global_graph(conn)
         kdtree = _build_kdtree(coords_xyz)
+        # cKDTree retains a reference to coords_xyz via kdtree.data, so
+        # dropping our local doesn't free the array, but it does drop
+        # one redundant reference. The topology-output step reads from
+        # kdtree.data, not coords_xyz directly, so the local can go.
+        import gc
+        del coords_xyz
+        gc.collect()
         # Per-anchor `orig_out_deg` is computed on demand from
         # csr.indptr[sub_idx + 1] - csr.indptr[sub_idx]. We don't keep
         # a global out-degree array (would be another ~456 MB).
@@ -571,7 +585,10 @@ def run(conn: psycopg.Connection, out_dir: Path) -> dict:
         topology_path = topology_dir / f"{ci}.npz"
         if not topology_path.exists():
             kept_global_idx = sub_idx[keep_in_subgraph]
-            xyz_kept = coords_xyz[kept_global_idx]
+            # Read from kdtree.data, which is the cKDTree's owned copy
+            # of the 3D unit-sphere coordinates. No extra global array
+            # held by run() besides the kdtree itself.
+            xyz_kept = kdtree.data[kept_global_idx]
             kept_lon = np.degrees(np.arctan2(xyz_kept[:, 1], xyz_kept[:, 0])).astype(np.float32)
             kept_lat = np.degrees(np.arcsin(np.clip(xyz_kept[:, 2], -1.0, 1.0))).astype(np.float32)
             np.savez(
