@@ -303,36 +303,60 @@ if __name__ == "__main__":
         leg = _chain_dijkstra(chain_adj, waypoints[i], waypoints[i + 1])
         chain.extend(leg if i == 0 else leg[1:])
 
-    # Pre-load SPTs and paired files once (mimics what a server-side
-    # lru_cache would do across requests).
+    # Pre-load: the destination's SPT (used for the final inbound walk
+    # to Wien-seed AND the e_vid → root segment), plus all paired SPTs
+    # for chain edges (i, i+1) with i = 1..N-2. The start city's SPT
+    # is NOT loaded.
+    #
+    # Some paired SPTs may not exist (e.g. final pair when the
+    # destination is a 100 km city — Mödling's whole reach lives
+    # inside Wien, so paired_(Mödling, Wien) has |kept| = 0). Those
+    # are loaded as None and the walker falls back to the
+    # destination's full SPT for that leg.
     _t = time.time()
-    chain0_spt = _load_spt(spt_dir, chain[0])
     chainN_spt = _load_spt(spt_dir, chain[-1])
-    paired = [
-        _load_paired(paired_dir, chain[i], chain[i + 1])
-        for i in range(len(chain) - 1)
-    ]
-    print(f"  pre-load (Graz + Wien SPTs + 14 paired): {(time.time()-_t)*1000:.1f} ms")
+    paired = []
+    for i in range(1, len(chain) - 1):
+        path = paired_dir / f"{chain[i]}_{chain[i + 1]}.npz"
+        paired.append(_load_paired(paired_dir, chain[i], chain[i + 1])
+                      if path.exists() else None)
+    print(f"  pre-load (Wien SPT + {len(paired)} paired): {(time.time()-_t)*1000:.1f} ms")
     print()
+
+    # Use the start city's anchor snap_vertex_id directly — guaranteed
+    # to be a chain[0]-seed and therefore in paired_0_1's traced set.
+    # For an arbitrary user click that isn't on a precomputed trunk,
+    # production routing would need a small approach-Dijkstra step;
+    # that's out of scope for this experiment.
+    s_vid = int(cities[chain[0]]["snap_vertex_id"])
 
     for run in range(3):
         t0 = time.time()
         with psycopg.connect(config.PG_DSN) as conn:
             t_open = time.time()
-            s_vid = _snap(conn, GRAZ[0], GRAZ[1])
             e_vid = _snap(conn, WIEN[0], WIEN[1])
             t_snap = time.time()
 
-            s_local = _local_idx(chain0_spt["node_global"], s_vid)
-            approach_path, _ = _walk_to_seed(chain0_spt, s_local)
-            current = approach_path[-1]
-            full_path = list(approach_path)
+            full_path = [s_vid]
+            current = s_vid
             t_app = time.time()
 
             for p in paired:
-                cur_local = _local_idx(p["node_global"], current)
+                cur_local = _local_idx(p["node_global"], current) if p is not None else -1
                 if cur_local < 0:
-                    raise RuntimeError(f"current {current} off the trunk")
+                    # Either paired SPT was degenerate (None) or
+                    # current vertex isn't on this paired's trunk.
+                    # Falls back to the destination SPT's gradient,
+                    # which by construction reaches all chain
+                    # cities' regions. This case is the city-radius
+                    # tail of the chain (Mödling→Wien for Graz→Wien).
+                    cur_local = _local_idx(chainN_spt["node_global"], current)
+                    if cur_local < 0:
+                        raise RuntimeError(f"current {current} not in dest SPT for fallback")
+                    leg, _ = _walk_to_seed(chainN_spt, cur_local)
+                    full_path.extend(leg[1:])
+                    current = leg[-1]
+                    continue
                 leg, _ = _walk_to_seed(p, cur_local)
                 full_path.extend(leg[1:])
                 current = leg[-1]
