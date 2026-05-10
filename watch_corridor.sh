@@ -7,9 +7,10 @@
 #
 # Detects which stage is active (Stage 1 = per-anchor SPTs, Stage 2 =
 # corridor-wide paired-trunk DB) and shows the relevant counters, rate,
-# and ETA. Picks up either /tmp/rebuild-*.log (full launch_rebuild.sh)
-# or /tmp/corridor-*.log (legacy launch_corridor.sh). Exits when
-# stage 2 finishes (paired_trunks.db present and stable).
+# and ETA. Picks up /tmp/rebuild-*.log (full launch_rebuild.sh),
+# /tmp/resume-*.log (launch_resume_paired.sh — stage 2 only), or
+# /tmp/corridor-*.log (legacy launch_corridor.sh). Exits when stage 2
+# finishes (paired_trunks.db present and stable).
 
 set -u
 
@@ -108,8 +109,9 @@ while true; do
     pgrouting_stats=$(docker stats --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}" "$cname" 2>/dev/null | head -1)
   fi
 
-  # Pick the freshest log file (rebuild-*.log preferred; corridor-*.log fallback).
-  latest_log=$(ls -t /tmp/rebuild-*.log /tmp/corridor-*.log 2>/dev/null | head -1)
+  # Pick the freshest log file. rebuild-*.log = full two-stage launcher;
+  # resume-*.log = stage-2-only resume; corridor-*.log = legacy.
+  latest_log=$(ls -t /tmp/rebuild-*.log /tmp/resume-*.log /tmp/corridor-*.log 2>/dev/null | head -1)
   log_tail=""
   log_mtime=""
   log_age=""
@@ -180,7 +182,7 @@ while true; do
   if [ -n "$log_tail" ]; then
     echo "$log_tail"
   else
-    echo "  (no log file found at /tmp/rebuild-*.log or /tmp/corridor-*.log)"
+    echo "  (no log file found at /tmp/rebuild-*.log, /tmp/resume-*.log, or /tmp/corridor-*.log)"
   fi
   echo
   echo "  log file: ${latest_log:-none}"
