@@ -65,6 +65,36 @@ button#route-btn:hover:not(:disabled) { background: #2a4; }
 .pin.start { background: #2c5; }
 .pin.end   { background: #c52; }
 
+.waypoint-row {
+  display: flex; align-items: center; gap: 0.3rem;
+  margin-bottom: 0.3rem;
+}
+.wp-label {
+  flex: 0 0 22px; height: 22px; border-radius: 50%;
+  color: white; text-align: center; line-height: 22px;
+  font-weight: bold; font-size: 12px;
+}
+.wp-label.start { background: #2c5; }
+.wp-label.end   { background: #c52; }
+.wp-label.mid   { background: #888; }
+.wp-input {
+  flex: 1; min-width: 0;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid #bbb; border-radius: 3px;
+  font: inherit; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.78rem;
+}
+.wp-pick, .wp-remove {
+  flex: 0 0 auto; padding: 0.2rem 0.4rem;
+  font-size: 0.85rem; line-height: 1;
+}
+.wp-pick.armed { background: #2c5; color: white; border-color: #2c5; }
+.wp-remove { color: #c52; }
+button.secondary {
+  background: #fafaf8; color: #555; border-color: #bbb;
+  font-size: 0.78rem; padding: 0.25rem 0.5rem;
+}
+
 .hint { color: #888; font-size: 0.78rem; margin: 0.3rem 0 0; }
 
 main {

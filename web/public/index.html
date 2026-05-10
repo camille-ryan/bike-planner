@@ -16,41 +16,33 @@
       </header>
 
       <section id="instructions">
-        <p><strong>Click the map</strong> to drop waypoints: 1st = <span class="pin start">start</span>, 2nd = <span class="pin end">end</span>, more clicks insert via-points along the route. <em>Use 2–3 via-points for routes longer than ~600 km</em> — BRouter scales much better that way.</p>
+        <p>Type <strong>lon,lat</strong> or click <strong>📍</strong> then a map point. <em>Press Enter or click Route. Add midpoints to bias the chain through specific places.</em></p>
       </section>
 
       <section id="controls">
+        <div class="waypoint-row" data-role="start">
+          <span class="wp-label start">S</span>
+          <input type="text" class="wp-input" placeholder="lon,lat" />
+          <button class="wp-pick" title="Pick from map">📍</button>
+        </div>
+        <div id="midpoints"></div>
+        <div class="waypoint-row" data-role="end">
+          <span class="wp-label end">E</span>
+          <input type="text" class="wp-input" placeholder="lon,lat" />
+          <button class="wp-pick" title="Pick from map">📍</button>
+        </div>
+        <div class="row">
+          <button id="add-midpoint" class="secondary">+ Midpoint</button>
+        </div>
         <div class="row">
           <label>Profile
             <select id="profile">
-              <option value="lht" selected>lht (Long Haul Trucker)</option>
-              <option value="trekking">trekking</option>
-              <option value="trekking-noferries">trekking-noferries</option>
-              <option value="gravel">gravel</option>
-              <option value="fastbike-lowtraffic">fastbike-lowtraffic</option>
-            </select>
-          </label>
-        </div>
-        <div class="row">
-          <label>Alts
-            <input type="number" id="alternatives" min="0" max="3" value="2" />
-          </label>
-          <label class="checkbox">
-            <input type="checkbox" id="rerank" checked />
-            re-rank
-          </label>
-        </div>
-        <div class="row">
-          <label>Engine
-            <select id="engine">
-              <option value="brouter" selected>BRouter (live)</option>
-              <option value="spt">SPT (precomputed)</option>
+              <option value="lht" selected>lht</option>
             </select>
           </label>
         </div>
         <div class="row">
           <button id="route-btn" disabled>Route</button>
-          <button id="stages-btn" disabled>Stages (~100 km)</button>
           <button id="clear-btn">Clear</button>
         </div>
       </section>
@@ -68,13 +60,25 @@
       <section id="cells-section">
         <h2>Cells &amp; gradients</h2>
         <label class="checkbox"><input type="checkbox" id="show-anchors" />Show city anchors</label>
-        <p class="hint">Click an anchor to overlay its <em>cost gradient</em> — every road node assigned to that anchor in the multi-source SPT, colored by routing cost from the anchor. Updates live as the preprocess wave loop progresses.</p>
+        <div class="row">
+          <label>SPT max cost (km)
+            <input type="number" id="max-cost-km" min="1" max="100" step="1" value="15" />
+          </label>
+        </div>
+        <p class="hint">Click an anchor to overlay its <em>SPT</em> — every reachable road edge within the cost limit, colored by cost-from-anchor. Lower = sharper + faster; higher (up to 100 km cap) = more reach but laggier. Click again to clear.</p>
+      </section>
+
+      <section id="biome-section">
+        <h2>Map overlays</h2>
+        <label class="checkbox"><input type="checkbox" id="show-biome" />Biome / ecoregion (Resolve 2017)</label>
+        <label class="checkbox"><input type="checkbox" id="show-landcover" />Land cover (forest / agricultural / urban / water / wetland)</label>
+        <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name. Land cover: OSM landuse polygons rolled up to 5 classes — captures actual transitions between forest, cropland and urban for the corridor (AT, CZ, DE, DK only).</p>
       </section>
 
       <section id="results"></section>
 
       <footer>
-        <p class="hint">api at <code>/api/</code> · BRouter via <code>/api/route</code></p>
+        <p class="hint">api at <code>/api/</code> · routing via <code>/api/spt/route</code></p>
       </footer>
     </aside>
 

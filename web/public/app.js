@@ -3,6 +3,10 @@
 
 const API = "/api";
 
+// Default route on app load.
+const DEFAULT_START = [15.4395, 47.0707];   // Graz
+const DEFAULT_END   = [12.5683, 55.6761];   // København
+
 // --- map setup ---------------------------------------------------------
 
 const map = new maplibregl.Map({
@@ -40,57 +44,41 @@ map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "
 // --- state -------------------------------------------------------------
 
 const state = {
-  // 1st click = start, 2nd = end, every additional click inserts a via-point
-  // at whichever segment midpoint is closest to the click. Required for the
-  // long-corridor case where BRouter can't plan ~1300km point-to-point.
-  waypoints: [],      // [[lon, lat], ...]
-  routes: [],         // GeoJSON Features from /route
+  // Each waypoint: { role: 'start'|'mid'|'end', coord: [lon, lat]|null,
+  //                  input: HTMLInputElement, row: HTMLElement }
+  // The chainless SPT engine routes pairwise; midpoints chain N legs.
+  waypoints: [],
+  pickArmed: null,    // waypoint expecting next map click, or null
+  routes: [],         // merged GeoJSON Feature(s) from leg concat
   activeIdx: 0,
-  legs: [],           // from /stages
+  routeReqId: 0,      // increments per routeNow; stale responses are discarded
   poiMarkers: { viewpoint: [], lodging: [], food: [], bike_service: [], water: [] },
   waypointMarkers: [],
-  // Voronoi cells (Phase 3 SPT preprocess output).
-  cities: null,            // [{city_idx, name, lon, lat, ...}]
-  anchorMarkers: [],       // maplibre Markers for each city anchor
-  shownCellIdx: null,      // currently displayed cell, null when none
+  cities: null,
+  anchorMarkers: [],
+  shownCellIdx: null,
 };
 
 // --- map sources / layers (initialized once map loads) -----------------
 
 map.on("load", () => {
   map.addSource("route-active", { type: "geojson", data: emptyFC() });
-  map.addSource("route-alts",   { type: "geojson", data: emptyFC() });
-  map.addSource("legs",         { type: "geojson", data: emptyFC() });
-
-  map.addLayer({
-    id: "route-alts-line",
-    type: "line",
-    source: "route-alts",
-    paint: { "line-color": "#888", "line-width": 3, "line-opacity": 0.45, "line-dasharray": [1, 1.5] },
-  });
   map.addLayer({
     id: "route-active-line",
     type: "line",
     source: "route-active",
     paint: { "line-color": "#2c5", "line-width": 5, "line-opacity": 0.95 },
   });
+
   map.addSource("cell-gradient", { type: "geojson", data: emptyFC() });
-  // Cost-from-anchor heatmap: every cell-internal road edge as a
-  // LineString colored by cost. Lives below the route lines so an
-  // active route stays readable on top. Color stops are set per-fetch
-  // via setPaintProperty so the ramp stretches across the actual
-  // cost range of the cell (varies by city size + wave progress).
+  // SPT visualization: each non-seed vertex's edge to its parent_local,
+  // colored by cost-from-anchor. Lives below the route line so an
+  // active route stays readable on top.
   map.addLayer({
     id: "cell-gradient-lines",
     type: "line",
     source: "cell-gradient",
-    layout: {
-      // butt cap (not round) — each edge is its own 2-point LineString,
-      // round caps would draw a small dot at every endpoint and the
-      // overall network would look stippled.
-      "line-cap": "butt",
-      "line-join": "miter",
-    },
+    layout: { "line-cap": "butt", "line-join": "miter" },
     paint: {
       "line-width": [
         "interpolate", ["linear"], ["zoom"],
@@ -107,39 +95,13 @@ map.on("load", () => {
       ],
       "line-opacity": 0.7,
     },
-  }, "route-alts-line");
-
-  map.addLayer({
-    id: "legs-points",
-    type: "circle",
-    source: "legs",
-    paint: {
-      "circle-radius": 8,
-      "circle-color": "#fff",
-      "circle-stroke-color": "#c52",
-      "circle-stroke-width": 3,
-    },
-  });
-  map.addLayer({
-    id: "legs-labels",
-    type: "symbol",
-    source: "legs",
-    layout: {
-      "text-field": ["get", "n"],
-      "text-size": 11,
-      "text-font": ["Noto Sans Regular"],
-      "text-allow-overlap": true,
-    },
-    paint: { "text-color": "#000" },
-  });
+  }, "route-active-line");
 });
 
 // --- helpers -----------------------------------------------------------
 
 function emptyFC() { return { type: "FeatureCollection", features: [] }; }
-
 function fmtKm(m) { return (m / 1000).toFixed(1) + " km"; }
-function fmtH(s)  { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60); return `${h}h${String(m).padStart(2, "0")}`; }
 
 async function api(path, params) {
   const u = new URL(API + path, location.origin);
@@ -151,152 +113,257 @@ async function api(path, params) {
   return r.json();
 }
 
-// --- click to place waypoints -----------------------------------------
+// --- waypoint inputs --------------------------------------------------
+//
+// Inputs are the source of truth. Map click only fires when a 📍 button
+// has been "armed" — otherwise clicks just hit the basemap and do
+// nothing for routing (anchor markers still handle their own clicks).
 
-map.on("click", (e) => {
-  insertWaypoint([e.lngLat.lng, e.lngLat.lat]);
-  refreshWaypointMarkers();
-  const ready = state.waypoints.length >= 2;
-  document.getElementById("route-btn").disabled = !ready;
-  document.getElementById("stages-btn").disabled = !ready;
-});
+function parseLonLat(s) {
+  const m = (s || "").trim().match(/^(-?\d+(?:\.\d+)?)[ ,;\t]+(-?\d+(?:\.\d+)?)$/);
+  if (!m) return null;
+  const a = +m[1], b = +m[2];
+  if (!isFinite(a) || !isFinite(b)) return null;
+  return [a, b];
+}
 
-// Insert by closest-segment-midpoint: a click between Prague and Berlin lands
-// in the right slot regardless of click order. First two clicks just append
-// (start, end); subsequent clicks pick the segment they're nearest to.
-function insertWaypoint(lonlat) {
-  if (state.waypoints.length < 2) {
-    state.waypoints.push(lonlat);
+function bindWaypoint(row, role) {
+  const wp = {
+    role,
+    coord: null,
+    input: row.querySelector(".wp-input"),
+    pickBtn: row.querySelector(".wp-pick"),
+    row,
+  };
+  wp.input.addEventListener("input", () => {
+    wp.coord = parseLonLat(wp.input.value);
+    refreshWaypointMarkers();
+    updateRouteButton();
+  });
+  wp.input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !document.getElementById("route-btn").disabled) {
+      routeNow();
+    }
+  });
+  wp.pickBtn.addEventListener("click", () => armPick(wp));
+  return wp;
+}
+
+function armPick(wp) {
+  // Toggle off if same waypoint is clicked again.
+  for (const w of state.waypoints) w.pickBtn.classList.remove("armed");
+  if (state.pickArmed === wp) {
+    state.pickArmed = null;
+    map.getCanvas().style.cursor = "";
     return;
   }
-  let bestIdx = state.waypoints.length;  // default: append at end
-  let bestDist = Infinity;
-  for (let i = 0; i < state.waypoints.length - 1; i++) {
-    const a = state.waypoints[i], b = state.waypoints[i + 1];
-    const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-    const d = haversine(lonlat, mid);
-    if (d < bestDist) { bestDist = d; bestIdx = i + 1; }
+  state.pickArmed = wp;
+  wp.pickBtn.classList.add("armed");
+  map.getCanvas().style.cursor = "crosshair";
+}
+
+function disarmPick() {
+  if (!state.pickArmed) return;
+  state.pickArmed.pickBtn.classList.remove("armed");
+  state.pickArmed = null;
+  map.getCanvas().style.cursor = "";
+}
+
+map.on("click", (e) => {
+  if (!state.pickArmed) return;
+  const wp = state.pickArmed;
+  const lon = e.lngLat.lng, lat = e.lngLat.lat;
+  wp.coord = [lon, lat];
+  wp.input.value = `${lon.toFixed(5)},${lat.toFixed(5)}`;
+  disarmPick();
+  refreshWaypointMarkers();
+  updateRouteButton();
+});
+
+function addMidpoint(coord = null) {
+  const endIdx = state.waypoints.findIndex(w => w.role === "end");
+  if (endIdx < 0) return null;
+  const row = document.createElement("div");
+  row.className = "waypoint-row";
+  row.dataset.role = "mid";
+  row.innerHTML = `
+    <span class="wp-label mid">·</span>
+    <input type="text" class="wp-input" placeholder="lon,lat" />
+    <button class="wp-pick" title="Pick from map">📍</button>
+    <button class="wp-remove" title="Remove midpoint">✕</button>
+  `;
+  document.getElementById("midpoints").appendChild(row);
+  const wp = bindWaypoint(row, "mid");
+  state.waypoints.splice(endIdx, 0, wp);
+  row.querySelector(".wp-remove").addEventListener("click", () => removeWp(wp));
+  if (coord) {
+    wp.coord = coord;
+    wp.input.value = `${coord[0].toFixed(5)},${coord[1].toFixed(5)}`;
   }
-  state.waypoints.splice(bestIdx, 0, lonlat);
+  renumberMidpoints();
+  refreshWaypointMarkers();
+  updateRouteButton();
+  return wp;
+}
+
+function removeWp(wp) {
+  const i = state.waypoints.indexOf(wp);
+  if (i < 0) return;
+  if (state.pickArmed === wp) disarmPick();
+  state.waypoints.splice(i, 1);
+  wp.row.remove();
+  renumberMidpoints();
+  refreshWaypointMarkers();
+  updateRouteButton();
+}
+
+function renumberMidpoints() {
+  state.waypoints
+    .filter(w => w.role === "mid")
+    .forEach((w, i) => {
+      w.row.querySelector(".wp-label").textContent = String(i + 1);
+    });
+}
+
+function updateRouteButton() {
+  const allValid = state.waypoints.length >= 2 &&
+                   state.waypoints.every(w => w.coord);
+  document.getElementById("route-btn").disabled = !allValid;
 }
 
 function refreshWaypointMarkers() {
   state.waypointMarkers.forEach(m => m.remove());
   state.waypointMarkers = [];
-  state.waypoints.forEach((p, i) => {
-    const isStart = i === 0;
-    const isEnd = i === state.waypoints.length - 1;
-    const color = isStart ? "#2c5" : (isEnd ? "#c52" : "#888");
-    const label = isStart ? "S" : (isEnd ? "E" : String(i));
+  let midNum = 0;
+  state.waypoints.forEach((w) => {
+    if (!w.coord) return;
+    let color, label;
+    if (w.role === "start")    { color = "#2c5"; label = "S"; }
+    else if (w.role === "end") { color = "#c52"; label = "E"; }
+    else                       { color = "#888"; label = String(++midNum); }
     const el = document.createElement("div");
-    el.style.cssText = `width:22px;height:22px;border-radius:50%;background:${color};color:white;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:13px;border:2px solid white;box-shadow:0 1px 3px rgba(0,0,0,0.3);cursor:grab;`;
+    el.style.cssText = `width:22px;height:22px;border-radius:50%;background:${color};color:white;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:13px;border:2px solid white;box-shadow:0 1px 3px rgba(0,0,0,0.3);`;
     el.textContent = label;
-    const m = new maplibregl.Marker({ element: el, draggable: false }).setLngLat(p).addTo(map);
+    const m = new maplibregl.Marker({ element: el }).setLngLat(w.coord).addTo(map);
     state.waypointMarkers.push(m);
   });
 }
 
 document.getElementById("clear-btn").addEventListener("click", clearAll);
+document.getElementById("add-midpoint").addEventListener("click", () => addMidpoint());
 
 function clearAll() {
-  state.waypoints = [];
+  // Clear inputs but keep start/end rows; remove midpoints entirely.
+  for (const w of [...state.waypoints]) {
+    if (w.role === "mid") {
+      w.row.remove();
+    } else {
+      w.input.value = "";
+      w.coord = null;
+    }
+  }
+  state.waypoints = state.waypoints.filter(w => w.role !== "mid");
+  disarmPick();
   state.routes = [];
-  state.legs = [];
   state.activeIdx = 0;
-  document.getElementById("route-btn").disabled = true;
-  document.getElementById("stages-btn").disabled = true;
   state.waypointMarkers.forEach(m => m.remove());
   state.waypointMarkers = [];
   if (map.getSource("route-active")) map.getSource("route-active").setData(emptyFC());
-  if (map.getSource("route-alts"))   map.getSource("route-alts").setData(emptyFC());
-  if (map.getSource("legs"))         map.getSource("legs").setData(emptyFC());
   document.getElementById("results").innerHTML = "";
   document.getElementById("elevation").innerHTML = "";
+  updateRouteButton();
 }
 
 // --- route ------------------------------------------------------------
 
-document.getElementById("route-btn").addEventListener("click", async () => {
-  if (state.waypoints.length < 2) return;
+document.getElementById("route-btn").addEventListener("click", routeNow);
+
+async function routeNow() {
+  const valid = state.waypoints.filter(w => w.coord);
+  if (valid.length < 2) return;
   const profile = document.getElementById("profile").value;
-  const engine  = document.getElementById("engine").value;
-  if (engine === "spt") {
-    // Precomputed SPT engine: takes a single from/to pair, returns one path.
-    // Intermediate via-points are ignored by design — the city-graph plan
-    // already chooses the corridor.
-    const from = state.waypoints[0].join(",");
-    const to   = state.waypoints[state.waypoints.length - 1].join(",");
-    setBusy("Routing via SPT…");
-    try {
-      const r = await api("/spt/route", { from, to, profile });
-      // Adapt to the route-card renderer's expected shape.
-      const f = r.route;
-      f.properties = { ...f.properties,
-        "alternativeidx": 0,
-        "total-time": 0,
-        "filtered ascend": 0,
-      };
-      state.routes = [f];
-      state.activeIdx = 0;
-      renderRoutes();
-    } catch (e) {
-      setError(e.message);
-    }
-    return;
-  }
-  // BRouter path (existing behavior).
-  const alternatives = +document.getElementById("alternatives").value;
-  const rerank = document.getElementById("rerank").checked;
-  const lonlats = state.waypoints.map(p => p.join(",")).join("|");
-  setBusy(`Routing ${state.waypoints.length} waypoints…`);
+  const legCount = valid.length - 1;
+  // Bump the request id so any in-flight earlier routeNow (e.g. the
+  // ~10 s cold first-page-load default route) becomes stale and its
+  // late-arriving response is dropped instead of overwriting this one.
+  const myReqId = ++state.routeReqId;
+  setBusy(`Routing ${legCount} leg${legCount > 1 ? "s" : ""}…`);
   try {
-    const r = await api("/route", { lonlats, profile, alternatives, rerank });
-    state.routes = r.routes;
+    const legs = await Promise.all(
+      Array.from({ length: legCount }, (_, i) =>
+        api("/spt/route", {
+          from: valid[i].coord.join(","),
+          to:   valid[i + 1].coord.join(","),
+          profile,
+        })
+      )
+    );
+    if (myReqId !== state.routeReqId) return;   // superseded
+    state.routes = [mergeLegs(legs.map(r => r.route))];
     state.activeIdx = 0;
     renderRoutes();
   } catch (e) {
+    if (myReqId !== state.routeReqId) return;   // superseded
     setError(e.message);
   }
-});
+}
+
+function mergeLegs(legs) {
+  // Concatenate coordinates; drop the first point of each leg after the
+  // first to avoid a duplicated vertex at the join. Sum track-length
+  // and node-count; concat city sequences with the same dedup.
+  const coords = [];
+  let totalLen = 0;
+  let totalNodes = 0;
+  const cities = [];
+  for (const leg of legs) {
+    const lc = leg.geometry.coordinates;
+    if (coords.length > 0 && lc.length > 0) coords.push(...lc.slice(1));
+    else coords.push(...lc);
+    totalLen += +leg.properties["track-length"] || 0;
+    totalNodes += +leg.properties["node-count"] || 0;
+    const lcities = leg.properties.cities || [];
+    for (const c of lcities) {
+      if (cities[cities.length - 1] !== c) cities.push(c);
+    }
+  }
+  return {
+    type: "Feature",
+    geometry: { type: "LineString", coordinates: coords },
+    properties: {
+      creator: "spt-router",
+      cities,
+      "track-length": totalLen,
+      "node-count": totalNodes,
+      "leg-count": legs.length,
+    },
+  };
+}
 
 function renderRoutes() {
   const active = state.routes[state.activeIdx];
-  const others = state.routes.filter((_, i) => i !== state.activeIdx);
-  map.getSource("route-active").setData({ type: "FeatureCollection", features: active ? [active] : [] });
-  map.getSource("route-alts").setData({ type: "FeatureCollection", features: others });
+  map.getSource("route-active").setData({
+    type: "FeatureCollection",
+    features: active ? [active] : [],
+  });
 
   if (active) {
     const bbox = lineBbox(active.geometry.coordinates);
     map.fitBounds(bbox, { padding: 60, maxZoom: 13 });
-    drawElevation(active.geometry.coordinates);
   }
 
-  const html = state.routes.map((r, i) => {
-    const p = r.properties;
+  const html = state.routes.map((r) => {
+    const p = r.properties || {};
     const km = fmtKm(+p["track-length"] || 0);
-    const t  = fmtH(+p["total-time"] || 0);
-    const climb = `${Math.round(+(p["filtered ascend"] || p["filtered-ascend"]) || 0)} m`;
-    const sc = p.scoring;
-    const cls = i === state.activeIdx ? "active" : "";
-    const name = sc ? `Alt ${p.alternativeidx} · score ${sc.composite_score}` : `Alt ${p.alternativeidx}`;
-    let extras = "";
-    if (sc) extras = `<div class="stat"><span>curvy descent</span><span>${sc.curvy_descent_penalty}</span></div>
-                     <div class="stat"><span>viewpoints near</span><span>${sc.viewpoints_near_route}</span></div>`;
-    return `<div class="route-card ${cls}" data-idx="${i}">
-      <div class="name">${name}</div>
+    const cities = (p.cities || []).join(" → ");
+    return `<div class="route-card active">
+      <div class="name">SPT route</div>
       <div class="stat"><span>distance</span><span>${km}</span></div>
-      <div class="stat"><span>climb</span><span>${climb}</span></div>
-      <div class="stat"><span>time</span><span>${t}</span></div>
-      ${extras}
+      <div class="stat"><span>nodes</span><span>${(+p["node-count"] || 0).toLocaleString()}</span></div>
+      ${cities ? `<div class="stat" style="grid-template-columns: 1fr;"><span><em>${cities}</em></span></div>` : ""}
     </div>`;
   }).join("");
   document.getElementById("results").innerHTML = html;
-  document.querySelectorAll(".route-card").forEach(el => {
-    el.addEventListener("click", () => {
-      state.activeIdx = +el.dataset.idx;
-      renderRoutes();
-    });
-  });
 }
 
 function lineBbox(coords) {
@@ -308,107 +375,6 @@ function lineBbox(coords) {
     if (c[1] > s) s = c[1];
   }
   return [[w, n], [e, s]];
-}
-
-// --- elevation profile ------------------------------------------------
-
-function drawElevation(coords) {
-  const el = document.getElementById("elevation");
-  el.innerHTML = "";
-  if (!coords.length || coords[0].length < 3) return;
-  const w = el.clientWidth, h = el.clientHeight - 4;
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-  svg.setAttribute("preserveAspectRatio", "none");
-  svg.style.cssText = "width:100%;height:100%;";
-  // Cumulative distances + elevations
-  let dist = 0, prev = coords[0];
-  const pts = [{ d: 0, e: prev[2] }];
-  for (let i = 1; i < coords.length; i++) {
-    const c = coords[i];
-    dist += haversine(prev, c);
-    pts.push({ d: dist, e: c[2] });
-    prev = c;
-  }
-  const eMin = Math.min(...pts.map(p => p.e));
-  const eMax = Math.max(...pts.map(p => p.e));
-  const span = Math.max(1, eMax - eMin);
-  const dMax = pts[pts.length - 1].d || 1;
-  const xy = pts.map(p => [
-    (p.d / dMax) * w,
-    h - ((p.e - eMin) / span) * (h - 12) - 6
-  ]);
-  const path = "M " + xy.map(([x, y]) => `${x.toFixed(1)} ${y.toFixed(1)}`).join(" L ");
-  const poly = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  poly.setAttribute("d", path + ` L ${w} ${h} L 0 ${h} Z`);
-  poly.setAttribute("fill", "rgba(44, 197, 85, 0.25)");
-  poly.setAttribute("stroke", "#2c5");
-  poly.setAttribute("stroke-width", "1");
-  svg.appendChild(poly);
-  // Labels
-  const lbl = document.createElement("div");
-  lbl.style.cssText = "position:absolute;top:4px;left:8px;font-size:11px;color:#555;background:rgba(255,255,255,0.85);padding:1px 4px;border-radius:2px;";
-  lbl.textContent = `${Math.round(eMin)}–${Math.round(eMax)} m · ${(dMax / 1000).toFixed(1)} km · climb ${pts.reduce((s, p, i) => i ? s + Math.max(0, p.e - pts[i-1].e) : 0, 0).toFixed(0)} m`;
-  el.appendChild(svg);
-  el.appendChild(lbl);
-}
-
-function haversine(p1, p2) {
-  const R = 6371000;
-  const toRad = d => d * Math.PI / 180;
-  const dlat = toRad(p2[1] - p1[1]);
-  const dlon = toRad(p2[0] - p1[0]);
-  const a = Math.sin(dlat / 2) ** 2 + Math.cos(toRad(p1[1])) * Math.cos(toRad(p2[1])) * Math.sin(dlon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
-
-// --- stages ------------------------------------------------------------
-
-document.getElementById("stages-btn").addEventListener("click", async () => {
-  if (state.waypoints.length < 2) return;
-  // Stages currently splits a single from→to route. With multiple waypoints
-  // we treat the first and last as the corridor endpoints; if you want
-  // stages tied to your via-points, wait for that feature in a later version.
-  const profile = document.getElementById("profile").value;
-  setBusy("Planning stages…");
-  try {
-    const r = await api("/stages", {
-      from: state.waypoints[0].join(","),
-      to:   state.waypoints[state.waypoints.length - 1].join(","),
-      profile,
-      target_km: 100,
-      lodging_radius_m: 3000,
-    });
-    state.legs = r.legs;
-    renderLegs(r);
-  } catch (e) {
-    setError(e.message);
-  }
-});
-
-function renderLegs(stagesResp) {
-  const features = stagesResp.legs.map((l, i) => ({
-    type: "Feature",
-    properties: { n: i + 1 },
-    geometry: { type: "Point", coordinates: l.end },
-  }));
-  map.getSource("legs").setData({ type: "FeatureCollection", features });
-  const html = `
-    <h2>Stages (${stagesResp.total_legs} legs · ${(stagesResp.total_length_m / 1000).toFixed(0)} km total)</h2>
-    ${stagesResp.legs.map((l, i) => `
-      <div class="leg-card">
-        <div class="leg-num">Leg ${i + 1} · ${(l.length_m / 1000).toFixed(1)} km · ${l.ascend_m} m climb</div>
-        <div class="lodging">${
-          l.lodging.length === 0
-            ? "<em>no lodging within 3 km</em>"
-            : l.lodging.slice(0, 5).map(p =>
-                `<span class="lodging-item">${p.subtype}: ${p.name || "(unnamed)"} · ${p.distance_m} m</span>`
-              ).join("")
-        }</div>
-      </div>
-    `).join("")}
-  `;
-  document.getElementById("results").innerHTML = html;
 }
 
 // --- POI overlay -------------------------------------------------------
@@ -423,12 +389,11 @@ const POI_COLORS = {
 
 function refreshPois() {
   const cats = [...document.querySelectorAll('#layers input[type=checkbox]')].filter(c => c.checked).map(c => c.dataset.cat);
-  // remove existing markers
   for (const cat of Object.keys(state.poiMarkers)) {
     state.poiMarkers[cat].forEach(m => m.remove());
     state.poiMarkers[cat] = [];
   }
-  if (cats.length === 0 || map.getZoom() < 9) return;  // too zoomed out
+  if (cats.length === 0 || map.getZoom() < 9) return;
   const b = map.getBounds();
   const bbox = `${b.getWest().toFixed(4)},${b.getSouth().toFixed(4)},${b.getEast().toFixed(4)},${b.getNorth().toFixed(4)}`;
   api("/pois", { bbox, category: cats.join(","), limit: 500 }).then(r => {
@@ -453,17 +418,20 @@ document.querySelectorAll('#layers input[type=checkbox]').forEach(c => {
   c.addEventListener("change", refreshPois);
 });
 
-// --- Anchors + cost-gradient overlay ----------------------------------
+// --- Anchors + SPT overlay ---------------------------------------------
 //
-// Anchor list comes from /live/cities (Postgres-backed; works even
-// while the preprocess wave loop is still running). Click an anchor
-// to overlay /live/cell/<idx>/gradient — every road node assigned to
-// that anchor in the multi-source SPT, colored by cost-from-anchor.
-// Refresh the same anchor to see updated coverage as waves progress.
+// Anchor list comes from /live/cities (Postgres-backed). Click an
+// anchor to overlay /spt/cell/<idx> — the per-anchor SPT from the
+// chainless preprocess, colored by cost-from-anchor — and load that
+// anchor's amenities (POIs grouped by category) into the sidebar.
 
 async function loadCities() {
+  // Filter to anchors that have an npz on disk for the active profile.
+  // While the chainless preprocess is mid-flight, this prevents the
+  // user from clicking anchors that aren't yet routable.
+  const profile = document.getElementById("profile").value;
   try {
-    const r = await api("/live/cities");
+    const r = await api("/live/cities", { profile });
     state.cities = r.cities;
     document.getElementById("show-anchors").disabled = false;
     if (document.getElementById("show-anchors").checked) renderAnchors();
@@ -491,29 +459,47 @@ function renderAnchors() {
     el.title = c.name;
     el.addEventListener("click", (ev) => {
       ev.stopPropagation();
-      toggleGradient(c.city_idx, c.name);
+      toggleSpt(c.city_idx, c.name);
     });
     const m = new maplibregl.Marker({ element: el }).setLngLat([c.lon, c.lat]).addTo(map);
     state.anchorMarkers.push(m);
   }
 }
 
-async function toggleGradient(idx, name) {
+async function toggleSpt(idx, name) {
   if (state.shownCellIdx === idx) {
     map.getSource("cell-gradient").setData(emptyFC());
     state.shownCellIdx = null;
     document.getElementById("results").innerHTML = "";
     return;
   }
-  setBusy(`Loading cost gradient for ${name}…`);
+  setBusy(`Loading SPT for ${name}…`);
   try {
-    const r = await api(`/live/cell/${idx}/gradient`);
-    map.getSource("cell-gradient").setData(r);
+    const profile = document.getElementById("profile").value;
+    // Default cost filter — sharp unsubsampled view of the ~15 km
+    // bike-cost vicinity. At 30 km Graz produces 78 MB / 528 K edges
+    // and MapLibre is laggy; 15 km is roughly a quarter of that and
+    // still shows the full local road network. Read from the input
+    // box so users can widen/narrow.
+    const maxCostInput = document.getElementById("max-cost-km");
+    const max_cost_km = Math.max(1, +maxCostInput?.value || 15);
+    const max_cost = max_cost_km * 1000;
+    // Fetch the SPT and the amenities in parallel — independent reads.
+    const [spt, amenities] = await Promise.all([
+      api(`/spt/cell/${idx}`, { profile, max_cost }),
+      api(`/spt/cell/${idx}/amenities`).catch(e => {
+        console.warn("amenities fetch failed", e);
+        return null;
+      }),
+    ]);
+    map.getSource("cell-gradient").setData(spt);
     state.shownCellIdx = idx;
-    // Re-stretch the color ramp to the actual cost range of this cell
-    // so we always see contrast even when the cell is small or huge.
-    const lo = r.cost_min ?? 0;
-    const hi = r.cost_max ?? 100000;
+    // Stretch the color ramp across the *shown* cost range, not the
+    // full-SPT range. Otherwise filtering to a small max_cost (say
+    // 15 km of a 100 km SPT) leaves every shown edge in the bottom
+    // 15% of the ramp — visually all green.
+    const lo = spt.shown_cost_min ?? spt.cost_min ?? 0;
+    const hi = spt.shown_cost_max ?? spt.cost_max ?? 100000;
     const mid = lo + (hi - lo) / 2;
     map.setPaintProperty("cell-gradient-lines", "line-color", [
       "interpolate", ["linear"], ["get", "cost"],
@@ -521,23 +507,48 @@ async function toggleGradient(idx, name) {
       mid, "#facc15",
       hi,  "#dc2626",
     ]);
-    showGradientInfo(name, r);
+    showSptInfo(name, spt, amenities);
   } catch (e) {
     setError(e.message);
   }
 }
 
-function showGradientInfo(name, r) {
-  const lo = r.cost_min, hi = r.cost_max;
+function showSptInfo(name, spt, amenities) {
+  const lo = spt.cost_min, hi = spt.cost_max;
   const km = (n) => (n / 1000).toFixed(1) + " km-equiv";
+  const filtered = spt.filtered_max_cost
+    ? `, filtered to <${(spt.filtered_max_cost/1000).toFixed(0)} km`
+    : "";
+  const renderMode = spt.subsampled
+    ? `subsampled (grid ~${(spt.grid_deg * 111).toFixed(2)} km)`
+    : "all kept edges";
+  let amenityHtml = "";
+  if (amenities && amenities.by_category) {
+    const cats = Object.entries(amenities.by_category);
+    if (cats.length > 0) {
+      amenityHtml = `
+        <div class="route-card">
+          <div class="name">${name}: amenities (${amenities.footprint})</div>
+          ${cats.map(([cat, info]) => `
+            <div class="stat"><span>${cat}</span><span>${info.count}</span></div>
+            <div class="hint" style="margin-top:-2px;font-size:10px;">${info.samples.slice(0, 4).map(s => s.name).join(" · ")}${info.count > 4 ? " …" : ""}</div>
+          `).join("")}
+        </div>`;
+    } else {
+      amenityHtml = `<div class="route-card"><div class="name">${name}: no POIs in footprint</div></div>`;
+    }
+  }
+  const showLo = spt.shown_cost_min ?? lo;
+  const showHi = spt.shown_cost_max ?? hi;
   document.getElementById("results").innerHTML = `
     <div class="route-card">
-      <div class="name">${name}: cost gradient</div>
-      <div class="stat"><span>visited nodes</span><span>${r.total_visited.toLocaleString()}</span></div>
-      <div class="stat"><span>shown (subsampled)</span><span>${r.features.length.toLocaleString()}</span></div>
-      <div class="stat"><span>cost range</span><span>${lo == null ? "—" : km(lo) + " → " + km(hi)}</span></div>
-      <p class="hint">Refresh to see updated coverage as the wave loop runs.</p>
+      <div class="name">${name}: SPT${filtered}</div>
+      <div class="stat"><span>reachable nodes</span><span>${(spt.total_visited || 0).toLocaleString()}</span></div>
+      <div class="stat"><span>shown</span><span>${spt.features.length.toLocaleString()} edges (${renderMode})</span></div>
+      <div class="stat"><span>shown cost range</span><span>${km(showLo)} → ${km(showHi)}</span></div>
+      <div class="stat"><span>full SPT cost range</span><span>${lo == null ? "—" : km(lo) + " → " + km(hi)}</span></div>
     </div>
+    ${amenityHtml}
   `;
 }
 
@@ -549,7 +560,148 @@ document.getElementById("show-anchors").addEventListener("change", (e) => {
     state.shownCellIdx = null;
   }
 });
-map.on("load", loadCities);
+
+// --- Biome overlay (Resolve 2017 ecoregions) ---------------------------
+//
+// Static GeoJSON at /data/ecoregions_europe.geojson — clipped to Europe
+// (-15..40 lon, 33..72 lat), simplified to ~500 m tolerance, 1.3 MB.
+// Loaded lazily on first toggle, then just shown/hidden afterwards.
+
+let biomeLoaded = false;
+
+async function ensureBiomeLayers() {
+  if (biomeLoaded) return;
+  setBusy("Loading ecoregions…");
+  try {
+    const r = await fetch("/data/ecoregions_europe.geojson");
+    if (!r.ok) throw new Error(`ecoregions: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("ecoregions", { type: "geojson", data: fc });
+    // Fill colored by the dataset's own COLOR_BIO field (one color per
+    // biome, set in the source shapefile). Place beneath the gradient
+    // line layer so SPT viz still pops.
+    map.addLayer({
+      id: "ecoregions-fill",
+      type: "fill",
+      source: "ecoregions",
+      paint: {
+        "fill-color": ["get", "COLOR_BIO"],
+        "fill-opacity": 0.30,
+      },
+    }, "cell-gradient-lines");
+    map.addLayer({
+      id: "ecoregions-outline",
+      type: "line",
+      source: "ecoregions",
+      paint: {
+        "line-color": ["get", "COLOR_BIO"],
+        "line-width": 0.6,
+        "line-opacity": 0.8,
+      },
+    }, "cell-gradient-lines");
+    map.on("click", "ecoregions-fill", (e) => {
+      const f = e.features?.[0];
+      if (!f) return;
+      const p = f.properties;
+      new maplibregl.Popup({ offset: 8 })
+        .setLngLat(e.lngLat)
+        .setHTML(
+          `<strong>${p.ECO_NAME}</strong>` +
+          `<br><small>${p.BIOME_NAME}</small>`
+        )
+        .addTo(map);
+    });
+    map.on("mouseenter", "ecoregions-fill", () => map.getCanvas().style.cursor = "crosshair");
+    map.on("mouseleave", "ecoregions-fill", () => map.getCanvas().style.cursor = "");
+    biomeLoaded = true;
+    document.getElementById("results").innerHTML = "";
+  } catch (e) {
+    setError(`biome load failed: ${e.message}`);
+    throw e;
+  }
+}
+
+document.getElementById("show-biome").addEventListener("change", async (e) => {
+  if (e.target.checked) {
+    try {
+      await ensureBiomeLayers();
+    } catch {
+      e.target.checked = false;
+      return;
+    }
+    map.setLayoutProperty("ecoregions-fill", "visibility", "visible");
+    map.setLayoutProperty("ecoregions-outline", "visibility", "visible");
+  } else if (biomeLoaded) {
+    map.setLayoutProperty("ecoregions-fill", "visibility", "none");
+    map.setLayoutProperty("ecoregions-outline", "visibility", "none");
+  }
+});
+
+// --- Land cover overlay (OSM landuse, AT/CZ/DE/DK) ---------------------
+//
+// Static GeoJSON at /data/landcover_corridor.geojson, ~26 MB / 75 K
+// polygons rolled up to 5 classes from OSM landuse + natural tags.
+// Coverage: only the four current corridor countries (Austria, Czech
+// Republic, Germany, Denmark). Adding new tour countries means
+// re-running ingest/build_landuse_overlay.py for those countries
+// and concatenating into the same file.
+
+const LANDCOVER_COLORS = {
+  forest:       "#1e6b3a",
+  agricultural: "#d4b366",
+  urban:        "#7a7a7a",
+  water:        "#3d6fa3",
+  wetland:      "#4a8a8a",
+};
+
+let landcoverLoaded = false;
+
+async function ensureLandcoverLayers() {
+  if (landcoverLoaded) return;
+  setBusy("Loading landcover (~26 MB)…");
+  try {
+    const r = await fetch("/data/landcover_corridor.geojson");
+    if (!r.ok) throw new Error(`landcover: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("landcover", { type: "geojson", data: fc });
+    map.addLayer({
+      id: "landcover-fill",
+      type: "fill",
+      source: "landcover",
+      paint: {
+        "fill-color": [
+          "match", ["get", "class"],
+          "forest",       LANDCOVER_COLORS.forest,
+          "agricultural", LANDCOVER_COLORS.agricultural,
+          "urban",        LANDCOVER_COLORS.urban,
+          "water",        LANDCOVER_COLORS.water,
+          "wetland",      LANDCOVER_COLORS.wetland,
+          "#666",
+        ],
+        "fill-opacity": 0.45,
+      },
+    }, "cell-gradient-lines");
+    landcoverLoaded = true;
+    document.getElementById("results").innerHTML = "";
+  } catch (e) {
+    setError(`landcover load failed: ${e.message}`);
+    throw e;
+  }
+}
+
+document.getElementById("show-landcover").addEventListener("change", async (e) => {
+  if (e.target.checked) {
+    try {
+      await ensureLandcoverLayers();
+    } catch {
+      e.target.checked = false;
+      return;
+    }
+    map.setLayoutProperty("landcover-fill", "visibility", "visible");
+  } else if (landcoverLoaded) {
+    map.setLayoutProperty("landcover-fill", "visibility", "none");
+  }
+});
 
 // --- status helpers ---------------------------------------------------
 
@@ -560,3 +712,24 @@ function setBusy(msg) {
 function setError(msg) {
   document.getElementById("results").innerHTML = `<div class="route-card" style="border-color:#c52;"><strong>Error</strong><div class="stat">${msg}</div></div>`;
 }
+
+// --- bootstrap ---------------------------------------------------------
+
+map.on("load", () => {
+  // Bind the start/end input rows from the DOM into state.waypoints.
+  const startRow = document.querySelector('.waypoint-row[data-role="start"]');
+  const endRow   = document.querySelector('.waypoint-row[data-role="end"]');
+  state.waypoints = [
+    bindWaypoint(startRow, "start"),
+    bindWaypoint(endRow,   "end"),
+  ];
+  // Seed defaults.
+  state.waypoints[0].coord = DEFAULT_START;
+  state.waypoints[0].input.value = DEFAULT_START.join(",");
+  state.waypoints[1].coord = DEFAULT_END;
+  state.waypoints[1].input.value = DEFAULT_END.join(",");
+  refreshWaypointMarkers();
+  updateRouteButton();
+  loadCities();
+  routeNow();
+});

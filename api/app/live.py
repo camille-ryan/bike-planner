@@ -26,10 +26,18 @@ import psycopg
 MAX_WAYS = 10_000
 
 
-def list_cities(conn: psycopg.Connection) -> list[dict]:
+def list_cities(
+    conn: psycopg.Connection, profile: str | None = None,
+) -> list[dict]:
     """Anchors with snap targets, ordered for stable city_idx mapping.
-    `city_idx` matches the index used by the wave loop and the per-city
-    SPT files (anchor.id - 1, since anchors.id is 1-based bigserial)."""
+    `city_idx` matches the index used by the per-city SPT files
+    (anchor.id - 1, since anchors.id is 1-based bigserial).
+
+    If `profile` is given, filter to only the anchors that have a
+    finished `<ci>.npz` on disk for that profile. Useful for the web UI
+    so users don't see anchor pins they can't usefully click while the
+    chainless preprocess is mid-flight.
+    """
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id, name, place, country,
@@ -40,12 +48,29 @@ def list_cities(conn: psycopg.Connection) -> list[dict]:
             ORDER BY id
         """)
         rows = cur.fetchall()
-    return [{
-        "city_idx": int(r[0]) - 1,
-        "name": r[1], "place": r[2], "country": r[3],
-        "lon": float(r[4]), "lat": float(r[5]),
-        "snap_vertex_id": int(r[6]),
-    } for r in rows]
+
+    if profile is None:
+        ready_set: set[int] | None = None
+    else:
+        from .settings import SPT_DIR
+        spt_dir = SPT_DIR / profile / "spt"
+        ready_set = (
+            {int(p.stem) for p in spt_dir.glob("*.npz")}
+            if spt_dir.exists() else set()
+        )
+
+    out: list[dict] = []
+    for r in rows:
+        ci = int(r[0]) - 1
+        if ready_set is not None and ci not in ready_set:
+            continue
+        out.append({
+            "city_idx": ci,
+            "name": r[1], "place": r[2], "country": r[3],
+            "lon": float(r[4]), "lat": float(r[5]),
+            "snap_vertex_id": int(r[6]),
+        })
+    return out
 
 
 def gradient_for(conn: psycopg.Connection, city_idx: int) -> dict:
