@@ -291,7 +291,7 @@ async function routeNow() {
   try {
     const legs = await Promise.all(
       Array.from({ length: legCount }, (_, i) =>
-        api("/spt/route", {
+        api("/trunk/route", {
           from: valid[i].coord.join(","),
           to:   valid[i + 1].coord.join(","),
           profile,
@@ -310,32 +310,36 @@ async function routeNow() {
 
 function mergeLegs(legs) {
   // Concatenate coordinates; drop the first point of each leg after the
-  // first to avoid a duplicated vertex at the join. Sum track-length
-  // and node-count; concat city sequences with the same dedup.
+  // first to avoid a duplicated vertex at the join. Sum gross_length_m
+  // and vertex_count; concat chain_names with dedup.
   const coords = [];
   let totalLen = 0;
   let totalNodes = 0;
   const cities = [];
+  const bridges = [];
   for (const leg of legs) {
     const lc = leg.geometry.coordinates;
     if (coords.length > 0 && lc.length > 0) coords.push(...lc.slice(1));
     else coords.push(...lc);
-    totalLen += +leg.properties["track-length"] || 0;
-    totalNodes += +leg.properties["node-count"] || 0;
-    const lcities = leg.properties.cities || [];
+    const lp = leg.properties || {};
+    totalLen += +lp.gross_length_m || 0;
+    totalNodes += +lp.vertex_count || 0;
+    const lcities = lp.chain_names || [];
     for (const c of lcities) {
       if (cities[cities.length - 1] !== c) cities.push(c);
     }
+    for (const b of (lp.bridges || [])) bridges.push(b);
   }
   return {
     type: "Feature",
     geometry: { type: "LineString", coordinates: coords },
     properties: {
-      creator: "spt-router",
-      cities,
-      "track-length": totalLen,
-      "node-count": totalNodes,
-      "leg-count": legs.length,
+      creator: "trunk-router",
+      chain_names: cities,
+      gross_length_m: totalLen,
+      vertex_count: totalNodes,
+      leg_count: legs.length,
+      bridges,
     },
   };
 }
@@ -354,12 +358,14 @@ function renderRoutes() {
 
   const html = state.routes.map((r) => {
     const p = r.properties || {};
-    const km = fmtKm(+p["track-length"] || 0);
-    const cities = (p.cities || []).join(" → ");
+    const km = fmtKm(+p.gross_length_m || 0);
+    const cities = (p.chain_names || []).join(" → ");
+    const nBridges = (p.bridges || []).length;
     return `<div class="route-card active">
-      <div class="name">SPT route</div>
+      <div class="name">trunk route</div>
       <div class="stat"><span>distance</span><span>${km}</span></div>
-      <div class="stat"><span>nodes</span><span>${(+p["node-count"] || 0).toLocaleString()}</span></div>
+      <div class="stat"><span>nodes</span><span>${(+p.vertex_count || 0).toLocaleString()}</span></div>
+      ${nBridges ? `<div class="stat"><span>bridges</span><span>${nBridges}</span></div>` : ""}
       ${cities ? `<div class="stat" style="grid-template-columns: 1fr;"><span><em>${cities}</em></span></div>` : ""}
     </div>`;
   }).join("");

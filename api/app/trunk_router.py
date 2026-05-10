@@ -334,6 +334,10 @@ def route(
             coords[k-1][0], coords[k-1][1], coords[k][0], coords[k][1],
         )
 
+    # Human-readable chain names for UI display.
+    name_by_idx = {int(c["city_idx"]): c["name"] for c in prof.cities}
+    chain_names = [name_by_idx.get(ci, str(ci)) for ci in chain]
+
     return {
         "type": "Feature",
         "geometry": {
@@ -343,6 +347,7 @@ def route(
         "properties": {
             "profile":            profile,
             "chain_length":       len(chain),
+            "chain_names":        chain_names,
             "leg_count":          len(chain) - 1,
             "vertex_count":       len(coords),
             "gross_length_m":     round(gross_m, 1),
