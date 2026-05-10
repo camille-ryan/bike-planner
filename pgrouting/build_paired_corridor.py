@@ -7,27 +7,25 @@ anchors. With Phase A's is_frontier byproduct, pruning is precise: kept
 frontier leaf, plus the B-frontier vertices themselves.
 
 Output: a SQLite database at `data/spt/<profile>/paired_trunks.db` with
-a single table:
+one row per pair, each row holding a packed numpy structured array:
 
-    CREATE TABLE trunks (
+    CREATE TABLE trunk_blobs (
       src_city  INTEGER NOT NULL,
       dst_city  INTEGER NOT NULL,
-      vertex_id INTEGER NOT NULL,
-      successor INTEGER,                -- NULL at trunk root (B-frontier)
-      lat       REAL NOT NULL,
-      lon       REAL NOT NULL,
-      PRIMARY KEY (src_city, dst_city, vertex_id)
+      n_rows    INTEGER NOT NULL,
+      blob      BLOB    NOT NULL,        -- TRUNK_DTYPE * n_rows
+      PRIMARY KEY (src_city, dst_city)
     ) WITHOUT ROWID;
 
-Each trunk row gives the next vertex toward the B-frontier (`successor`)
-and the row's own coords. A routing client snaps the user's start, finds
-the chain via city_graph Dijkstra, then for each chain edge (A, B):
+    TRUNK_DTYPE = [('vid', i8), ('succ', i8), ('lat', f4), ('lon', f4)]
+    succ == -1 means trunk root (B-frontier)
+    rows within a blob are sorted by vid ascending
 
-    SELECT successor, lat, lon FROM trunks
-     WHERE src_city = A AND dst_city = B AND vertex_id = current
-
-…follows successor until NULL (= reached B-frontier handoff to next
-chain edge's trunk). No npz loading per leg, no postgres roundtrips.
+Routing clients load each pair's trunk with np.frombuffer (zero-copy
+view) and walk via a precomputed next_idx pointer array. A typical
+chain (Graz→Cph, 71 legs) preloads in ~200 ms warm, ~30 MB resident,
+and walks in <30 ms thereafter — see test_graz_cph.py for the
+reference loader/walker.
 
 If the user's start vertex isn't in the first trunk, fall back to the
 unpruned CSR data in the per-anchor SPT npz (Phase C: edge_indptr,
@@ -38,6 +36,7 @@ import argparse
 import json
 import sqlite3
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -45,10 +44,13 @@ import psycopg
 
 import config
 from build_paired_spts import (
-    _build_pair, _build_ferry_pair_fake, _filter_spt_to_radius,
+    _build_pair, _build_ferry_pair_fake,
     _identify_ferry_chain_pairs, _load_spt, _load_topology, _fetch_coords,
-    LARGE_SPT_THRESHOLD, FILTER_RADIUS_M,
 )
+
+
+SPT_CACHE_MAX = 64        # ~80 MB/SPT loaded × 64 ≈ 5 GB cap
+TOPOLOGY_CACHE_MAX = 64   # ~10 MB each, much smaller
 
 
 def _parse_polyline(spec: str) -> list[tuple[float, float]]:
@@ -86,6 +88,19 @@ def _corridor_anchor_ids(
         return {int(r[0]) for r in cur.fetchall()}
 
 
+# Packed-blob trunk schema. Each pair = one row containing a numpy
+# structured array of (vid, succ, lat, lon) tuples, sorted by vid.
+# Routing clients load via np.frombuffer (zero-copy) and walk via
+# precomputed next_idx pointer arrays.
+TRUNK_DTYPE = np.dtype([
+    ("vid",  "<i8"),
+    ("succ", "<i8"),   # NULL_SENTINEL = -1 means trunk root (B-frontier)
+    ("lat",  "<f4"),
+    ("lon",  "<f4"),
+])
+NULL_SENTINEL = np.int64(-1)
+
+
 def _open_trunk_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path)
@@ -93,51 +108,50 @@ def _open_trunk_db(db_path: Path) -> sqlite3.Connection:
     db.execute("PRAGMA synchronous = NORMAL")
     db.execute(
         """
-        CREATE TABLE IF NOT EXISTS trunks (
+        CREATE TABLE IF NOT EXISTS trunk_blobs (
             src_city  INTEGER NOT NULL,
             dst_city  INTEGER NOT NULL,
-            vertex_id INTEGER NOT NULL,
-            successor INTEGER,
-            lat       REAL NOT NULL,
-            lon       REAL NOT NULL,
-            PRIMARY KEY (src_city, dst_city, vertex_id)
+            n_rows    INTEGER NOT NULL,
+            blob      BLOB    NOT NULL,
+            PRIMARY KEY (src_city, dst_city)
         ) WITHOUT ROWID
         """
     )
     return db
 
 
-def _trunk_rows_for_pair(
-    a: int, b: int, pair: dict, lon: np.ndarray, lat: np.ndarray,
-):
-    """Yield (src, dst, vertex_id, successor, lat, lon) tuples for a
-    paired SPT's kept vertices.
+def _pack_trunk_blob(
+    pair: dict, lon: np.ndarray, lat: np.ndarray,
+) -> tuple[int, bytes]:
+    """Pack a pair's kept vertices into a TRUNK_DTYPE byte buffer.
 
-    `pair` is the output of `_build_pair(a_spt, b_spt, prune=True)`:
-        node_global   int32[K]   global vertex IDs of kept vertices
-        parent_local  int32[K]   kept-local index of each vertex's
-                                 successor (= next on walk to B-frontier),
-                                 or -9999 for trunk roots (B-frontier)
-        cost          float32[K] (unused in DB)
+    `pair` fields:
+        node_global   int32[K]   global vertex IDs
+        parent_local  int32[K]   kept-local successor index, or <0 / >=K
+                                 for trunk roots (B-frontier)
 
-    `lon`, `lat` are float arrays length K, one per kept vertex.
+    Returns (n_rows, blob_bytes). Rows are sorted by vid ascending so
+    clients can use searchsorted on `arr['vid']` without rebuilding.
     """
-    ng       = pair["node_global"]
-    par      = pair["parent_local"]
-    K        = len(ng)
-    for i in range(K):
-        succ_local = int(par[i])
-        if succ_local < 0 or succ_local >= K:
-            successor = None
-        else:
-            successor = int(ng[succ_local])
-        yield (
-            a, b,
-            int(ng[i]),
-            successor,
-            float(lat[i]),
-            float(lon[i]),
-        )
+    ng  = pair["node_global"]
+    par = pair["parent_local"]
+    K   = len(ng)
+    if K == 0:
+        return 0, b""
+
+    # Resolve each vertex's successor (kept-local index) to a global vid,
+    # or to NULL_SENTINEL if it's a trunk root.
+    valid_par = (par >= 0) & (par < K)
+    succ = np.where(valid_par, ng[np.clip(par, 0, K - 1)], NULL_SENTINEL)
+
+    # Order by vid so loaders can searchsorted on arr['vid'].
+    order = np.argsort(ng.astype(np.int64), kind="stable")
+    arr = np.empty(K, dtype=TRUNK_DTYPE)
+    arr["vid"]  = ng[order].astype(np.int64)
+    arr["succ"] = succ[order].astype(np.int64)
+    arr["lat"]  = lat[order].astype(np.float32)
+    arr["lon"]  = lon[order].astype(np.float32)
+    return K, arr.tobytes()
 
 
 def run(
@@ -192,20 +206,30 @@ def run(
     })
     print(f"[corridor] {len(pairs_to_build):,} directed pairs to build", flush=True)
 
-    # 3. Caches.
-    spt_cache: dict[int, dict] = {}
-    topology_cache: dict[int, dict | None] = {}
-    filtered_cache: dict[int, dict] = {}
+    # 3. Caches — bounded LRU. SPT npzs decompress to ~80 MB each;
+    # 927 corridor anchors × all-cached would OOM a 16 GB host.
+    spt_cache: OrderedDict[int, dict] = OrderedDict()
+    topology_cache: OrderedDict[int, dict | None] = OrderedDict()
 
     def get_spt(idx: int) -> dict:
-        if idx not in spt_cache:
-            spt_cache[idx] = _load_spt(spt_dir, idx)
-        return spt_cache[idx]
+        if idx in spt_cache:
+            spt_cache.move_to_end(idx)
+            return spt_cache[idx]
+        v = _load_spt(spt_dir, idx)
+        spt_cache[idx] = v
+        if len(spt_cache) > SPT_CACHE_MAX:
+            spt_cache.popitem(last=False)
+        return v
 
     def get_topology(idx: int) -> dict | None:
-        if idx not in topology_cache:
-            topology_cache[idx] = _load_topology(topology_dir, idx)
-        return topology_cache[idx]
+        if idx in topology_cache:
+            topology_cache.move_to_end(idx)
+            return topology_cache[idx]
+        v = _load_topology(topology_dir, idx)
+        topology_cache[idx] = v
+        if len(topology_cache) > TOPOLOGY_CACHE_MAX:
+            topology_cache.popitem(last=False)
+        return v
 
     # 4. Build + write trunk rows.
     db = _open_trunk_db(db_path)
@@ -214,18 +238,6 @@ def run(
         ferry_pairs = _identify_ferry_chain_pairs(
             conn, cities, spt_dir, sorted(corridor_idxs)
         )
-
-        def get_filtered_spt(idx: int) -> dict:
-            spt = get_spt(idx)
-            if len(spt["node_global"]) < LARGE_SPT_THRESHOLD:
-                return spt
-            if idx not in filtered_cache:
-                anchor = cities[idx]
-                filtered_cache[idx] = _filter_spt_to_radius(
-                    spt, anchor["lon"], anchor["lat"],
-                    FILTER_RADIUS_M, conn,
-                )
-            return filtered_cache[idx] or spt
 
         REGULAR_DEGENERATE_THRESHOLD = 200
         written = 0
@@ -237,26 +249,23 @@ def run(
         t_start = time.time()
         last_report = t_start
 
-        BATCH = 5000
-        row_buffer: list[tuple] = []
+        BATCH = 500              # blobs per executemany
+        blob_buffer: list[tuple[int, int, int, bytes]] = []
 
         def flush_buffer():
-            nonlocal total_rows_inserted
-            if not row_buffer:
+            if not blob_buffer:
                 return
             db.executemany(
-                "INSERT OR REPLACE INTO trunks "
-                "(src_city, dst_city, vertex_id, successor, lat, lon) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                row_buffer,
+                "INSERT OR REPLACE INTO trunk_blobs "
+                "(src_city, dst_city, n_rows, blob) VALUES (?, ?, ?, ?)",
+                blob_buffer,
             )
-            total_rows_inserted += len(row_buffer)
-            row_buffer.clear()
+            blob_buffer.clear()
 
         # Resume support: skip pairs already in the DB.
         existing_pairs = set()
         for r in db.execute(
-            "SELECT DISTINCT src_city, dst_city FROM trunks"
+            "SELECT src_city, dst_city FROM trunk_blobs"
         ).fetchall():
             existing_pairs.add((int(r[0]), int(r[1])))
         if existing_pairs:
@@ -268,13 +277,13 @@ def run(
                 skipped_existing += 1
                 continue
 
-            a_filt = get_filtered_spt(a)
-            b_filt = get_filtered_spt(b)
-            pair = _build_pair(a_filt, b_filt, prune=prune)
+            a_spt = get_spt(a)
+            b_spt = get_spt(b)
+            pair = _build_pair(a_spt, b_spt, prune=prune)
             if (pair is None or pair["kept_size"] < REGULAR_DEGENERATE_THRESHOLD) \
                and (a, b) in ferry_pairs:
                 pair = _build_ferry_pair_fake(
-                    a_filt, get_spt(b), ferry_pairs[(a, b)],
+                    a_spt, b_spt, ferry_pairs[(a, b)],
                 )
 
             if pair is None or pair["kept_size"] == 0:
@@ -304,11 +313,12 @@ def run(
             else:
                 lon, lat = _fetch_coords(conn, kept_globals)
 
-            # Insert rows.
-            for row in _trunk_rows_for_pair(a, b, pair, lon, lat):
-                row_buffer.append(row)
-                if len(row_buffer) >= BATCH:
-                    flush_buffer()
+            n, blob = _pack_trunk_blob(pair, lon, lat)
+            if n == 0:
+                skipped_degenerate += 1
+                continue
+            blob_buffer.append((a, b, n, blob))
+            total_rows_inserted += n
 
             written += 1
             total_kept += pair["kept_size"]
@@ -324,6 +334,9 @@ def run(
                     lon=lon, lat=lat,
                 )
 
+            if len(blob_buffer) >= BATCH:
+                flush_buffer()
+
             now = time.time()
             if now - last_report >= 5.0 or i == len(pairs_to_build) - 1:
                 flush_buffer()
@@ -336,7 +349,7 @@ def run(
                 print(
                     f"[corridor] {done:,}/{len(pairs_to_build):,}  "
                     f"written={written:,} deg={skipped_degenerate:,}  "
-                    f"db_rows={total_rows_inserted + len(row_buffer):,}  "
+                    f"trunk_rows={total_rows_inserted:,}  "
                     f"avg_kept_ratio={100*total_kept/max(1,total_a):.1f}% of A  "
                     f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s",
                     flush=True,
@@ -344,9 +357,7 @@ def run(
                 last_report = now
 
         flush_buffer()
-        # Vacuum + index after all inserts (SQLite indexes the PK by
-        # default for WITHOUT ROWID tables, so just ANALYZE here).
-        db.execute("ANALYZE trunks")
+        db.execute("ANALYZE trunk_blobs")
         db.commit()
         db.close()
 

@@ -24,7 +24,6 @@ south back into Graz's center (the U-turn we explicitly avoid).
 from __future__ import annotations
 import heapq
 import json
-import math
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -33,13 +32,6 @@ import numpy as np
 import psycopg
 
 import config
-
-
-# SPTs larger than this many vertices are treated as "city / ferry-town"
-# scale (built at 100 km geographic radius in compute_spts.py) and get
-# filtered down to a 30 km radius before being used as paired-SPT input.
-LARGE_SPT_THRESHOLD = 1_500_000
-FILTER_RADIUS_M = 30_000.0
 
 
 def _load_chain_graph(out_dir: Path):
@@ -139,48 +131,6 @@ def _fetch_coords(conn: psycopg.Connection, vids: np.ndarray) -> tuple[np.ndarra
         lon = np.array([r[1] for r in rows], dtype=np.float32)
         lat = np.array([r[2] for r in rows], dtype=np.float32)
     return lon, lat
-
-
-def _filter_spt_to_radius(
-    spt: dict, anchor_lon: float, anchor_lat: float,
-    radius_m: float, conn: psycopg.Connection,
-) -> dict | None:
-    """Filter `spt` to vertices within `radius_m` great-circle of the
-    anchor; remap parent_local so out-of-filter parents become -9999.
-
-    For city- and ferry-town SPTs (built at 100 km geographic radius
-    in compute_spts.py) this trims them down to a town-sized 30 km
-    region. Without this, paired_(town, city) becomes degenerate
-    because the city's reach swallows the town entirely (e.g.
-    Mödling→Wien).
-    """
-    lon, lat = _fetch_coords(conn, spt["node_global"])
-    R = 6_371_000.0
-    lat_a = math.radians(anchor_lat)
-    lat_v = np.radians(lat)
-    lon_diff = np.radians(lon - anchor_lon)
-    a = (np.sin((lat_v - lat_a) / 2) ** 2
-         + math.cos(lat_a) * np.cos(lat_v) * np.sin(lon_diff / 2) ** 2)
-    dist = 2 * R * np.arcsin(np.sqrt(a))
-    keep = dist <= radius_m
-    keep_idx = np.flatnonzero(keep)
-    if len(keep_idx) == 0:
-        return None
-
-    n = len(spt["node_global"])
-    remap = np.full(n, -1, dtype=np.int32)
-    remap[keep_idx] = np.arange(len(keep_idx), dtype=np.int32)
-    par_orig = spt["parent_local"][keep_idx]
-    new_par = np.where(
-        (par_orig >= 0) & (remap[par_orig.clip(0)] >= 0),
-        remap[par_orig.clip(0)],
-        np.int32(-9999),
-    ).astype(np.int32)
-    return {
-        "node_global":  spt["node_global"][keep_idx],
-        "parent_local": new_par,
-        "cost":         spt["cost"][keep_idx],
-    }
 
 
 def _identify_ferry_chain_pairs(
@@ -435,7 +385,6 @@ def main(chain_names: list[str], profile: str = "lht", prune: bool = False) -> N
     t_total = time.time()
 
     spt_cache: dict[int, dict] = {}
-    filtered_cache: dict[int, dict] = {}
 
     def get_spt(idx: int) -> dict:
         if idx not in spt_cache:
@@ -460,50 +409,28 @@ def main(chain_names: list[str], profile: str = "lht", prune: bool = False) -> N
                 print(f"[paired]   {cities[a]['name']} ↔ {cities[b]['name']}  "
                       f"(B-terminal vid={bt})")
 
-        def get_filtered_spt(idx: int) -> dict:
-            """Return the 30 km-filtered version of an SPT if it's
-            originally a 100 km city/ferry-town SPT; else pass through.
-            Cached per anchor since the filter is anchor-relative."""
-            spt = get_spt(idx)
-            if len(spt["node_global"]) < LARGE_SPT_THRESHOLD:
-                return spt
-            if idx not in filtered_cache:
-                anchor = cities[idx]
-                filt = _filter_spt_to_radius(
-                    spt, anchor["lon"], anchor["lat"],
-                    FILTER_RADIUS_M, conn,
-                )
-                filtered_cache[idx] = filt
-                if filt is not None:
-                    print(
-                        f"[paired]   filter {anchor['name']:<22} "
-                        f"|orig|={len(spt['node_global']):>9,} → "
-                        f"|filtered|={len(filt['node_global']):>9,}",
-                        flush=True,
-                    )
-            return filtered_cache[idx] or spt
         # Build paired_(chain[i], chain[i+1]) for i = 1..N-2 (skip i=0).
         # Strategy: always try regular construction first; only fall
         # back to the ferry-fake when (a) regular is degenerate
-        # (filtered A and B don't meaningfully overlap) AND (b) the
-        # pair was flagged as a ferry by the auto-detector. This
-        # avoids false positives from coastal anchors that happen to
-        # own ferry endpoints but are connected by land.
+        # (A and B don't meaningfully overlap) AND (b) the pair was
+        # flagged as a ferry by the auto-detector. This avoids false
+        # positives from coastal anchors that happen to own ferry
+        # endpoints but are connected by land.
         REGULAR_DEGENERATE_THRESHOLD = 200    # |kept| below this triggers ferry fallback
         for i in range(1, len(chain) - 1):
             a, b = chain[i], chain[i + 1]
             t0 = time.time()
-            a_filt = get_filtered_spt(a)
-            b_filt = get_filtered_spt(b)
+            a_spt = get_spt(a)
+            b_spt = get_spt(b)
             t_load = time.time() - t0
 
             t1 = time.time()
-            pair = _build_pair(a_filt, b_filt, prune=prune)
+            pair = _build_pair(a_spt, b_spt, prune=prune)
             is_ferry = False
             if (pair is None or pair["kept_size"] < REGULAR_DEGENERATE_THRESHOLD) \
                and (a, b) in ferry_pairs:
                 pair = _build_ferry_pair_fake(
-                    a_filt, get_spt(b), ferry_pairs[(a, b)],
+                    a_spt, b_spt, ferry_pairs[(a, b)],
                 )
                 is_ferry = pair is not None
             t_build = time.time() - t1
