@@ -26,15 +26,25 @@ V2 changes vs V1:
     designations; stacks with the cycleway sub-1.0 (correct: a cycleway
     that's also a Fahrradstraße is a stronger signal than either alone).
 
+V2 Phase A (this commit): elevation-aware grade + curvy-descent multipliers
+(V2.md §1.4). Take effect only when `grade_pct` and `sinuosity` are
+supplied; defaults (0.0 and 1.0) are no-ops so the existing per-tag
+ingest path keeps working until DEM ingest lands.
+  - Uphill: `1 + 0.028 × grade²` — pure quadratic on positive grade.
+    Calibration: 6%→2.0 (user's "trouble to sustain"), 9%→3.3, 12%→5.0.
+  - Straight downhill: `1 - 0.05g + 0.005g²` — peaked bonus, min 0.875
+    at g=5% (the "fun zone"), back to 1.0 at g=10%, mild penalty above.
+  - Curvy descent: `× (1 + 0.1 × (sinuosity - 1) × g)` — applied only
+    on descents. Per-way sinuosity = actual_length / endpoint_distance.
+
 Known gaps deferred to V3 (V2.md §1.2):
-  - elevation / grade penalty (`cost ∝ grade²` on positive grade)
-  - curvy-descent penalty
   - spatial scenic signals (landcover, water/camp POI density along
     corridor — see GAP+C&O calibration in design notes)
   - `access:conditional` / `seasonal=yes` parsing (mountain pass
     seasonal closures)
   - route-relation enrichment (`route=bicycle` with
     `network=icn|ncn|rcn|lcn`)
+  - turn-aware routing (Phase B — fewer turns, dangerous turns)
 
 Returns a per-meter cost factor (multiplied by length to get edge cost)
 or `None` if the edge should be excluded entirely.
@@ -134,6 +144,14 @@ _SURFACE = {
 # the cycleway sub-1.0 floor.
 _BICYCLE_ROAD_BONUS = 0.9
 
+# V2 Phase A: elevation-based grade multipliers (require DEM ingest to
+# populate `grade_pct` at the call site). Coefficients calibrated to
+# match the user's cycling tolerance — see docstring for examples.
+_UPHILL_COEFF = 0.028          # uphill:   1 + k·g²
+_DOWNHILL_LINEAR = 0.05        # downhill: 1 - a·g + b·g², min at g = a/(2b) = 5%
+_DOWNHILL_QUADRATIC = 0.005    #   so bonus peaks in the "fun zone," neutral by 10%, penalty beyond
+_SINUOSITY_COEFF = 0.1         # curvy descent extra: 1 + c·(sinuosity-1)·g
+
 
 def _has_bike_infra(bicycle: str, cycleway: str, bicycle_road: str) -> bool:
     if bicycle_road == "yes":
@@ -155,6 +173,8 @@ def bike_edge_cost(
     access: str,
     bicycle_road: str,
     is_ferry: bool = False,
+    grade_pct: float = 0.0,     # positive = uphill, negative = downhill
+    sinuosity: float = 1.0,     # per-way: actual_length / endpoint_distance
 ) -> float | None:
     """Return a unitless per-meter costfactor, or None to exclude the edge."""
     # Ferries are tagged `route=ferry` in OSM and typically don't carry
@@ -196,5 +216,16 @@ def bike_edge_cost(
     # V2: Fahrradstraße / bicycle-priority road bonus.
     if bicycle_road == "yes":
         cost *= _BICYCLE_ROAD_BONUS
+
+    # V2 Phase A: grade + curvy-descent multipliers. No-op when
+    # grade_pct == 0.0 and sinuosity == 1.0 (the defaults), so callers
+    # that haven't been updated to provide elevation data still work.
+    if grade_pct > 0.0:
+        cost *= 1.0 + _UPHILL_COEFF * grade_pct * grade_pct
+    elif grade_pct < 0.0:
+        g = -grade_pct
+        cost *= 1.0 - _DOWNHILL_LINEAR * g + _DOWNHILL_QUADRATIC * g * g
+        if sinuosity > 1.0:
+            cost *= 1.0 + _SINUOSITY_COEFF * (sinuosity - 1.0) * g
 
     return float(cost)
