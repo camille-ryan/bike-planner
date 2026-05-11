@@ -1,20 +1,40 @@
-"""Per-edge cost function — Python port of the lht.brf semantics needed
-to make Voronoi cells and gradient walks behave sensibly.
+"""Per-edge cost function — V2 (see /V2.md §1).
 
-v1 deliberately drops two BRouter terms:
-  - elevation (uphill quadratic) — requires SRTM join, deferred to v2.
-  - scenic biases (estimated_traffic/forest/river/town/noise classes) —
-    BRouter computes these from neighborhood spatial heuristics during
-    its own preprocess. Approximating them is a project of its own; v1
-    skips them and accepts that cells reflect cyclable-shortest-path,
-    not scenic-tour-shortest-path.
+V2 changes vs V1:
+  - `highway=cycleway` base lowered to 0.9 (sub-1.0 floor) — the router
+    will detour up to ~11% of length to use a designated cycle path,
+    correcting the V1 problem where cycleway tied at 1.0 with residential
+    and tertiary roads.
+  - `highway=track` bike-infra distinction dropped (only 3.4% of tracks
+    carry an explicit bike-infra tag in central Europe; the V1 NOBIKE
+    value of 5.0 was an artifact of tagging diligence, not rideability).
+    Base 1.1 in both tables; tracktype + surface multipliers carry the
+    quality signal.
+  - `highway=path` without bike infra: 5.0 → 2.0. Forest paths become
+    routable when they save substantial distance. Failure mode is
+    "annoying push-the-bike," not "illegal sidewalk shortcut."
+  - `highway=footway` without bike infra: unchanged at 5.0 (footways
+    are designed for pedestrians; riding bikes there is often illegal).
+  - Surface filter replaced: V1 hard-excluded sand/mud/grass/earth/dirt;
+    V2 grades every surface multiplicatively. Sand/mud/ice/snow at 10×
+    (walking-equivalent, including misery premium), grass/woodchips 3×,
+    dirt/earth/ground/unpaved 1.5×, gravel/sett/pebblestone 1.3×,
+    cobblestone 1.7×, fine_gravel 1.1×, asphalt/paved/compacted 1.0×.
+    No surface is hard-excluded — only access is.
+  - New: `bicycle_road=yes` applies a 0.9× multiplicative bonus on top
+    of the final cost. Captures Fahrradstraße / bicycle-priority road
+    designations; stacks with the cycleway sub-1.0 (correct: a cycleway
+    that's also a Fahrradstraße is a stronger signal than either alone).
 
-What we *do* keep, sourced from `brouter/profiles/lht.brf`:
-  - Highway-type cost factors (cycleway/residential cheap, primary
-    expensive unless bike-equipped, motorway excluded).
-  - Surface filter for 40 mm tires (sand/mud/grade5 excluded).
-  - Track-type penalties (grade1 cheap, grade5 effectively excluded).
-  - Cycleway/bicycle access discount.
+Known gaps deferred to V3 (V2.md §1.2):
+  - elevation / grade penalty (`cost ∝ grade²` on positive grade)
+  - curvy-descent penalty
+  - spatial scenic signals (landcover, water/camp POI density along
+    corridor — see GAP+C&O calibration in design notes)
+  - `access:conditional` / `seasonal=yes` parsing (mountain pass
+    seasonal closures)
+  - route-relation enrichment (`route=bicycle` with
+    `network=icn|ncn|rcn|lcn`)
 
 Returns a per-meter cost factor (multiplied by length to get edge cost)
 or `None` if the edge should be excluded entirely.
@@ -25,13 +45,11 @@ EXCLUDE = {
     "raceway", "elevator", "platform",
 }
 
-EXCLUDE_SURFACES = {"sand", "mud", "grass", "earth", "dirt"}
-
 # Highway-type costfactor when the way *is* bike-accessible (has cycleway,
 # bicycle=designated, etc.) vs not. Mirrors the LHT profile's branching
 # at lht.brf:285-289 and the cycleway/residential cases above.
 _HIGHWAY_COST_BIKE = {
-    "cycleway":      1.0,
+    "cycleway":      0.9,    # V2: sub-1.0 floor — prefer cycleway
     "residential":   1.0,
     "living_street": 1.0,
     "service":       1.3,
@@ -51,12 +69,12 @@ _HIGHWAY_COST_BIKE = {
     "tertiary_link": 1.0,
 }
 _HIGHWAY_COST_NOBIKE = {
-    "cycleway":      1.0,   # cycleway implies bike-accessible
+    "cycleway":      0.9,    # cycleway implies bike-accessible
     "residential":   1.0,
     "living_street": 1.0,
     "service":       1.3,
-    "track":         5.0,   # track without bike infra is rough
-    "path":          5.0,
+    "track":         1.1,    # V2: drop bike-infra distinction on tracks
+    "path":          2.0,    # V2: was 5.0; soften to allow forest paths
     "footway":       5.0,
     "pedestrian":    3.0,
     "bridleway":     5.0,
@@ -72,6 +90,8 @@ _HIGHWAY_COST_NOBIKE = {
 }
 
 # Per-tracktype multiplier on top of base highway cost. From lht.brf:275-279.
+# OSM tracktype=* describes the firmness/quality of unpaved tracks (not
+# elevation grade). Only applied on track-like highways (see below).
 _TRACKTYPE = {
     "grade1": 1.0,
     "grade2": 1.4,
@@ -79,6 +99,40 @@ _TRACKTYPE = {
     "grade4": 4.0,
     "grade5": 100.0,   # effectively excluded
 }
+
+# V2: graded surface multiplier (replaces V1 EXCLUDE_SURFACES blacklist).
+# Anchored on a walking-equivalent reasoning: riding 10 m on sand is
+# about as bad as riding 100 m on asphalt, including the misery premium
+# over the pure walk-vs-ride speed ratio (~5×). A surface not in this
+# table (including untagged) gets factor 1.0 — no penalty, no bonus.
+_SURFACE = {
+    "asphalt":       1.0,
+    "paved":         1.0,
+    "concrete":      1.0,
+    "paving_stones": 1.0,
+    "compacted":     1.0,
+    "fine_gravel":   1.1,
+    "gravel":        1.3,
+    "pebblestone":   1.3,
+    "sett":          1.3,
+    "cobblestone":   1.7,
+    "dirt":          1.5,
+    "earth":         1.5,
+    "ground":        1.5,
+    "unpaved":       1.5,
+    "grass":         3.0,
+    "woodchips":     3.0,
+    "sand":          10.0,
+    "mud":           10.0,
+    "ice":           10.0,
+    "snow":          10.0,
+}
+
+# V2: legal bike-priority road designation (German Fahrradstraße and
+# equivalents). A regular road repurposed for bike priority — cars are
+# guests. Applied multiplicatively on the final cost so it stacks with
+# the cycleway sub-1.0 floor.
+_BICYCLE_ROAD_BONUS = 0.9
 
 
 def _has_bike_infra(bicycle: str, cycleway: str, bicycle_road: str) -> bool:
@@ -119,21 +173,28 @@ def bike_edge_cost(
         return None
     if access in ("private", "no") and bicycle not in ("yes", "designated", "permissive"):
         return None
-    if surface in EXCLUDE_SURFACES:
-        return None
     if bicycle in ("no", "private", "dismount"):
         return None
 
     has_bike = _has_bike_infra(bicycle, cycleway, bicycle_road)
     table = _HIGHWAY_COST_BIKE if has_bike else _HIGHWAY_COST_NOBIKE
-    base = table.get(highway)
-    if base is None:
+    cost = table.get(highway)
+    if cost is None:
         # Unknown highway tag — give it a moderate non-zero cost rather than
         # excluding outright; the routing graph has many odd ones.
-        base = 2.0
+        cost = 2.0
 
     # Tracktype is only meaningful on track-like highways.
     if tracktype in _TRACKTYPE and highway in ("track", "path", "footway", "road"):
-        base *= _TRACKTYPE[tracktype]
+        cost *= _TRACKTYPE[tracktype]
 
-    return float(base)
+    # V2: graded surface multiplier (was a blacklist exclude in V1).
+    # Untagged or unknown surfaces fall through with no change.
+    if surface in _SURFACE:
+        cost *= _SURFACE[surface]
+
+    # V2: Fahrradstraße / bicycle-priority road bonus.
+    if bicycle_road == "yes":
+        cost *= _BICYCLE_ROAD_BONUS
+
+    return float(cost)
