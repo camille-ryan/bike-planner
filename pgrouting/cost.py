@@ -27,15 +27,22 @@ V2 changes vs V1:
     that's also a Fahrradstraße is a stronger signal than either alone).
 
 V2 Phase A (this commit): elevation-aware grade + curvy-descent multipliers
-(V2.md §1.4). Take effect only when `grade_pct` and `sinuosity` are
-supplied; defaults (0.0 and 1.0) are no-ops so the existing per-tag
+(V2.md §1.4). Take effect only when `grade_pct` and `curv` are
+supplied; defaults (0.0 and 0.0) are no-ops so the existing per-tag
 ingest path keeps working until DEM ingest lands.
   - Uphill: `1 + 0.028 × grade²` — pure quadratic on positive grade.
     Calibration: 6%→2.0 (user's "trouble to sustain"), 9%→3.3, 12%→5.0.
   - Straight downhill: `1 - 0.05g + 0.005g²` — peaked bonus, min 0.875
     at g=5% (the "fun zone"), back to 1.0 at g=10%, mild penalty above.
-  - Curvy descent: `× (1 + 0.1 × (sinuosity - 1) × g)` — applied only
-    on descents. Per-way sinuosity = actual_length / endpoint_distance.
+  - Curvy descent: `× (1 + 0.0005 × curv × g)` — applied only on
+    descents. `curv` is the total bend angle (degrees) the rider will
+    encounter looking *ahead* in their direction of travel, summed over
+    a ~300 m polyline window. Captures "steep descent into a curve":
+    the descent segment looks ahead, sees the upcoming bend, gets
+    penalized even if the descent itself is on a straight stretch.
+    Forward and reverse edges carry separate `curv_fwd` / `curv_rev`
+    in the database; the caller passes whichever applies for the
+    direction it's pricing.
 
 Known gaps deferred to V3 (V2.md §1.2):
   - spatial scenic signals (landcover, water/camp POI density along
@@ -150,7 +157,16 @@ _BICYCLE_ROAD_BONUS = 0.9
 _UPHILL_COEFF = 0.028          # uphill:   1 + k·g²
 _DOWNHILL_LINEAR = 0.05        # downhill: 1 - a·g + b·g², min at g = a/(2b) = 5%
 _DOWNHILL_QUADRATIC = 0.005    #   so bonus peaks in the "fun zone," neutral by 10%, penalty beyond
-_SINUOSITY_COEFF = 0.1         # curvy descent extra: 1 + c·(sinuosity-1)·g
+# Curvy-descent coefficient. Per-edge final factor at descent g% and
+# `curv` degrees of upcoming bend is:
+#     (1 - 0.05g + 0.005g²)   ×   (1 + k·curv·g)
+#     └── straight downhill ──┘   └── curvy ────┘
+# Calibration examples at k=0.0005, taken as total factor:
+#   90° ahead at -10%:               1.45
+#   90° ahead at -5%:                1.07
+#   switchback group 540° at -8%:    2.91
+#   switchback group 540° at -10%:   3.70
+_CURV_COEFF = 0.0005
 
 
 def _has_bike_infra(bicycle: str, cycleway: str, bicycle_road: str) -> bool:
@@ -174,7 +190,8 @@ def bike_edge_cost(
     bicycle_road: str,
     is_ferry: bool = False,
     grade_pct: float = 0.0,     # positive = uphill, negative = downhill
-    sinuosity: float = 1.0,     # per-way: actual_length / endpoint_distance
+    curv: float = 0.0,          # total bend angle (degrees) in the *forward*
+                                # polyline window for the direction being priced
 ) -> float | None:
     """Return a unitless per-meter costfactor, or None to exclude the edge."""
     # Ferries are tagged `route=ferry` in OSM and typically don't carry
@@ -218,14 +235,15 @@ def bike_edge_cost(
         cost *= _BICYCLE_ROAD_BONUS
 
     # V2 Phase A: grade + curvy-descent multipliers. No-op when
-    # grade_pct == 0.0 and sinuosity == 1.0 (the defaults), so callers
-    # that haven't been updated to provide elevation data still work.
+    # grade_pct == 0.0 and curv == 0.0 (the defaults), so callers
+    # that haven't been updated to provide elevation/curvature data
+    # still work.
     if grade_pct > 0.0:
         cost *= 1.0 + _UPHILL_COEFF * grade_pct * grade_pct
     elif grade_pct < 0.0:
         g = -grade_pct
         cost *= 1.0 - _DOWNHILL_LINEAR * g + _DOWNHILL_QUADRATIC * g * g
-        if sinuosity > 1.0:
-            cost *= 1.0 + _SINUOSITY_COEFF * (sinuosity - 1.0) * g
+        if curv > 0.0:
+            cost *= 1.0 + _CURV_COEFF * curv * g
 
     return float(cost)

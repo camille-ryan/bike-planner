@@ -6,6 +6,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 OSM_DIR  = DATA_DIR / "osm"
 POIS_DB  = DATA_DIR / "pois" / "pois.sqlite"
 SPT_DIR  = DATA_DIR / "spt"      # per-profile subdirs created at write time
+DEM_DIR  = DATA_DIR / "dem"      # Copernicus DEM GLO-30 GeoTIFF tiles
 
 # Postgres connection — defaults pull from env vars set by the
 # Dockerfile, override in compose for non-default deployments.

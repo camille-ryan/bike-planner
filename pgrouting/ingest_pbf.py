@@ -17,9 +17,21 @@ Memory: pyosmium streams the PBF; per-batch Python objects are flushed
 to Postgres every BATCH_SIZE rows. Process RSS stays under ~1 GB
 regardless of PBF size. Postgres's working memory is governed by the
 service's shared_buffers / work_mem (set in docker-compose).
+
+V2 Phase A.2 changes:
+  - Raw OSM tag columns (highway, surface, tracktype, oneway, bicycle,
+    cycleway, bicycle_road, access) are persisted on `ways` so cost
+    can be recomputed without re-parsing PBFs.
+  - Per-way sinuosity (actual_length / endpoint_distance) is computed
+    inline and stamped on every edge of the way. Clamped to [1.0, 5.0].
+  - Edge `cost`/`reverse_cost` are still computed inline using
+    `bike_edge_cost` with the V2 defaults (grade_pct=0, sinuosity=1).
+    The recompute_cost stage updates these after ingest_dem populates
+    vertex elevations, so the graph is immediately usable for routing
+    even before elevation is available.
 """
 import os
-from math import asin, cos, radians, sin, sqrt
+from math import asin, atan2, cos, degrees, radians, sin, sqrt
 from pathlib import Path
 from typing import Iterable
 
@@ -32,6 +44,16 @@ from cost import bike_edge_cost, EXCLUDE
 _EARTH_R = 6_371_000.0
 _BATCH_SIZE = 100_000
 
+# Window over which directional curvature is accumulated. Each segment's
+# `curv_fwd` is the total absolute bend angle at nodes within the next
+# ~_CURV_WINDOW_M polyline meters (forward direction of travel); `curv_rev`
+# is the same looking the other way. This captures the physics of "steep
+# descent into a curve" — the descending segment sees the upcoming bend in
+# its forward window even though the segment itself is straight.
+#
+# 300 m matches typical alpine-switchback / valley-bottom-curve scales.
+_CURV_WINDOW_M = 300.0
+
 
 def _haversine(lon1, lat1, lon2, lat2):
     rl1, rl2 = radians(lat1), radians(lat2)
@@ -39,6 +61,82 @@ def _haversine(lon1, lat1, lon2, lat2):
     dn = radians(lon2 - lon1)
     a = sin(dl / 2) ** 2 + cos(rl1) * cos(rl2) * sin(dn / 2) ** 2
     return 2 * _EARTH_R * asin(sqrt(a))
+
+
+def _segment_curvatures(nodes: list[tuple[int, float, float]],
+                        window_m: float = _CURV_WINDOW_M
+                        ) -> list[tuple[float, float]]:
+    """Per-segment directional bend totals over a polyline window.
+
+    For each of the N-1 segments, returns `(curv_fwd, curv_rev)`:
+      curv_fwd: sum of absolute bend angles (degrees) at nodes within
+                the next `window_m` of polyline (forward in way order).
+                "Forward" includes the bend at the segment's own target
+                node — that's the first bend you encounter as you exit.
+      curv_rev: same looking the other way.
+
+    O(N) per way via prefix-sum + two-pointer window advancement.
+    """
+    n = len(nodes)
+    if n < 2:
+        return []
+
+    # Cumulative polyline length per node.
+    cumlen = [0.0] * n
+    for i in range(n - 1):
+        _, ln1, lt1 = nodes[i]
+        _, ln2, lt2 = nodes[i + 1]
+        cumlen[i + 1] = cumlen[i] + _haversine(ln1, lt1, ln2, lt2)
+
+    # Per-node absolute bend angle (degrees). Endpoints get 0 since
+    # they have no incoming-or-outgoing pair. Latitude-scaled local
+    # frame: lon × cos(mean_lat) so angles aren't distorted at higher
+    # latitudes. Relative scale only matters; absolute units cancel.
+    bends = [0.0] * n
+    if n >= 3:
+        lat_mid = nodes[n // 2][2]
+        lon_scale = cos(radians(lat_mid))
+        for i in range(1, n - 1):
+            ax = (nodes[i][1]     - nodes[i - 1][1]) * lon_scale
+            ay =  nodes[i][2]     - nodes[i - 1][2]
+            bx = (nodes[i + 1][1] - nodes[i][1])     * lon_scale
+            by =  nodes[i + 1][2] - nodes[i][2]
+            # Signed angle from incoming to outgoing direction.
+            cross = ax * by - ay * bx
+            dot   = ax * bx + ay * by
+            bends[i] = abs(degrees(atan2(cross, dot)))
+
+    # Prefix sums of bends so window queries are O(1) given indices.
+    # bend_prefix[k] = sum of bends[0..k-1].
+    bend_prefix = [0.0] * (n + 1)
+    for i in range(n):
+        bend_prefix[i + 1] = bend_prefix[i] + bends[i]
+
+    out: list[tuple[float, float]] = []
+
+    # Forward window for segment k = (node[k], node[k+1]):
+    # bends at indices m where k+1 <= m and cumlen[m] - cumlen[k+1] <= window_m.
+    # m is monotonic non-decreasing as k advances.
+    m_fwd = 0
+    for k in range(n - 1):
+        if m_fwd < k + 1:
+            m_fwd = k + 1
+        while m_fwd + 1 < n and cumlen[m_fwd + 1] - cumlen[k + 1] <= window_m:
+            m_fwd += 1
+        curv_fwd = bend_prefix[m_fwd + 1] - bend_prefix[k + 1]
+        out.append((curv_fwd, 0.0))   # curv_rev filled in next loop
+
+    # Reverse window for segment k:
+    # bends at indices m where m <= k and cumlen[k] - cumlen[m] <= window_m.
+    # As k advances, the lower bound m_min is monotonic non-decreasing.
+    m_min = 0
+    for k in range(n - 1):
+        while m_min < k and cumlen[m_min] < cumlen[k] - window_m:
+            m_min += 1
+        curv_rev = bend_prefix[k + 1] - bend_prefix[m_min]
+        out[k] = (out[k][0], curv_rev)
+
+    return out
 
 
 def _create_staging(cur):
@@ -62,7 +160,17 @@ def _create_staging(cur):
             cost         double precision NOT NULL,
             reverse_cost double precision NOT NULL,
             length_m     double precision NOT NULL,
-            is_ferry     boolean NOT NULL
+            is_ferry     boolean NOT NULL,
+            highway      text NOT NULL,
+            surface      text NOT NULL,
+            tracktype    text NOT NULL,
+            oneway       text NOT NULL,
+            bicycle      text NOT NULL,
+            cycleway     text NOT NULL,
+            bicycle_road text NOT NULL,
+            access       text NOT NULL,
+            curv_fwd     real NOT NULL,
+            curv_rev     real NOT NULL
         )
     """)
 
@@ -106,7 +214,9 @@ class _PgIngestHandler(osmium.SimpleHandler):
         with self.conn.cursor() as cur:
             with cur.copy(
                 "COPY tmp_edges (osm_way_id, source_osm, target_osm, "
-                "cost, reverse_cost, length_m, is_ferry) FROM STDIN"
+                "cost, reverse_cost, length_m, is_ferry, "
+                "highway, surface, tracktype, oneway, bicycle, "
+                "cycleway, bicycle_road, access, curv_fwd, curv_rev) FROM STDIN"
             ) as cp:
                 for row in self._edge_buf:
                     cp.write_row(row)
@@ -123,21 +233,29 @@ class _PgIngestHandler(osmium.SimpleHandler):
         if hw in EXCLUDE:
             self.skipped_excluded += 1
             return
+        surface      = tags.get("surface", "") or ""
+        tracktype    = tags.get("tracktype", "") or ""
+        bicycle      = tags.get("bicycle", "") or ""
+        cycleway     = tags.get("cycleway", "") or ""
+        access       = tags.get("access", "") or ""
+        bicycle_road = tags.get("bicycle_road", "") or ""
+        oneway_raw   = tags.get("oneway", "") or ""
+
         cost_factor = bike_edge_cost(
             highway=hw,
-            surface=tags.get("surface", "") or "",
-            tracktype=tags.get("tracktype", "") or "",
-            bicycle=tags.get("bicycle", "") or "",
-            cycleway=tags.get("cycleway", "") or "",
-            access=tags.get("access", "") or "",
-            bicycle_road=tags.get("bicycle_road", "") or "",
+            surface=surface,
+            tracktype=tracktype,
+            bicycle=bicycle,
+            cycleway=cycleway,
+            access=access,
+            bicycle_road=bicycle_road,
             is_ferry=is_ferry,
         )
         if cost_factor is None:
             self.skipped_no_cost += 1
             return
 
-        ow = (tags.get("oneway") or "").lower()
+        ow = oneway_raw.lower()
         if ow in ("-1", "reverse"):
             oneway_dir = -1
         elif ow in ("yes", "true", "1"):
@@ -145,16 +263,32 @@ class _PgIngestHandler(osmium.SimpleHandler):
         else:
             oneway_dir = 0
 
-        prev_id = None
-        prev_lon = prev_lat = 0.0
+        # Pass 1: collect all resolvable node positions. Missing locations
+        # (InvalidLocationError) just break the chain — same behavior as
+        # the V1 code, kept for symmetry.
+        nodes: list[tuple[int, float, float]] = []
         for node in w.nodes:
             try:
                 lon = node.location.lon
                 lat = node.location.lat
             except (osmium.InvalidLocationError, RuntimeError):
-                prev_id = None
                 continue
-            self._node_buf.append((int(node.ref), float(lon), float(lat)))
+            nodes.append((int(node.ref), float(lon), float(lat)))
+        if len(nodes) < 2:
+            return
+
+        # Per-segment directional curvature (windowed; see _segment_curvatures).
+        seg_curvs = _segment_curvatures(nodes)
+
+        # Pass 2: emit nodes and per-segment edges. Each edge carries
+        # its own (curv_fwd, curv_rev) so the cost recompute can
+        # attribute upcoming curvature to whichever segment is
+        # descending into it — not just to the curve itself.
+        prev_id = None
+        prev_lon = prev_lat = 0.0
+        seg_idx = 0
+        for osm_id, lon, lat in nodes:
+            self._node_buf.append((osm_id, lon, lat))
             if prev_id is not None:
                 length_m = _haversine(prev_lon, prev_lat, lon, lat)
                 if length_m > 0:
@@ -165,11 +299,18 @@ class _PgIngestHandler(osmium.SimpleHandler):
                         cost, rev = fwd_cost, -1.0
                     else:                         # reverse only
                         cost, rev = -1.0, fwd_cost
+                    cf, cr = (seg_curvs[seg_idx]
+                              if seg_idx < len(seg_curvs)
+                              else (0.0, 0.0))
                     self._edge_buf.append((
-                        int(w.id), int(prev_id), int(node.ref),
+                        int(w.id), prev_id, osm_id,
                         cost, rev, float(length_m), bool(is_ferry),
+                        hw, surface, tracktype, oneway_raw,
+                        bicycle, cycleway, bicycle_road, access,
+                        float(cf), float(cr),
                     ))
-            prev_id = int(node.ref)
+                seg_idx += 1
+            prev_id = osm_id
             prev_lon = lon
             prev_lat = lat
 
@@ -220,6 +361,18 @@ def _stream_pbf(conn: psycopg.Connection, pbf: Path) -> dict:
     }
 
 
+_INSERT_COLUMNS = (
+    "osm_way_id, source, target, cost, reverse_cost, length_m, is_ferry, "
+    "highway, surface, tracktype, oneway, bicycle, cycleway, bicycle_road, "
+    "access, curv_fwd, curv_rev"
+)
+_SELECT_COLUMNS = (
+    "e.osm_way_id, v_src.id, v_dst.id, e.cost, e.reverse_cost, e.length_m, "
+    "e.is_ferry, e.highway, e.surface, e.tracktype, e.oneway, e.bicycle, "
+    "e.cycleway, e.bicycle_road, e.access, e.curv_fwd, e.curv_rev"
+)
+
+
 def _resolve_into_final(cur):
     """Promote staging rows into the final pgRouting-backed tables.
 
@@ -256,13 +409,9 @@ def _resolve_into_final(cur):
             ON ways (osm_way_id, source, target)
         """)
         print("[ingest] incremental insert into ways (dedup via ON CONFLICT)...")
-        cur.execute("""
-            INSERT INTO ways (osm_way_id, source, target,
-                              cost, reverse_cost, length_m, is_ferry)
-            SELECT
-                e.osm_way_id,
-                v_src.id, v_dst.id,
-                e.cost, e.reverse_cost, e.length_m, e.is_ferry
+        cur.execute(f"""
+            INSERT INTO ways ({_INSERT_COLUMNS})
+            SELECT {_SELECT_COLUMNS}
             FROM tmp_edges e
             JOIN ways_vertices_pgr v_src ON v_src.osm_id = e.source_osm
             JOIN ways_vertices_pgr v_dst ON v_dst.osm_id = e.target_osm
@@ -276,13 +425,9 @@ def _resolve_into_final(cur):
         cur.execute("DROP INDEX IF EXISTS ways_target_idx")
 
         print("[ingest] resolve ids + insert into ways (no indexes, no FKs)...")
-        cur.execute("""
-            INSERT INTO ways (osm_way_id, source, target,
-                              cost, reverse_cost, length_m, is_ferry)
-            SELECT
-                e.osm_way_id,
-                v_src.id, v_dst.id,
-                e.cost, e.reverse_cost, e.length_m, e.is_ferry
+        cur.execute(f"""
+            INSERT INTO ways ({_INSERT_COLUMNS})
+            SELECT {_SELECT_COLUMNS}
             FROM tmp_edges e
             JOIN ways_vertices_pgr v_src ON v_src.osm_id = e.source_osm
             JOIN ways_vertices_pgr v_dst ON v_dst.osm_id = e.target_osm

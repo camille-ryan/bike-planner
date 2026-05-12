@@ -709,6 +709,241 @@ document.getElementById("show-landcover").addEventListener("change", async (e) =
   }
 });
 
+// --- Terrain hillshade overlay ---------------------------------------
+// Public DEM tiles from AWS Open Data, terrarium-encoded. MapLibre
+// renders shaded relief from the raster-dem source via the hillshade
+// layer type — no compositing on our side, no auth.
+
+let hillshadeLoaded = false;
+
+function ensureHillshade() {
+  if (hillshadeLoaded) return;
+  map.addSource("terrain-dem", {
+    type: "raster-dem",
+    tiles: ["https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"],
+    encoding: "terrarium",
+    tileSize: 256,
+    maxzoom: 14,
+    attribution: "DEM: <a href='https://registry.opendata.aws/terrain-tiles/'>AWS Open Data</a>",
+  });
+  // Put hillshade above basemap but beneath any vector overlays.
+  // beforeId is left undefined so it lands on top; we'll move it
+  // beneath the routes if/when they exist via map.moveLayer.
+  map.addLayer({
+    id: "hillshade",
+    type: "hillshade",
+    source: "terrain-dem",
+    paint: {
+      "hillshade-exaggeration": 0.5,
+      "hillshade-shadow-color": "#000",
+      "hillshade-highlight-color": "#fff",
+      "hillshade-accent-color": "#666",
+    },
+  });
+  // Keep route lines on top of the shading.
+  for (const id of ["graz-wien-v1", "graz-wien-v2"]) {
+    if (map.getLayer(id)) map.moveLayer(id);
+  }
+  hillshadeLoaded = true;
+}
+
+document.getElementById("show-hillshade").addEventListener("change", (e) => {
+  if (e.target.checked) {
+    ensureHillshade();
+    map.setLayoutProperty("hillshade", "visibility", "visible");
+  } else if (hillshadeLoaded) {
+    map.setLayoutProperty("hillshade", "visibility", "none");
+  }
+});
+
+// --- Elevation profile chart ------------------------------------------
+// Lightweight SVG line chart drawn into the #elevation div under the
+// map. Used by the Graz→Wien comparison overlay to plot both variants'
+// elevation profiles side-by-side. Two lines: red = V1-style cost,
+// green = full V2.
+
+function renderElevationProfile(features) {
+  const root = document.getElementById("elevation");
+  root.innerHTML = "";
+  // Filter to features with a profile array (currently just the compare overlay).
+  const series = features
+    .map(f => ({
+      name: f.properties.name,
+      variant: f.properties.variant,
+      points: (f.properties.profile || []).filter(p => p[1] != null),
+      color: f.properties.variant === "v2" ? "#2ca02c" : "#d62728",
+    }))
+    .filter(s => s.points.length > 1);
+  if (!series.length) return;
+
+  const w = root.clientWidth || 800;
+  const h = root.clientHeight || 140;
+  const ml = 36, mr = 8, mt = 6, mb = 18;
+  const innerW = w - ml - mr;
+  const innerH = h - mt - mb;
+
+  // x: cumulative distance km. Use the max across both series.
+  const maxKm = Math.max(...series.map(s => s.points[s.points.length - 1][0]));
+  const allElevs = series.flatMap(s => s.points.map(p => p[1]));
+  const minE = Math.min(...allElevs);
+  const maxE = Math.max(...allElevs);
+  const elevRange = Math.max(maxE - minE, 1);
+
+  const sx = (km) => ml + (km / maxKm) * innerW;
+  const sy = (e)  => mt + innerH - ((e - minE) / elevRange) * innerH;
+
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("width", w);
+  svg.setAttribute("height", h);
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  svg.style.font = "10px system-ui, sans-serif";
+
+  // y-axis grid + labels (every 200 m)
+  const yStep = elevRange > 800 ? 200 : 100;
+  const yStart = Math.ceil(minE / yStep) * yStep;
+  for (let e = yStart; e <= maxE; e += yStep) {
+    const y = sy(e);
+    const line = document.createElementNS(svgNS, "line");
+    line.setAttribute("x1", ml); line.setAttribute("x2", w - mr);
+    line.setAttribute("y1", y);  line.setAttribute("y2", y);
+    line.setAttribute("stroke", "#eee"); line.setAttribute("stroke-width", "1");
+    svg.appendChild(line);
+    const txt = document.createElementNS(svgNS, "text");
+    txt.setAttribute("x", ml - 4); txt.setAttribute("y", y + 3);
+    txt.setAttribute("text-anchor", "end"); txt.setAttribute("fill", "#666");
+    txt.textContent = `${e}m`;
+    svg.appendChild(txt);
+  }
+  // x-axis labels (every 50 km)
+  for (let km = 0; km <= maxKm; km += 50) {
+    const x = sx(km);
+    const txt = document.createElementNS(svgNS, "text");
+    txt.setAttribute("x", x); txt.setAttribute("y", h - 4);
+    txt.setAttribute("text-anchor", "middle"); txt.setAttribute("fill", "#666");
+    txt.textContent = `${km}km`;
+    svg.appendChild(txt);
+  }
+  // Series lines
+  for (const s of series) {
+    const path = document.createElementNS(svgNS, "path");
+    let d = "";
+    for (let i = 0; i < s.points.length; i++) {
+      const [km, e] = s.points[i];
+      d += (i === 0 ? "M" : "L") + sx(km).toFixed(1) + " " + sy(e).toFixed(1);
+    }
+    path.setAttribute("d", d);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", s.color);
+    path.setAttribute("stroke-width", "1.5");
+    path.setAttribute("stroke-opacity", "0.85");
+    svg.appendChild(path);
+  }
+  // Legend
+  const legend = document.createElementNS(svgNS, "g");
+  legend.setAttribute("transform", `translate(${ml + 8}, ${mt + 4})`);
+  for (let i = 0; i < series.length; i++) {
+    const s = series[i];
+    const y = i * 12;
+    const sw = document.createElementNS(svgNS, "line");
+    sw.setAttribute("x1", 0); sw.setAttribute("x2", 14);
+    sw.setAttribute("y1", y); sw.setAttribute("y2", y);
+    sw.setAttribute("stroke", s.color); sw.setAttribute("stroke-width", "2");
+    legend.appendChild(sw);
+    const t = document.createElementNS(svgNS, "text");
+    t.setAttribute("x", 18); t.setAttribute("y", y + 3); t.setAttribute("fill", "#333");
+    t.textContent = s.name;
+    legend.appendChild(t);
+  }
+  svg.appendChild(legend);
+
+  root.appendChild(svg);
+}
+
+// --- Graz → Wien V1 vs V2 comparison overlay --------------------------
+// Static GeoJSON at /data/graz_wien_compare.geojson, ~742 KB. Two
+// MultiLineString features (V1 baseline + V2 elevation+curvature)
+// with route stats baked into properties.
+
+let grazWienCompareLoaded = false;
+
+async function ensureGrazWienCompareLayers() {
+  if (grazWienCompareLoaded) return;
+  setBusy("Loading Graz→Wien comparison…");
+  try {
+    const r = await fetch("/data/graz_wien_compare.geojson");
+    if (!r.ok) throw new Error(`compare: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("graz-wien-compare", { type: "geojson", data: fc });
+    // V1 underneath, V2 on top
+    map.addLayer({
+      id: "graz-wien-v1",
+      type: "line",
+      source: "graz-wien-compare",
+      filter: ["==", ["get", "variant"], "v1"],
+      paint: {
+        "line-color": "#d62728",
+        "line-width": 4,
+        "line-opacity": 0.85,
+      },
+    });
+    map.addLayer({
+      id: "graz-wien-v2",
+      type: "line",
+      source: "graz-wien-compare",
+      filter: ["==", ["get", "variant"], "v2"],
+      paint: {
+        "line-color": "#2ca02c",
+        "line-width": 4,
+        "line-opacity": 0.85,
+      },
+    });
+    // Hover to show route stats
+    for (const id of ["graz-wien-v1", "graz-wien-v2"]) {
+      map.on("click", id, (e) => {
+        const p = e.features[0].properties;
+        document.getElementById("results").innerHTML =
+          `<div class="route-card"><strong>${p.name}</strong>` +
+          `<div class="stat">Edges: ${p.edges}</div>` +
+          `<div class="stat">Length: ${p.length_km} km</div>` +
+          `<div class="stat">Climb: ${p.climb_m} m</div></div>`;
+      });
+      map.on("mouseenter", id, () => map.getCanvas().style.cursor = "crosshair");
+      map.on("mouseleave", id, () => map.getCanvas().style.cursor = "");
+    }
+    grazWienCompareLoaded = true;
+    // Frame the map to the comparison bbox so the user sees both routes.
+    map.fitBounds([[15.0, 46.9], [16.8, 48.4]], { padding: 60, duration: 500 });
+    // Elevation profile chart below the map.
+    renderElevationProfile(fc.features);
+    document.getElementById("results").innerHTML =
+      `<div class="route-card"><strong>Graz→Wien comparison loaded</strong>` +
+      `<div class="stat" style="color:#d62728">▬ V2 cost, grade/curv=0: 7442 edges, 209.2 km, 3616 m climb</div>` +
+      `<div class="stat" style="color:#2ca02c">▬ V2 cost, full elev+curv: 6736 edges, 210.8 km, 2812 m climb</div>` +
+      `<div class="stat"><em>Adding DEM-driven grade + directional curvature drops total climb by 804 m for 1.6 km extra length. All other V2 cost terms (cycleway 0.9, track 1.1, path 2.0, surface multipliers, bicycle_road bonus) are present in both routes — only elevation and curvature differ.</em></div></div>`;
+  } catch (e) {
+    setError(`compare load failed: ${e.message}`);
+    throw e;
+  }
+}
+
+document.getElementById("show-graz-wien-compare").addEventListener("change", async (e) => {
+  if (e.target.checked) {
+    try {
+      await ensureGrazWienCompareLayers();
+    } catch {
+      e.target.checked = false;
+      return;
+    }
+    map.setLayoutProperty("graz-wien-v1", "visibility", "visible");
+    map.setLayoutProperty("graz-wien-v2", "visibility", "visible");
+  } else if (grazWienCompareLoaded) {
+    map.setLayoutProperty("graz-wien-v1", "visibility", "none");
+    map.setLayoutProperty("graz-wien-v2", "visibility", "none");
+    document.getElementById("elevation").innerHTML = "";
+  }
+});
+
 // --- status helpers ---------------------------------------------------
 
 function setBusy(msg) {
