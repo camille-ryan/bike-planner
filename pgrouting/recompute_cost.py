@@ -37,7 +37,7 @@ def _recompute_one(row: tuple) -> tuple[int, float, float]:
     """Return (gid, new_cost, new_reverse_cost) for a single edge row."""
     (gid, length_m, is_ferry, reverse_cost_in,
      highway, surface, tracktype, oneway, bicycle, cycleway,
-     bicycle_road, access, curv_fwd, curv_rev,
+     bicycle_road, access, curv_fwd, curv_rev, canopy_frac,
      elev_src, elev_dst) = row
 
     if elev_src is None or elev_dst is None or length_m <= 0:
@@ -50,6 +50,7 @@ def _recompute_one(row: tuple) -> tuple[int, float, float]:
         bicycle=bicycle, cycleway=cycleway, access=access,
         bicycle_road=bicycle_road, is_ferry=is_ferry,
         grade_pct=grade_pct_fwd, curv=float(curv_fwd),
+        canopy_frac=float(canopy_frac),
     )
     if fwd_factor is None:
         # An edge that previously priced now refuses to. Should not
@@ -66,6 +67,7 @@ def _recompute_one(row: tuple) -> tuple[int, float, float]:
             bicycle=bicycle, cycleway=cycleway, access=access,
             bicycle_road=bicycle_road, is_ferry=is_ferry,
             grade_pct=-grade_pct_fwd, curv=float(curv_rev),
+            canopy_frac=float(canopy_frac),
         )
         new_reverse_cost = (float(rev_factor) * float(length_m)
                             if rev_factor is not None
@@ -83,6 +85,9 @@ def recompute(conn: psycopg.Connection,
     corridor without re-pricing the whole graph.
     """
     with conn.cursor() as cur:
+        # Parallel hash join over ways+vertices twice can blow past the
+        # postgres container's /dev/shm. We don't need parallelism here.
+        cur.execute("SET max_parallel_workers_per_gather = 0")
         if bbox:
             cur.execute(
                 "SELECT COUNT(*) FROM ways w "
@@ -127,11 +132,12 @@ def recompute(conn: psycopg.Connection,
         bbox_params = (bbox[0], bbox[2], bbox[1], bbox[3]) * 2
     while True:
         with conn.cursor() as cur:
+            cur.execute("SET max_parallel_workers_per_gather = 0")
             cur.execute(
                 "SELECT w.gid, w.length_m, w.is_ferry, w.reverse_cost, "
                 "w.highway, w.surface, w.tracktype, w.oneway, "
                 "w.bicycle, w.cycleway, w.bicycle_road, w.access, "
-                "w.curv_fwd, w.curv_rev, "
+                "w.curv_fwd, w.curv_rev, w.canopy_frac, "
                 "vs.elev_m AS elev_src, vt.elev_m AS elev_dst "
                 "FROM ways w "
                 "JOIN ways_vertices_pgr vs ON vs.id = w.source "

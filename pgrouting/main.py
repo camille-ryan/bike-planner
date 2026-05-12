@@ -1,34 +1,43 @@
 """pgRouting-backed preprocess orchestrator.
 
-  python3 main.py ingest         --countries austria
-  python3 main.py snap           --countries austria
-  python3 main.py boundaries     --countries austria
-  python3 main.py dem-download   --countries austria
+  python3 main.py ingest             --countries austria
+  python3 main.py snap               --countries austria
+  python3 main.py boundaries         --countries austria
+  python3 main.py dem-download       --countries austria
   python3 main.py dem-ingest
+  python3 main.py landcover-ingest   --countries austria
+  python3 main.py canopy-compute
   python3 main.py recompute-cost
-  python3 main.py spts           --profile lht
-  python3 main.py paired         --profile lht
-  python3 main.py all            --countries austria --profile lht
+  python3 main.py spts               --profile lht
+  python3 main.py paired             --profile lht
+  python3 main.py all                --countries austria --profile lht
 
 Subcommands (run order):
-  ingest         stream OSM PBFs into Postgres ways + ways_vertices_pgr
-                 (V2: also persists raw OSM tags + per-way sinuosity)
-  snap           load anchors from pois.sqlite, snap to nearest graph vertex
-  boundaries     stream admin polygons into anchors.geom_boundary
-  dem-download   fetch Copernicus DEM GLO-30 tiles covering the country bbox
-                 union into data/dem/ (V2 Phase A.2)
-  dem-ingest     bilinear-sample elevation at every vertex →
-                 ways_vertices_pgr.elev_m
-  recompute-cost re-apply bike_edge_cost over every edge with grade_pct +
-                 sinuosity; writes ways.cost / reverse_cost in place
-  spts           per-anchor 30 km multi-source Dijkstra → SPT npzs;
-                 also writes road_topology/<id>.npz (lon/lat per vertex,
-                 shared across profiles) and city_graph.json (with ferry
-                 chain edges added for long sea/lake crossings)
-  paired         pruned paired SPTs as a SQLite trunk DB plus optional
-                 per-pair npzs (for trace-level inspection)
-  all            ingest → snap → boundaries → dem-download → dem-ingest →
-                 recompute-cost → spts → paired
+  ingest            stream OSM PBFs into Postgres ways + ways_vertices_pgr
+                    (V2: also persists raw OSM tags + per-edge curvature)
+  snap              load anchors from pois.sqlite, snap to nearest graph vertex
+  boundaries        stream admin polygons into anchors.geom_boundary
+  dem-download      fetch Copernicus DEM GLO-30 tiles covering the country bbox
+                    union into data/dem/ (V2 Phase A.2)
+  dem-ingest        bilinear-sample elevation at every vertex →
+                    ways_vertices_pgr.elev_m
+  landcover-ingest  stream `*-landuse.osm.pbf` files into `landcover` table;
+                    forest polygons only for now (V2 Phase A.3 — scenicness
+                    tree-cover signal). Per-country, idempotent.
+  canopy-compute    per-edge fraction inside a forest polygon →
+                    ways.canopy_frac. Universal cost-bonus input.
+  recompute-cost    re-apply bike_edge_cost over every edge with grade_pct +
+                    curvature + canopy_frac; writes cost / reverse_cost
+                    in place
+  spts              per-anchor 30 km multi-source Dijkstra → SPT npzs;
+                    also writes road_topology/<id>.npz (lon/lat per vertex,
+                    shared across profiles) and city_graph.json (with ferry
+                    chain edges added for long sea/lake crossings)
+  paired            pruned paired SPTs as a SQLite trunk DB plus optional
+                    per-pair npzs (for trace-level inspection)
+  all               ingest → snap → boundaries → dem-download → dem-ingest →
+                    landcover-ingest → canopy-compute → recompute-cost →
+                    spts → paired
 
 `profile` is the output-directory name. cost.py is currently the only
 profile but the pipeline is structured to support more (topology stays
@@ -43,10 +52,16 @@ import config
 import ingest_pbf
 import ingest_boundaries
 import ingest_dem
+import ingest_landcover
+import compute_canopy_frac
+import compute_canopy_frac_raster
+import compare_canopy
+import reannotate_canopy_km
 import snap_anchors
 import compute_spts
 import download_dem
 import recompute_cost
+import export_route_compare
 
 
 def cmd_ingest(args) -> None:
@@ -91,11 +106,119 @@ def cmd_dem_ingest(args) -> None:
     print("[main] dem-ingest done")
 
 
-def cmd_recompute_cost(args) -> None:
-    print(f"[main] recompute-cost")
+def cmd_landcover_ingest(args) -> None:
+    countries = [c.strip() for c in args.countries.split(",") if c.strip()]
+    # `*-landuse.osm.pbf` lives next to `*-latest.osm.pbf` (DATA_DIR/osm)
+    # is too unrelated; the landuse extracts are stored under
+    # DATA_DIR/landcover by the upstream extract pipeline.
+    landcover_dir = config.DATA_DIR / "landcover"
+    pbfs = [landcover_dir / f"{c}-landuse.osm.pbf" for c in countries]
+    bbox = _parse_bbox(args.bbox)
+    print(f"[main] landcover-ingest countries={countries} bbox={bbox}")
     with psycopg.connect(config.PG_DSN) as conn:
-        recompute_cost.recompute(conn)
+        ingest_landcover.ingest(conn, pbfs, countries, bbox=bbox)
+    print("[main] landcover-ingest done")
+
+
+def cmd_canopy_compute(args) -> None:
+    bbox = _parse_bbox(args.bbox)
+    print(f"[main] canopy-compute bbox={bbox}")
+    with psycopg.connect(config.PG_DSN) as conn:
+        compute_canopy_frac.compute(conn, bbox=bbox)
+    print("[main] canopy-compute done")
+
+
+def cmd_canopy_compute_raster(args) -> None:
+    bbox = _parse_bbox(args.bbox)
+    if bbox is None:
+        raise SystemExit("canopy-compute-raster requires --bbox")
+    res_m = float(args.res_m) if args.res_m else 20.0
+    print(f"[main] canopy-compute-raster bbox={bbox} res_m={res_m}")
+    with psycopg.connect(config.PG_DSN) as conn:
+        compute_canopy_frac_raster.compute(conn, bbox, res_m=res_m)
+    print("[main] canopy-compute-raster done")
+
+
+def cmd_reannotate_canopy_km(args) -> None:
+    """Re-annotate canopy_km on the existing compare GeoJSON without
+    re-routing. See pgrouting/reannotate_canopy_km.py for details."""
+    in_path = Path(args.out) if args.out else reannotate_canopy_km.DEFAULT_PATH
+    if not in_path.exists():
+        raise SystemExit(f"missing GeoJSON: {in_path}")
+    print(f"[main] reannotate-canopy-km -> {in_path}")
+    import json
+    with in_path.open() as h:
+        fc = json.load(h)
+    with psycopg.connect(config.PG_DSN) as conn:
+        for feat in fc.get("features", []):
+            v = feat.get("properties", {}).get("variant", "?")
+            print(f"[main]   variant={v}")
+            reannotate_canopy_km._annotate_feature(conn, feat)
+    with in_path.open("w") as h:
+        json.dump(fc, h)
+    for feat in fc["features"]:
+        p = feat["properties"]
+        print(f"[main]   variant={p.get('variant')}: "
+              f"canopy_km={p.get('canopy_km')}")
+
+
+def cmd_compare_canopy(args) -> None:
+    bbox = _parse_bbox(args.bbox)
+    out_path = Path(args.out) if args.out else None
+    print(f"[main] compare-canopy bbox={bbox} -> {out_path}")
+    with psycopg.connect(config.PG_DSN) as conn:
+        compare_canopy.compare(conn, bbox=bbox, out_path=out_path)
+    print("[main] compare-canopy done")
+
+
+def cmd_recompute_cost(args) -> None:
+    bbox = _parse_bbox(args.bbox)
+    print(f"[main] recompute-cost bbox={bbox}")
+    with psycopg.connect(config.PG_DSN) as conn:
+        recompute_cost.recompute(conn, bbox=bbox)
     print("[main] recompute-cost done")
+
+
+def cmd_export_route_compare(args) -> None:
+    # In-container default writes to /data/ (mounted as ./data/ on host);
+    # user copies the file out to web/public/data/. The standalone script
+    # (run on host) has a different default that points directly at the
+    # web tree.
+    out = Path(args.out) if args.out else (config.DATA_DIR / "graz_wien_compare.geojson")
+    if not args.variant:
+        raise SystemExit("export-route-compare requires --variant (no_canopy | with_canopy)")
+    print(f"[main] export-route-compare variant={args.variant} -> {out}")
+    import json
+    with psycopg.connect(config.PG_DSN) as conn:
+        feat = export_route_compare.build_feature(conn, args.variant)
+    if out.exists():
+        with out.open() as h:
+            fc = json.load(h)
+        fc["features"] = [
+            f for f in fc.get("features", [])
+            if f.get("properties", {}).get("variant") != args.variant
+        ]
+    else:
+        fc = {"type": "FeatureCollection", "features": []}
+    fc["features"].append(feat)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w") as h:
+        json.dump(fc, h)
+    p = feat["properties"]
+    print(f"[main] export-route-compare done: edges={p['edges']} "
+          f"length_km={p['length_km']} climb_m={p['climb_m']} "
+          f"canopy_km={p['canopy_km']}")
+    print(f"[main]   variants in file: "
+          f"{[f['properties']['variant'] for f in fc['features']]}")
+
+
+def _parse_bbox(arg: str | None) -> tuple[float, float, float, float] | None:
+    if not arg:
+        return None
+    parts = tuple(float(x) for x in arg.split(","))
+    if len(parts) != 4:
+        raise SystemExit("--bbox must be 4 comma-separated floats")
+    return parts  # type: ignore[return-value]
 
 
 def cmd_spts(args) -> None:
@@ -131,6 +254,8 @@ def cmd_all(args) -> None:
     cmd_boundaries(args)
     cmd_dem_download(args)
     cmd_dem_ingest(args)
+    cmd_landcover_ingest(args)
+    cmd_canopy_compute(args)
     cmd_recompute_cost(args)
     cmd_spts(args)
     cmd_paired(args)
@@ -146,7 +271,13 @@ def main() -> None:
         ("boundaries", cmd_boundaries),
         ("dem-download", cmd_dem_download),
         ("dem-ingest", cmd_dem_ingest),
+        ("landcover-ingest", cmd_landcover_ingest),
+        ("canopy-compute", cmd_canopy_compute),
+        ("canopy-compute-raster", cmd_canopy_compute_raster),
+        ("compare-canopy", cmd_compare_canopy),
+        ("reannotate-canopy-km", cmd_reannotate_canopy_km),
         ("recompute-cost", cmd_recompute_cost),
+        ("export-route-compare", cmd_export_route_compare),
         ("spts", cmd_spts),
         ("paired", cmd_paired),
         ("all", cmd_all),
@@ -160,6 +291,18 @@ def main() -> None:
             help="Anchor inclusion radius around polyline. paired-only.")
         sp.add_argument("--keep-npzs", action="store_true",
             help="Also write per-pair npzs alongside the trunk DB. paired-only.")
+        sp.add_argument("--bbox", default=None,
+            help="min_lon,min_lat,max_lon,max_lat — bbox-restrict canopy-compute "
+                 "and recompute-cost (validation runs).")
+        sp.add_argument("--variant", default=None,
+            help="export-route-compare: variant tag (no_canopy | with_canopy)")
+        sp.add_argument("--out", default=None,
+            help="export-route-compare: output path. Default writes inside "
+                 "the container to /data/graz_wien_compare.geojson — copy out "
+                 "to web/public/data/ to view.")
+        sp.add_argument("--res-m", default=None,
+            help="canopy-compute-raster: raster resolution in meters "
+                 "(default 20).")
         sp.set_defaults(func=func)
 
     args = p.parse_args()

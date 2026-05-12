@@ -97,6 +97,12 @@ services:
     container_name: bike-web
     ports:
       - "8080:80"
+    # Bind-mount the static tree so edits to index.html / app.js /
+    # data/*.geojson land without rebuilding the image. The image is
+    # still built (carries the baseline files for prod / CI), the
+    # bind-mount overlays it in dev.
+    volumes:
+      - ./web/public:/usr/share/nginx/html:ro
     depends_on:
       - api
     restart: unless-stopped
