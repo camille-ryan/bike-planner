@@ -3,3 +3,6 @@ osmium==4.1.1
 numpy==1.26.4
 scipy==1.13.1
 shapely==2.0.6
+# V2 Phase A.2 — DEM ingest + vertex elevation sampling
+rasterio==1.4.2
+requests==2.32.3

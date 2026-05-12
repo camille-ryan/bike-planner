@@ -17,6 +17,18 @@ Memory: pyosmium streams the PBF; per-batch Python objects are flushed
 to Postgres every BATCH_SIZE rows. Process RSS stays under ~1 GB
 regardless of PBF size. Postgres's working memory is governed by the
 service's shared_buffers / work_mem (set in docker-compose).
+
+V2 Phase A.2 changes:
+  - Raw OSM tag columns (highway, surface, tracktype, oneway, bicycle,
+    cycleway, bicycle_road, access) are persisted on `ways` so cost
+    can be recomputed without re-parsing PBFs.
+  - Per-way sinuosity (actual_length / endpoint_distance) is computed
+    inline and stamped on every edge of the way. Clamped to [1.0, 5.0].
+  - Edge `cost`/`reverse_cost` are still computed inline using
+    `bike_edge_cost` with the V2 defaults (grade_pct=0, sinuosity=1).
+    The recompute_cost stage updates these after ingest_dem populates
+    vertex elevations, so the graph is immediately usable for routing
+    even before elevation is available.
 """
 import os
 from math import asin, cos, radians, sin, sqrt
@@ -31,6 +43,11 @@ from cost import bike_edge_cost, EXCLUDE
 
 _EARTH_R = 6_371_000.0
 _BATCH_SIZE = 100_000
+
+# Sinuosity clamp range. Endpoint-distance near zero (closed loops) or
+# tiny ways with degenerate endpoints would otherwise blow up.
+_SINUOSITY_MIN = 1.0
+_SINUOSITY_MAX = 5.0
 
 
 def _haversine(lon1, lat1, lon2, lat2):
@@ -62,7 +79,16 @@ def _create_staging(cur):
             cost         double precision NOT NULL,
             reverse_cost double precision NOT NULL,
             length_m     double precision NOT NULL,
-            is_ferry     boolean NOT NULL
+            is_ferry     boolean NOT NULL,
+            highway      text NOT NULL,
+            surface      text NOT NULL,
+            tracktype    text NOT NULL,
+            oneway       text NOT NULL,
+            bicycle      text NOT NULL,
+            cycleway     text NOT NULL,
+            bicycle_road text NOT NULL,
+            access       text NOT NULL,
+            sinuosity    real NOT NULL
         )
     """)
 
@@ -106,7 +132,9 @@ class _PgIngestHandler(osmium.SimpleHandler):
         with self.conn.cursor() as cur:
             with cur.copy(
                 "COPY tmp_edges (osm_way_id, source_osm, target_osm, "
-                "cost, reverse_cost, length_m, is_ferry) FROM STDIN"
+                "cost, reverse_cost, length_m, is_ferry, "
+                "highway, surface, tracktype, oneway, bicycle, "
+                "cycleway, bicycle_road, access, sinuosity) FROM STDIN"
             ) as cp:
                 for row in self._edge_buf:
                     cp.write_row(row)
@@ -123,21 +151,29 @@ class _PgIngestHandler(osmium.SimpleHandler):
         if hw in EXCLUDE:
             self.skipped_excluded += 1
             return
+        surface      = tags.get("surface", "") or ""
+        tracktype    = tags.get("tracktype", "") or ""
+        bicycle      = tags.get("bicycle", "") or ""
+        cycleway     = tags.get("cycleway", "") or ""
+        access       = tags.get("access", "") or ""
+        bicycle_road = tags.get("bicycle_road", "") or ""
+        oneway_raw   = tags.get("oneway", "") or ""
+
         cost_factor = bike_edge_cost(
             highway=hw,
-            surface=tags.get("surface", "") or "",
-            tracktype=tags.get("tracktype", "") or "",
-            bicycle=tags.get("bicycle", "") or "",
-            cycleway=tags.get("cycleway", "") or "",
-            access=tags.get("access", "") or "",
-            bicycle_road=tags.get("bicycle_road", "") or "",
+            surface=surface,
+            tracktype=tracktype,
+            bicycle=bicycle,
+            cycleway=cycleway,
+            access=access,
+            bicycle_road=bicycle_road,
             is_ferry=is_ferry,
         )
         if cost_factor is None:
             self.skipped_no_cost += 1
             return
 
-        ow = (tags.get("oneway") or "").lower()
+        ow = oneway_raw.lower()
         if ow in ("-1", "reverse"):
             oneway_dir = -1
         elif ow in ("yes", "true", "1"):
@@ -145,16 +181,41 @@ class _PgIngestHandler(osmium.SimpleHandler):
         else:
             oneway_dir = 0
 
-        prev_id = None
-        prev_lon = prev_lat = 0.0
+        # Pass 1: collect all resolvable node positions. Missing locations
+        # (InvalidLocationError) just break the chain — same behavior as
+        # the V1 code, kept for symmetry.
+        nodes: list[tuple[int, float, float]] = []
         for node in w.nodes:
             try:
                 lon = node.location.lon
                 lat = node.location.lat
             except (osmium.InvalidLocationError, RuntimeError):
-                prev_id = None
                 continue
-            self._node_buf.append((int(node.ref), float(lon), float(lat)))
+            nodes.append((int(node.ref), float(lon), float(lat)))
+        if len(nodes) < 2:
+            return
+
+        # Per-way sinuosity: total polyline length / endpoint distance.
+        total_length = 0.0
+        for i in range(len(nodes) - 1):
+            _, ln1, lt1 = nodes[i]
+            _, ln2, lt2 = nodes[i + 1]
+            total_length += _haversine(ln1, lt1, ln2, lt2)
+        end_dist = _haversine(nodes[0][1], nodes[0][2],
+                              nodes[-1][1], nodes[-1][2])
+        if end_dist <= 0.0:
+            # Closed loop or coincident endpoints — sinuosity is
+            # undefined; treat as curvy.
+            sinuosity = _SINUOSITY_MAX
+        else:
+            sinuosity = max(_SINUOSITY_MIN,
+                            min(_SINUOSITY_MAX, total_length / end_dist))
+
+        # Pass 2: emit nodes and per-segment edges.
+        prev_id = None
+        prev_lon = prev_lat = 0.0
+        for osm_id, lon, lat in nodes:
+            self._node_buf.append((osm_id, lon, lat))
             if prev_id is not None:
                 length_m = _haversine(prev_lon, prev_lat, lon, lat)
                 if length_m > 0:
@@ -166,10 +227,13 @@ class _PgIngestHandler(osmium.SimpleHandler):
                     else:                         # reverse only
                         cost, rev = -1.0, fwd_cost
                     self._edge_buf.append((
-                        int(w.id), int(prev_id), int(node.ref),
+                        int(w.id), prev_id, osm_id,
                         cost, rev, float(length_m), bool(is_ferry),
+                        hw, surface, tracktype, oneway_raw,
+                        bicycle, cycleway, bicycle_road, access,
+                        float(sinuosity),
                     ))
-            prev_id = int(node.ref)
+            prev_id = osm_id
             prev_lon = lon
             prev_lat = lat
 
@@ -220,6 +284,18 @@ def _stream_pbf(conn: psycopg.Connection, pbf: Path) -> dict:
     }
 
 
+_INSERT_COLUMNS = (
+    "osm_way_id, source, target, cost, reverse_cost, length_m, is_ferry, "
+    "highway, surface, tracktype, oneway, bicycle, cycleway, bicycle_road, "
+    "access, sinuosity"
+)
+_SELECT_COLUMNS = (
+    "e.osm_way_id, v_src.id, v_dst.id, e.cost, e.reverse_cost, e.length_m, "
+    "e.is_ferry, e.highway, e.surface, e.tracktype, e.oneway, e.bicycle, "
+    "e.cycleway, e.bicycle_road, e.access, e.sinuosity"
+)
+
+
 def _resolve_into_final(cur):
     """Promote staging rows into the final pgRouting-backed tables.
 
@@ -256,13 +332,9 @@ def _resolve_into_final(cur):
             ON ways (osm_way_id, source, target)
         """)
         print("[ingest] incremental insert into ways (dedup via ON CONFLICT)...")
-        cur.execute("""
-            INSERT INTO ways (osm_way_id, source, target,
-                              cost, reverse_cost, length_m, is_ferry)
-            SELECT
-                e.osm_way_id,
-                v_src.id, v_dst.id,
-                e.cost, e.reverse_cost, e.length_m, e.is_ferry
+        cur.execute(f"""
+            INSERT INTO ways ({_INSERT_COLUMNS})
+            SELECT {_SELECT_COLUMNS}
             FROM tmp_edges e
             JOIN ways_vertices_pgr v_src ON v_src.osm_id = e.source_osm
             JOIN ways_vertices_pgr v_dst ON v_dst.osm_id = e.target_osm
@@ -276,13 +348,9 @@ def _resolve_into_final(cur):
         cur.execute("DROP INDEX IF EXISTS ways_target_idx")
 
         print("[ingest] resolve ids + insert into ways (no indexes, no FKs)...")
-        cur.execute("""
-            INSERT INTO ways (osm_way_id, source, target,
-                              cost, reverse_cost, length_m, is_ferry)
-            SELECT
-                e.osm_way_id,
-                v_src.id, v_dst.id,
-                e.cost, e.reverse_cost, e.length_m, e.is_ferry
+        cur.execute(f"""
+            INSERT INTO ways ({_INSERT_COLUMNS})
+            SELECT {_SELECT_COLUMNS}
             FROM tmp_edges e
             JOIN ways_vertices_pgr v_src ON v_src.osm_id = e.source_osm
             JOIN ways_vertices_pgr v_dst ON v_dst.osm_id = e.target_osm
