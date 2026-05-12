@@ -74,6 +74,12 @@
         <label class="checkbox"><input type="checkbox" id="show-landcover" />Land cover (forest / agricultural / urban / water / wetland)</label>
         <label class="checkbox"><input type="checkbox" id="show-hillshade" />Terrain hillshade (AWS Open Data, terrarium-encoded)</label>
         <label class="checkbox"><input type="checkbox" id="show-graz-wien-compare" />Graz→Wien: with vs. without canopy bonus</label>
+      </section>
+
+      <section id="scenicness-section">
+        <h2>Scenicness signals</h2>
+        <p class="hint">Rasters produced by <code>scenicness-bake</code>. Each layer is a single PNG image overlay covering the bbox (currently the Graz↔Wien corridor). Toggle on demand — PNGs are tens of MB.</p>
+        <div id="scenicness-toggles"><em class="hint">Loading manifest…</em></div>
         <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name. Land cover: OSM landuse polygons rolled up to 5 classes — captures actual transitions between forest, cropland and urban for the corridor (AT, CZ, DE, DK only). Graz→Wien compare: same V2 cost (elevation + curvature always on). Gray = no canopy term. Green = + 0.9× multiplier where the edge centerline runs under a forest polygon.</p>
       </section>
 
@@ -91,6 +97,6 @@
   </div>
 
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-  <script src="app.js?v=20260512a"></script>
+  <script src="app.js?v=20260512b"></script>
 </body>
 </html>

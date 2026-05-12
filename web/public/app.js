@@ -977,6 +977,91 @@ function setError(msg) {
   document.getElementById("results").innerHTML = `<div class="route-card" style="border-color:#c52;"><strong>Error</strong><div class="stat">${msg}</div></div>`;
 }
 
+// --- Scenicness raster overlays ---------------------------------------
+// One image overlay per signal raster, produced by
+// `scenicness-bake --export-rasters`. The bake writes
+// data/scenicness/<column>.png plus a manifest.json giving the bbox
+// and per-signal colormap info. We fetch the manifest, render one
+// toggle per signal, and lazily add MapLibre image sources/layers on
+// first activation.
+
+const SCENICNESS_MANIFEST_URL = "/data/scenicness/manifest.json";
+const scenicnessLoaded = new Set();     // columns whose layer is in the style
+let scenicnessManifest = null;
+
+async function initScenicnessOverlays() {
+  const root = document.getElementById("scenicness-toggles");
+  if (!root) return;
+  try {
+    const r = await fetch(SCENICNESS_MANIFEST_URL + "?ts=" + Date.now());
+    if (!r.ok) throw new Error(`manifest: ${r.status}`);
+    scenicnessManifest = await r.json();
+  } catch (e) {
+    root.innerHTML =
+      `<p class="hint" style="color:#a52;">No scenicness manifest yet ` +
+      `(<code>${e.message}</code>). Run <code>scenicness-bake ` +
+      `--export-rasters</code> to generate.</p>`;
+    return;
+  }
+  const sigs = scenicnessManifest.signals || {};
+  const items = Object.keys(sigs).map(col => {
+    const s = sigs[col];
+    return `<label class="checkbox" title="${s.description || ""}">` +
+      `<input type="checkbox" data-scenicness="${col}" />` +
+      `${s.name || col}</label>`;
+  });
+  root.innerHTML = items.length
+    ? items.join("\n")
+    : `<p class="hint">No signals in manifest.</p>`;
+  for (const cb of root.querySelectorAll("input[data-scenicness]")) {
+    cb.addEventListener("change", e => toggleScenicness(
+      e.target.dataset.scenicness, e.target.checked,
+    ));
+  }
+}
+
+function toggleScenicness(column, on) {
+  if (!scenicnessManifest) return;
+  const sig = scenicnessManifest.signals[column];
+  if (!sig) return;
+  const layerId = `scenic-${column}`;
+  const sourceId = `scenic-${column}-src`;
+
+  if (on && !scenicnessLoaded.has(column)) {
+    const [minLon, minLat, maxLon, maxLat] = scenicnessManifest.bbox;
+    map.addSource(sourceId, {
+      type: "image",
+      url: `/data/scenicness/${sig.png}?ts=${Date.now()}`,
+      // MapLibre image source corners, clockwise from top-left.
+      coordinates: [
+        [minLon, maxLat],
+        [maxLon, maxLat],
+        [maxLon, minLat],
+        [minLon, minLat],
+      ],
+    });
+    // Insert just below the route/anchor layers so overlays don't
+    // hide them. Pick the first layer in the active style whose id
+    // starts with one of the "things we want on top" prefixes; if
+    // none found, addLayer with no anchor (= on top).
+    const topAnchor = map.getStyle().layers
+      .map(l => l.id)
+      .find(id => id.startsWith("graz-wien-") || id === "anchors"
+                || id === "route-line");
+    map.addLayer({
+      id: layerId,
+      type: "raster",
+      source: sourceId,
+      paint: { "raster-opacity": 0.55 },
+    }, topAnchor);
+    scenicnessLoaded.add(column);
+  } else if (scenicnessLoaded.has(column)) {
+    map.setLayoutProperty(
+      layerId, "visibility", on ? "visible" : "none",
+    );
+  }
+}
+
 // --- bootstrap ---------------------------------------------------------
 
 map.on("load", () => {
@@ -995,5 +1080,6 @@ map.on("load", () => {
   refreshWaypointMarkers();
   updateRouteButton();
   loadCities();
+  initScenicnessOverlays();
   routeNow();
 });

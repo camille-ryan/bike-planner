@@ -107,6 +107,18 @@ ALTER TABLE ways ADD COLUMN IF NOT EXISTS curv_fwd     real NOT NULL DEFAULT 0.0
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS curv_rev     real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS grade_pct    real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS canopy_frac  real NOT NULL DEFAULT 0.0;
+-- V2 scenicness: per-edge raster-sampled signals. Populated by
+-- pgrouting/scenicness/bake.py (see `signals.py` for the registry).
+-- forest_local: forest fraction in 200 m disc, sampled at midpoint
+-- forest_wide:  forest fraction in 2 km disc, sampled at midpoint
+-- view_dominance: DEM minus 2 km Gaussian blur (meters), midpoint
+-- local_relief:  stddev of DEM in 500 m window (meters), midpoint
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS forest_local   real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS forest_wide    real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS view_dominance real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS local_relief   real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS regional_relief   real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS distance_to_drama real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways DROP COLUMN IF EXISTS sinuosity;
 CREATE INDEX IF NOT EXISTS ways_source_idx ON ways(source);
 CREATE INDEX IF NOT EXISTS ways_target_idx ON ways(target);
