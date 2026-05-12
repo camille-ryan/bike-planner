@@ -55,6 +55,8 @@ import ingest_dem
 import ingest_landcover
 import compute_canopy_frac
 import compute_canopy_frac_raster
+from scenicness import bake as scenicness_bake
+from scenicness import signals as scenicness_signals
 import compare_canopy
 import reannotate_canopy_km
 import snap_anchors
@@ -126,6 +128,32 @@ def cmd_canopy_compute(args) -> None:
     with psycopg.connect(config.PG_DSN) as conn:
         compute_canopy_frac.compute(conn, bbox=bbox)
     print("[main] canopy-compute done")
+
+
+def cmd_scenicness_bake(args) -> None:
+    """Compute per-edge scenicness signals in one pass."""
+    bbox = _parse_bbox(args.bbox)
+    if bbox is None:
+        raise SystemExit("scenicness-bake requires --bbox")
+    if args.signals:
+        names = [s.strip() for s in args.signals.split(",") if s.strip()]
+    else:
+        names = list(scenicness_signals.SIGNALS.keys())
+    unknown = [n for n in names if n not in scenicness_signals.SIGNALS]
+    if unknown:
+        raise SystemExit(f"unknown signal(s): {unknown}; "
+                         f"available: {list(scenicness_signals.SIGNALS.keys())}")
+    res_m = float(args.res_m) if args.res_m else 20.0
+    export_dir = Path(args.export_rasters) if args.export_rasters else None
+    print(f"[main] scenicness-bake bbox={bbox} res_m={res_m} signals={names} "
+          f"export_rasters={export_dir}")
+    with psycopg.connect(config.PG_DSN) as conn:
+        scenicness_bake.bake(
+            conn, names, bbox, res_m=res_m,
+            dem_dir=config.DEM_DIR,
+            export_rasters_dir=export_dir,
+        )
+    print("[main] scenicness-bake done")
 
 
 def cmd_canopy_compute_raster(args) -> None:
@@ -274,6 +302,7 @@ def main() -> None:
         ("landcover-ingest", cmd_landcover_ingest),
         ("canopy-compute", cmd_canopy_compute),
         ("canopy-compute-raster", cmd_canopy_compute_raster),
+        ("scenicness-bake", cmd_scenicness_bake),
         ("compare-canopy", cmd_compare_canopy),
         ("reannotate-canopy-km", cmd_reannotate_canopy_km),
         ("recompute-cost", cmd_recompute_cost),
@@ -301,8 +330,14 @@ def main() -> None:
                  "the container to /data/graz_wien_compare.geojson — copy out "
                  "to web/public/data/ to view.")
         sp.add_argument("--res-m", default=None,
-            help="canopy-compute-raster: raster resolution in meters "
-                 "(default 20).")
+            help="canopy-compute-raster / scenicness-bake: raster "
+                 "resolution in meters (default 20).")
+        sp.add_argument("--signals", default=None,
+            help="scenicness-bake: comma-separated signal names. "
+                 "Default = every registered signal.")
+        sp.add_argument("--export-rasters", default=None,
+            help="scenicness-bake: write PNG overlays + manifest.json "
+                 "to this directory (e.g. /data/web_overlays/scenicness).")
         sp.set_defaults(func=func)
 
     args = p.parse_args()

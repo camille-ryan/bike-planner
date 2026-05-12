@@ -1,0 +1,87 @@
+{
+  "bbox": [
+    14.5,
+    46.8,
+    17.0,
+    48.5
+  ],
+  "res_m": 20.0,
+  "signals": {
+    "forest_local": {
+      "name": "forest_local",
+      "description": "Fraction of a 200 m disc around the edge that's forest.",
+      "png": "forest_local.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "green"
+      }
+    },
+    "forest_wide": {
+      "name": "forest_wide",
+      "description": "Fraction of a 2 km disc around the edge that's forest.",
+      "png": "forest_wide.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "green"
+      }
+    },
+    "local_relief": {
+      "name": "local_relief",
+      "description": "Std-dev of elevation in 500 m window (meters of terrain variation \u2014 high in gorges and on mountainsides).",
+      "png": "local_relief.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "intensity",
+        "vmax": 120.0
+      }
+    },
+    "regional_relief": {
+      "name": "regional_relief",
+      "description": "Std-dev of elevation in 10 km window \u2014 regional mountainous-ness, even where local terrain is flat.",
+      "png": "regional_relief.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "intensity",
+        "vmax": 250.0
+      }
+    },
+    "distance_to_drama": {
+      "name": "distance_to_drama",
+      "description": "Meters to nearest cell with local_relief \u2265 80 m. Small = visible mountains nearby. ~0 inside dramatic terrain.",
+      "png": "distance_to_drama.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "inverse_intensity",
+        "vmax": 15000.0
+      }
+    },
+    "view_dominance": {
+      "name": "view_dominance",
+      "description": "DEM elevation minus 2 km Gaussian blur \u2014 meters above local mean.",
+      "png": "view_dominance.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "diverging",
+        "vmax": 200.0
+      }
+    }
+  }
+}
