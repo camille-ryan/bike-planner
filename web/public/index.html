@@ -72,7 +72,9 @@
         <h2>Map overlays</h2>
         <label class="checkbox"><input type="checkbox" id="show-biome" />Biome / ecoregion (Resolve 2017)</label>
         <label class="checkbox"><input type="checkbox" id="show-landcover" />Land cover (forest / agricultural / urban / water / wetland)</label>
-        <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name. Land cover: OSM landuse polygons rolled up to 5 classes — captures actual transitions between forest, cropland and urban for the corridor (AT, CZ, DE, DK only).</p>
+        <label class="checkbox"><input type="checkbox" id="show-hillshade" />Terrain hillshade (AWS Open Data, terrarium-encoded)</label>
+        <label class="checkbox"><input type="checkbox" id="show-graz-wien-compare" />Graz→Wien: with vs. without elevation + curvature</label>
+        <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name. Land cover: OSM landuse polygons rolled up to 5 classes — captures actual transitions between forest, cropland and urban for the corridor (AT, CZ, DE, DK only). Graz→Wien compare: same V2 cost function, only elevation + curvature toggled. Red = grade/curv set to 0 (flat-graph assumption). Green = full V2 with DEM-derived grade and directional curvature.</p>
       </section>
 
       <section id="results"></section>
