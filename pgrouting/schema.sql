@@ -87,7 +87,13 @@ CREATE TABLE IF NOT EXISTS ways (
     -- Derived per-edge fields populated by ingest pipeline.
     curv_fwd      real NOT NULL DEFAULT 0.0,
     curv_rev      real NOT NULL DEFAULT 0.0,
-    grade_pct     real NOT NULL DEFAULT 0.0
+    grade_pct     real NOT NULL DEFAULT 0.0,
+    -- V2 scenicness: fraction of edge length whose centerline falls
+    -- inside a `landcover.class='forest'` polygon. Populated by
+    -- `compute_canopy_frac`; 0.0 when uncomputed. Used as a universal
+    -- cost bonus ("trees overhead = shade & nicer ride"); applies to
+    -- every profile, not just scenic.
+    canopy_frac   real NOT NULL DEFAULT 0.0
 );
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS highway      text NOT NULL DEFAULT '';
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS surface      text NOT NULL DEFAULT '';
@@ -100,6 +106,7 @@ ALTER TABLE ways ADD COLUMN IF NOT EXISTS access       text NOT NULL DEFAULT '';
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS curv_fwd     real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS curv_rev     real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS grade_pct    real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS canopy_frac  real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways DROP COLUMN IF EXISTS sinuosity;
 CREATE INDEX IF NOT EXISTS ways_source_idx ON ways(source);
 CREATE INDEX IF NOT EXISTS ways_target_idx ON ways(target);
@@ -125,3 +132,22 @@ CREATE INDEX IF NOT EXISTS anchors_geom_idx ON anchors USING gist(geom);
 CREATE INDEX IF NOT EXISTS anchors_snap_idx ON anchors(snap_vertex_id);
 CREATE INDEX IF NOT EXISTS anchors_geom_boundary_idx
     ON anchors USING gist(geom_boundary);
+
+-- V2 scenicness: full-resolution landcover polygons sourced from
+-- per-country `*-landuse.osm.pbf` extracts. Populated by
+-- `ingest_landcover.py`, one row per OSM area. `class` is the rolled-up
+-- category (currently always 'forest' for tree-cover signals; the
+-- column is in place so other classes — water, agricultural — can be
+-- added without schema churn). `country` tags the source PBF so a
+-- country can be re-ingested in isolation without wiping the others.
+CREATE TABLE IF NOT EXISTS landcover (
+    id      bigserial PRIMARY KEY,
+    osm_id  bigint,
+    country text NOT NULL,
+    class   text NOT NULL,
+    geom    geometry(MultiPolygon, 4326) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS landcover_geom_idx
+    ON landcover USING gist(geom);
+CREATE INDEX IF NOT EXISTS landcover_class_idx ON landcover(class);
+CREATE INDEX IF NOT EXISTS landcover_country_idx ON landcover(country);

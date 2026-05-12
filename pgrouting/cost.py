@@ -44,9 +44,21 @@ ingest path keeps working until DEM ingest lands.
     in the database; the caller passes whichever applies for the
     direction it's pricing.
 
+V2 Phase A.3: tree-cover overhead (universal modifier).
+  - `canopy_frac` (∈ [0, 1]) is the fraction of an edge whose
+    centerline falls inside a `landcover=forest` polygon. Populated
+    by `compute_canopy_frac.py` from OSM `landuse=forest` /
+    `natural=wood` areas.
+  - Multiplier: `× (1 - 0.1 × canopy_frac)`. A fully-canopied edge
+    gets a 10% bonus — the rider's "trees overhead = shade" value.
+  - Applies to every profile (direct, balanced, scenic eventually).
+    The "forests visible nearby" scenic-only signal lives elsewhere
+    (`nearby_forest_frac`, deferred to scenic-profile work).
+
 Known gaps deferred to V3 (V2.md §1.2):
-  - spatial scenic signals (landcover, water/camp POI density along
-    corridor — see GAP+C&O calibration in design notes)
+  - additional spatial scenic signals (water proximity, low-traffic
+    feel, camp/lodging density along corridor — see GAP+C&O
+    calibration in design notes)
   - `access:conditional` / `seasonal=yes` parsing (mountain pass
     seasonal closures)
   - route-relation enrichment (`route=bicycle` with
@@ -168,6 +180,13 @@ _DOWNHILL_QUADRATIC = 0.005    #   so bonus peaks in the "fun zone," neutral by 
 #   switchback group 540° at -10%:   3.70
 _CURV_COEFF = 0.0005
 
+# V2 Phase A.3: tree-cover overhead bonus. A fully-canopied edge gets a
+# 10% cost reduction (multiplier 0.9). Applied universally — direct,
+# balanced, and (future) scenic all get the same bonus, because shade
+# is objectively a better ride regardless of how scenic-leaning the
+# profile is.
+_CANOPY_BONUS = 0.1
+
 
 def _has_bike_infra(bicycle: str, cycleway: str, bicycle_road: str) -> bool:
     if bicycle_road == "yes":
@@ -192,6 +211,7 @@ def bike_edge_cost(
     grade_pct: float = 0.0,     # positive = uphill, negative = downhill
     curv: float = 0.0,          # total bend angle (degrees) in the *forward*
                                 # polyline window for the direction being priced
+    canopy_frac: float = 0.0,   # ∈ [0,1] fraction of edge under forest canopy
 ) -> float | None:
     """Return a unitless per-meter costfactor, or None to exclude the edge."""
     # Ferries are tagged `route=ferry` in OSM and typically don't carry
@@ -245,5 +265,10 @@ def bike_edge_cost(
         cost *= 1.0 - _DOWNHILL_LINEAR * g + _DOWNHILL_QUADRATIC * g * g
         if curv > 0.0:
             cost *= 1.0 + _CURV_COEFF * curv * g
+
+    # V2 Phase A.3: universal tree-cover-overhead bonus. Edge fraction
+    # inside a forest polygon gets a proportional discount, max 10%.
+    if canopy_frac > 0.0:
+        cost *= 1.0 - _CANOPY_BONUS * canopy_frac
 
     return float(cost)
