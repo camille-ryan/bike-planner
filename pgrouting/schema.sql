@@ -54,15 +54,16 @@ CREATE INDEX IF NOT EXISTS ways_vertices_pgr_geom_idx
 -- to ingest time. Our ingest pipeline JOINs against ways_vertices_pgr
 -- to resolve the IDs, which is its own integrity check.
 --
--- V2 Phase A.2: raw OSM tag columns + sinuosity + grade_pct are
--- persisted at ingest time so cost can be recomputed (with elevation
--- + sinuosity) without re-parsing PBFs.
+-- V2 Phase A.2: raw OSM tag columns + directional curvature + grade
+-- are persisted at ingest time so cost can be recomputed (with
+-- elevation + curvature) without re-parsing PBFs.
 --   - tag columns (highway, surface, tracktype, oneway, bicycle,
 --     cycleway, bicycle_road, access) are per-way but stored per-edge
 --     for simplicity. Empty string when the tag is absent.
---   - sinuosity is per-way (actual_length / endpoint_distance) and
---     also denormalized per-edge for the same reason; defaults to 1.0
---     (straight) when uncomputed.
+--   - curv_fwd / curv_rev are per-edge: the total absolute bend
+--     angle (in degrees) the rider encounters in the next ~300 m of
+--     polyline, looking *ahead* in the forward and reverse direction
+--     of travel respectively. Default 0.0 = no bends.
 --   - grade_pct is per-edge, derived from vertex elevations after
 --     ingest_dem runs; defaults to 0.0 (flat) when uncomputed.
 CREATE TABLE IF NOT EXISTS ways (
@@ -83,8 +84,9 @@ CREATE TABLE IF NOT EXISTS ways (
     cycleway      text NOT NULL DEFAULT '',
     bicycle_road  text NOT NULL DEFAULT '',
     access        text NOT NULL DEFAULT '',
-    -- Derived per-way / per-edge fields populated by ingest pipeline.
-    sinuosity     real NOT NULL DEFAULT 1.0,
+    -- Derived per-edge fields populated by ingest pipeline.
+    curv_fwd      real NOT NULL DEFAULT 0.0,
+    curv_rev      real NOT NULL DEFAULT 0.0,
     grade_pct     real NOT NULL DEFAULT 0.0
 );
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS highway      text NOT NULL DEFAULT '';
@@ -95,8 +97,10 @@ ALTER TABLE ways ADD COLUMN IF NOT EXISTS bicycle      text NOT NULL DEFAULT '';
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS cycleway     text NOT NULL DEFAULT '';
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS bicycle_road text NOT NULL DEFAULT '';
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS access       text NOT NULL DEFAULT '';
-ALTER TABLE ways ADD COLUMN IF NOT EXISTS sinuosity    real NOT NULL DEFAULT 1.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS curv_fwd     real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS curv_rev     real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS grade_pct    real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways DROP COLUMN IF EXISTS sinuosity;
 CREATE INDEX IF NOT EXISTS ways_source_idx ON ways(source);
 CREATE INDEX IF NOT EXISTS ways_target_idx ON ways(target);
 

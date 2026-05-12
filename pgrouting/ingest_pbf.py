@@ -31,7 +31,7 @@ V2 Phase A.2 changes:
     even before elevation is available.
 """
 import os
-from math import asin, cos, radians, sin, sqrt
+from math import asin, atan2, cos, degrees, radians, sin, sqrt
 from pathlib import Path
 from typing import Iterable
 
@@ -44,20 +44,15 @@ from cost import bike_edge_cost, EXCLUDE
 _EARTH_R = 6_371_000.0
 _BATCH_SIZE = 100_000
 
-# Sinuosity clamp range. Endpoint-distance near zero (closed loops) or
-# tiny ways with degenerate endpoints would otherwise blow up.
-_SINUOSITY_MIN = 1.0
-_SINUOSITY_MAX = 5.0
-
-# Window over which per-segment sinuosity is measured. A pure per-way
-# sinuosity would average a 1 km switchback section into a 10 km way's
-# overall ~1.0 sinuosity, washing out the signal exactly where the
-# cost function needs it. Computing sinuosity in a small polyline
-# window around each segment localizes the metric. 300 m is roughly
-# the scale of an alpine switchback group; smaller windows pick up
-# noise from minor wiggles, larger ones re-introduce the averaging
-# problem.
-_SINUOSITY_WINDOW_M = 300.0
+# Window over which directional curvature is accumulated. Each segment's
+# `curv_fwd` is the total absolute bend angle at nodes within the next
+# ~_CURV_WINDOW_M polyline meters (forward direction of travel); `curv_rev`
+# is the same looking the other way. This captures the physics of "steep
+# descent into a curve" — the descending segment sees the upcoming bend in
+# its forward window even though the segment itself is straight.
+#
+# 300 m matches typical alpine-switchback / valley-bottom-curve scales.
+_CURV_WINDOW_M = 300.0
 
 
 def _haversine(lon1, lat1, lon2, lat2):
@@ -68,74 +63,79 @@ def _haversine(lon1, lat1, lon2, lat2):
     return 2 * _EARTH_R * asin(sqrt(a))
 
 
-def _segment_sinuosities(nodes: list[tuple[int, float, float]],
-                         window_m: float = _SINUOSITY_WINDOW_M
-                         ) -> list[float]:
-    """Per-segment sinuosity over a polyline window centered on each segment.
+def _segment_curvatures(nodes: list[tuple[int, float, float]],
+                        window_m: float = _CURV_WINDOW_M
+                        ) -> list[tuple[float, float]]:
+    """Per-segment directional bend totals over a polyline window.
 
-    For each of the N-1 segments in `nodes`, returns
-        actual_polyline_length / straight_line_distance
-    computed over a window of ~`window_m` polyline meters centered on
-    the segment's midpoint, clamped to [_SINUOSITY_MIN, _SINUOSITY_MAX].
+    For each of the N-1 segments, returns `(curv_fwd, curv_rev)`:
+      curv_fwd: sum of absolute bend angles (degrees) at nodes within
+                the next `window_m` of polyline (forward in way order).
+                "Forward" includes the bend at the segment's own target
+                node — that's the first bend you encounter as you exit.
+      curv_rev: same looking the other way.
 
-    O(N) per way (two-pointer window advancement).
+    O(N) per way via prefix-sum + two-pointer window advancement.
     """
     n = len(nodes)
     if n < 2:
         return []
 
-    # Cumulative polyline length per node: cumlen[i] = polyline distance
-    # from nodes[0] to nodes[i]. cumlen[0] == 0; cumlen[n-1] == total.
+    # Cumulative polyline length per node.
     cumlen = [0.0] * n
     for i in range(n - 1):
         _, ln1, lt1 = nodes[i]
         _, ln2, lt2 = nodes[i + 1]
         cumlen[i + 1] = cumlen[i] + _haversine(ln1, lt1, ln2, lt2)
-    total_length = cumlen[-1]
 
-    # Way is shorter than ~1.5×window — local-vs-global distinction
-    # doesn't apply; fall back to whole-way sinuosity for every segment.
-    if total_length <= window_m * 1.5:
-        end_dist = _haversine(nodes[0][1], nodes[0][2],
-                              nodes[-1][1], nodes[-1][2])
-        if end_dist <= 0.0:
-            sin_global = _SINUOSITY_MAX
-        else:
-            sin_global = max(_SINUOSITY_MIN,
-                             min(_SINUOSITY_MAX, total_length / end_dist))
-        return [sin_global] * (n - 1)
+    # Per-node absolute bend angle (degrees). Endpoints get 0 since
+    # they have no incoming-or-outgoing pair. Latitude-scaled local
+    # frame: lon × cos(mean_lat) so angles aren't distorted at higher
+    # latitudes. Relative scale only matters; absolute units cancel.
+    bends = [0.0] * n
+    if n >= 3:
+        lat_mid = nodes[n // 2][2]
+        lon_scale = cos(radians(lat_mid))
+        for i in range(1, n - 1):
+            ax = (nodes[i][1]     - nodes[i - 1][1]) * lon_scale
+            ay =  nodes[i][2]     - nodes[i - 1][2]
+            bx = (nodes[i + 1][1] - nodes[i][1])     * lon_scale
+            by =  nodes[i + 1][2] - nodes[i][2]
+            # Signed angle from incoming to outgoing direction.
+            cross = ax * by - ay * bx
+            dot   = ax * bx + ay * by
+            bends[i] = abs(degrees(atan2(cross, dot)))
 
-    half = window_m / 2.0
-    a = 0           # window start node index
-    b = 0           # window end node index
-    out: list[float] = []
-    for i in range(n - 1):
-        mid = (cumlen[i] + cumlen[i + 1]) * 0.5
-        lo = mid - half
-        hi = mid + half
-        # Advance window-start until cumlen[a] <= lo and cumlen[a+1] > lo.
-        # i.e. a is the latest node at or before the window's lower edge.
-        while a + 1 < n and cumlen[a + 1] <= lo:
-            a += 1
-        # Advance window-end until cumlen[b] >= hi (or hit the end).
-        while b + 1 < n and cumlen[b] < hi:
-            b += 1
+    # Prefix sums of bends so window queries are O(1) given indices.
+    # bend_prefix[k] = sum of bends[0..k-1].
+    bend_prefix = [0.0] * (n + 1)
+    for i in range(n):
+        bend_prefix[i + 1] = bend_prefix[i] + bends[i]
 
-        if b <= a:
-            # Degenerate window (shouldn't really happen given the
-            # short-way fallback above, but be defensive).
-            out.append(_SINUOSITY_MIN)
-            continue
-        win_length = cumlen[b] - cumlen[a]
-        win_endpoint = _haversine(
-            nodes[a][1], nodes[a][2],
-            nodes[b][1], nodes[b][2],
-        )
-        if win_endpoint <= 0.0:
-            out.append(_SINUOSITY_MAX)
-        else:
-            out.append(max(_SINUOSITY_MIN,
-                           min(_SINUOSITY_MAX, win_length / win_endpoint)))
+    out: list[tuple[float, float]] = []
+
+    # Forward window for segment k = (node[k], node[k+1]):
+    # bends at indices m where k+1 <= m and cumlen[m] - cumlen[k+1] <= window_m.
+    # m is monotonic non-decreasing as k advances.
+    m_fwd = 0
+    for k in range(n - 1):
+        if m_fwd < k + 1:
+            m_fwd = k + 1
+        while m_fwd + 1 < n and cumlen[m_fwd + 1] - cumlen[k + 1] <= window_m:
+            m_fwd += 1
+        curv_fwd = bend_prefix[m_fwd + 1] - bend_prefix[k + 1]
+        out.append((curv_fwd, 0.0))   # curv_rev filled in next loop
+
+    # Reverse window for segment k:
+    # bends at indices m where m <= k and cumlen[k] - cumlen[m] <= window_m.
+    # As k advances, the lower bound m_min is monotonic non-decreasing.
+    m_min = 0
+    for k in range(n - 1):
+        while m_min < k and cumlen[m_min] < cumlen[k] - window_m:
+            m_min += 1
+        curv_rev = bend_prefix[k + 1] - bend_prefix[m_min]
+        out[k] = (out[k][0], curv_rev)
+
     return out
 
 
@@ -169,7 +169,8 @@ def _create_staging(cur):
             cycleway     text NOT NULL,
             bicycle_road text NOT NULL,
             access       text NOT NULL,
-            sinuosity    real NOT NULL
+            curv_fwd     real NOT NULL,
+            curv_rev     real NOT NULL
         )
     """)
 
@@ -215,7 +216,7 @@ class _PgIngestHandler(osmium.SimpleHandler):
                 "COPY tmp_edges (osm_way_id, source_osm, target_osm, "
                 "cost, reverse_cost, length_m, is_ferry, "
                 "highway, surface, tracktype, oneway, bicycle, "
-                "cycleway, bicycle_road, access, sinuosity) FROM STDIN"
+                "cycleway, bicycle_road, access, curv_fwd, curv_rev) FROM STDIN"
             ) as cp:
                 for row in self._edge_buf:
                     cp.write_row(row)
@@ -276,12 +277,13 @@ class _PgIngestHandler(osmium.SimpleHandler):
         if len(nodes) < 2:
             return
 
-        # Per-segment sinuosity (windowed; see _segment_sinuosities).
-        seg_sinuosities = _segment_sinuosities(nodes)
+        # Per-segment directional curvature (windowed; see _segment_curvatures).
+        seg_curvs = _segment_curvatures(nodes)
 
-        # Pass 2: emit nodes and per-segment edges, each stamped with
-        # its own locally-windowed sinuosity so a steep curvy 1 km of
-        # a longer way isn't averaged away.
+        # Pass 2: emit nodes and per-segment edges. Each edge carries
+        # its own (curv_fwd, curv_rev) so the cost recompute can
+        # attribute upcoming curvature to whichever segment is
+        # descending into it — not just to the curve itself.
         prev_id = None
         prev_lon = prev_lat = 0.0
         seg_idx = 0
@@ -297,15 +299,15 @@ class _PgIngestHandler(osmium.SimpleHandler):
                         cost, rev = fwd_cost, -1.0
                     else:                         # reverse only
                         cost, rev = -1.0, fwd_cost
-                    sinuosity = (seg_sinuosities[seg_idx]
-                                 if seg_idx < len(seg_sinuosities)
-                                 else _SINUOSITY_MIN)
+                    cf, cr = (seg_curvs[seg_idx]
+                              if seg_idx < len(seg_curvs)
+                              else (0.0, 0.0))
                     self._edge_buf.append((
                         int(w.id), prev_id, osm_id,
                         cost, rev, float(length_m), bool(is_ferry),
                         hw, surface, tracktype, oneway_raw,
                         bicycle, cycleway, bicycle_road, access,
-                        float(sinuosity),
+                        float(cf), float(cr),
                     ))
                 seg_idx += 1
             prev_id = osm_id
@@ -362,12 +364,12 @@ def _stream_pbf(conn: psycopg.Connection, pbf: Path) -> dict:
 _INSERT_COLUMNS = (
     "osm_way_id, source, target, cost, reverse_cost, length_m, is_ferry, "
     "highway, surface, tracktype, oneway, bicycle, cycleway, bicycle_road, "
-    "access, sinuosity"
+    "access, curv_fwd, curv_rev"
 )
 _SELECT_COLUMNS = (
     "e.osm_way_id, v_src.id, v_dst.id, e.cost, e.reverse_cost, e.length_m, "
     "e.is_ferry, e.highway, e.surface, e.tracktype, e.oneway, e.bicycle, "
-    "e.cycleway, e.bicycle_road, e.access, e.sinuosity"
+    "e.cycleway, e.bicycle_road, e.access, e.curv_fwd, e.curv_rev"
 )
 
 

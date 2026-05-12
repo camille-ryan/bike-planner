@@ -1,16 +1,18 @@
-"""Recompute edge cost using elevation + sinuosity.
+"""Recompute edge cost using elevation + directional curvature.
 
 Run after ingest_pbf + ingest_dem. Re-applies `bike_edge_cost` to
 every edge in `ways`, this time supplying `grade_pct` (derived from
 the vertex elevations now sitting in `ways_vertices_pgr`) and the
-per-way `sinuosity` that ingest already stamped onto the edge.
+per-edge directional curvature (`curv_fwd` / `curv_rev`) that
+ingest already stamped onto the edge.
 
 Direction handling:
   - Forward grade  = (elev_target - elev_source) / length_m × 100
   - Reverse grade  = -forward grade (same edge, opposite direction)
-  - Sinuosity is direction-independent.
+  - Forward cost   uses `curv_fwd` (bends ahead when traveling source→target)
+  - Reverse cost   uses `curv_rev` (bends ahead when traveling target→source)
   - If the edge is oneway (reverse_cost == -1 in V1/V2 convention),
-    reverse_cost stays -1. Otherwise it gets recomputed.
+    reverse_cost stays -1.
 
 When either endpoint elevation is NULL (DEM didn't cover it),
 grade_pct is treated as 0.0 — same as the V2 default no-op.
@@ -35,7 +37,7 @@ def _recompute_one(row: tuple) -> tuple[int, float, float]:
     """Return (gid, new_cost, new_reverse_cost) for a single edge row."""
     (gid, length_m, is_ferry, reverse_cost_in,
      highway, surface, tracktype, oneway, bicycle, cycleway,
-     bicycle_road, access, sinuosity,
+     bicycle_road, access, curv_fwd, curv_rev,
      elev_src, elev_dst) = row
 
     if elev_src is None or elev_dst is None or length_m <= 0:
@@ -47,7 +49,7 @@ def _recompute_one(row: tuple) -> tuple[int, float, float]:
         highway=highway, surface=surface, tracktype=tracktype,
         bicycle=bicycle, cycleway=cycleway, access=access,
         bicycle_road=bicycle_road, is_ferry=is_ferry,
-        grade_pct=grade_pct_fwd, sinuosity=float(sinuosity),
+        grade_pct=grade_pct_fwd, curv=float(curv_fwd),
     )
     if fwd_factor is None:
         # An edge that previously priced now refuses to. Should not
@@ -63,7 +65,7 @@ def _recompute_one(row: tuple) -> tuple[int, float, float]:
             highway=highway, surface=surface, tracktype=tracktype,
             bicycle=bicycle, cycleway=cycleway, access=access,
             bicycle_road=bicycle_road, is_ferry=is_ferry,
-            grade_pct=-grade_pct_fwd, sinuosity=float(sinuosity),
+            grade_pct=-grade_pct_fwd, curv=float(curv_rev),
         )
         new_reverse_cost = (float(rev_factor) * float(length_m)
                             if rev_factor is not None
@@ -98,7 +100,7 @@ def recompute(conn: psycopg.Connection) -> None:
                 w.gid, w.length_m, w.is_ferry, w.reverse_cost,
                 w.highway, w.surface, w.tracktype, w.oneway,
                 w.bicycle, w.cycleway, w.bicycle_road, w.access,
-                w.sinuosity,
+                w.curv_fwd, w.curv_rev,
                 vs.elev_m AS elev_src,
                 vt.elev_m AS elev_dst
             FROM ways w
