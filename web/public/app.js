@@ -741,7 +741,7 @@ function ensureHillshade() {
     },
   });
   // Keep route lines on top of the shading.
-  for (const id of ["graz-wien-v1", "graz-wien-v2"]) {
+  for (const id of ["graz-wien-no-canopy", "graz-wien-with-canopy"]) {
     if (map.getLayer(id)) map.moveLayer(id);
   }
   hillshadeLoaded = true;
@@ -759,19 +759,19 @@ document.getElementById("show-hillshade").addEventListener("change", (e) => {
 // --- Elevation profile chart ------------------------------------------
 // Lightweight SVG line chart drawn into the #elevation div under the
 // map. Used by the Graz→Wien comparison overlay to plot both variants'
-// elevation profiles side-by-side. Two lines: red = V1-style cost,
-// green = full V2.
+// elevation profiles side-by-side. Colors come from COMPARE_STYLES so
+// the chart and the map line colors stay in sync.
 
 function renderElevationProfile(features) {
   const root = document.getElementById("elevation");
   root.innerHTML = "";
-  // Filter to features with a profile array (currently just the compare overlay).
   const series = features
     .map(f => ({
       name: f.properties.name,
       variant: f.properties.variant,
       points: (f.properties.profile || []).filter(p => p[1] != null),
-      color: f.properties.variant === "v2" ? "#2ca02c" : "#d62728",
+      color: (COMPARE_STYLES[f.properties.variant]
+        || { color: "#888" }).color,
     }))
     .filter(s => s.points.length > 1);
   if (!series.length) return;
@@ -860,10 +860,18 @@ function renderElevationProfile(features) {
   root.appendChild(svg);
 }
 
-// --- Graz → Wien V1 vs V2 comparison overlay --------------------------
-// Static GeoJSON at /data/graz_wien_compare.geojson, ~742 KB. Two
-// MultiLineString features (V1 baseline + V2 elevation+curvature)
-// with route stats baked into properties.
+// --- Graz → Wien canopy-on/off comparison overlay ---------------------
+// Static GeoJSON at /data/graz_wien_compare.geojson. Two features
+// keyed by `variant`:
+//   - "no_canopy"   gray  baseline V2 (elev + curv on, no canopy term)
+//   - "with_canopy" green V2 + 0.9× multiplier where canopy_frac > 0
+// Built by pgrouting/export_route_compare.py; rerun before/after a
+// canopy recompute to refresh either variant in place.
+
+const COMPARE_STYLES = {
+  no_canopy:   { color: "#8a8d92", label: "no canopy term" },
+  with_canopy: { color: "#2ca02c", label: "with canopy bonus" },
+};
 
 let grazWienCompareLoaded = false;
 
@@ -871,56 +879,71 @@ async function ensureGrazWienCompareLayers() {
   if (grazWienCompareLoaded) return;
   setBusy("Loading Graz→Wien comparison…");
   try {
-    const r = await fetch("/data/graz_wien_compare.geojson");
+    const r = await fetch("/data/graz_wien_compare.geojson?ts=" + Date.now());
     if (!r.ok) throw new Error(`compare: ${r.status}`);
     const fc = await r.json();
     map.addSource("graz-wien-compare", { type: "geojson", data: fc });
-    // V1 underneath, V2 on top
+    // no_canopy underneath, with_canopy on top.
     map.addLayer({
-      id: "graz-wien-v1",
+      id: "graz-wien-no-canopy",
       type: "line",
       source: "graz-wien-compare",
-      filter: ["==", ["get", "variant"], "v1"],
+      filter: ["==", ["get", "variant"], "no_canopy"],
       paint: {
-        "line-color": "#d62728",
+        "line-color": COMPARE_STYLES.no_canopy.color,
         "line-width": 4,
         "line-opacity": 0.85,
       },
     });
     map.addLayer({
-      id: "graz-wien-v2",
+      id: "graz-wien-with-canopy",
       type: "line",
       source: "graz-wien-compare",
-      filter: ["==", ["get", "variant"], "v2"],
+      filter: ["==", ["get", "variant"], "with_canopy"],
       paint: {
-        "line-color": "#2ca02c",
+        "line-color": COMPARE_STYLES.with_canopy.color,
         "line-width": 4,
         "line-opacity": 0.85,
       },
     });
-    // Hover to show route stats
-    for (const id of ["graz-wien-v1", "graz-wien-v2"]) {
+    for (const id of ["graz-wien-no-canopy", "graz-wien-with-canopy"]) {
       map.on("click", id, (e) => {
         const p = e.features[0].properties;
         document.getElementById("results").innerHTML =
           `<div class="route-card"><strong>${p.name}</strong>` +
           `<div class="stat">Edges: ${p.edges}</div>` +
           `<div class="stat">Length: ${p.length_km} km</div>` +
-          `<div class="stat">Climb: ${p.climb_m} m</div></div>`;
+          `<div class="stat">Climb: ${p.climb_m} m</div>` +
+          `<div class="stat">Under canopy: ${p.canopy_km ?? 0} km</div></div>`;
       });
       map.on("mouseenter", id, () => map.getCanvas().style.cursor = "crosshair");
       map.on("mouseleave", id, () => map.getCanvas().style.cursor = "");
     }
     grazWienCompareLoaded = true;
-    // Frame the map to the comparison bbox so the user sees both routes.
     map.fitBounds([[15.0, 46.9], [16.8, 48.4]], { padding: 60, duration: 500 });
-    // Elevation profile chart below the map.
     renderElevationProfile(fc.features);
+
+    const byVariant = Object.fromEntries(
+      fc.features.map(f => [f.properties.variant, f.properties])
+    );
+    const lines = ["no_canopy", "with_canopy"]
+      .filter(v => byVariant[v])
+      .map(v => {
+        const p = byVariant[v];
+        return `<div class="stat" style="color:${COMPARE_STYLES[v].color}">` +
+          `▬ ${p.name}: ${p.edges} edges, ${p.length_km} km, ` +
+          `${p.climb_m} m climb, ${p.canopy_km ?? 0} km under canopy</div>`;
+      }).join("");
+    const missing = ["no_canopy", "with_canopy"].filter(v => !byVariant[v]);
+    const note = missing.length
+      ? `<div class="stat"><em>Missing variant(s): ${missing.join(", ")}. ` +
+        `Re-run export_route_compare.py to generate them.</em></div>`
+      : `<div class="stat"><em>V2 cost held constant (elev + curv always on); ` +
+        `the only difference is the per-edge canopy multiplier ` +
+        `(1 - 0.1 × canopy_frac).</em></div>`;
     document.getElementById("results").innerHTML =
-      `<div class="route-card"><strong>Graz→Wien comparison loaded</strong>` +
-      `<div class="stat" style="color:#d62728">▬ V2 cost, grade/curv=0: 7442 edges, 209.2 km, 3616 m climb</div>` +
-      `<div class="stat" style="color:#2ca02c">▬ V2 cost, full elev+curv: 6736 edges, 210.8 km, 2812 m climb</div>` +
-      `<div class="stat"><em>Adding DEM-driven grade + directional curvature drops total climb by 804 m for 1.6 km extra length. All other V2 cost terms (cycleway 0.9, track 1.1, path 2.0, surface multipliers, bicycle_road bonus) are present in both routes — only elevation and curvature differ.</em></div></div>`;
+      `<div class="route-card"><strong>Graz→Wien canopy comparison</strong>` +
+      lines + note + `</div>`;
   } catch (e) {
     setError(`compare load failed: ${e.message}`);
     throw e;
@@ -935,11 +958,11 @@ document.getElementById("show-graz-wien-compare").addEventListener("change", asy
       e.target.checked = false;
       return;
     }
-    map.setLayoutProperty("graz-wien-v1", "visibility", "visible");
-    map.setLayoutProperty("graz-wien-v2", "visibility", "visible");
+    map.setLayoutProperty("graz-wien-no-canopy", "visibility", "visible");
+    map.setLayoutProperty("graz-wien-with-canopy", "visibility", "visible");
   } else if (grazWienCompareLoaded) {
-    map.setLayoutProperty("graz-wien-v1", "visibility", "none");
-    map.setLayoutProperty("graz-wien-v2", "visibility", "none");
+    map.setLayoutProperty("graz-wien-no-canopy", "visibility", "none");
+    map.setLayoutProperty("graz-wien-with-canopy", "visibility", "none");
     document.getElementById("elevation").innerHTML = "";
   }
 });
