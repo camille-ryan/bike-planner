@@ -49,6 +49,16 @@ _BATCH_SIZE = 100_000
 _SINUOSITY_MIN = 1.0
 _SINUOSITY_MAX = 5.0
 
+# Window over which per-segment sinuosity is measured. A pure per-way
+# sinuosity would average a 1 km switchback section into a 10 km way's
+# overall ~1.0 sinuosity, washing out the signal exactly where the
+# cost function needs it. Computing sinuosity in a small polyline
+# window around each segment localizes the metric. 300 m is roughly
+# the scale of an alpine switchback group; smaller windows pick up
+# noise from minor wiggles, larger ones re-introduce the averaging
+# problem.
+_SINUOSITY_WINDOW_M = 300.0
+
 
 def _haversine(lon1, lat1, lon2, lat2):
     rl1, rl2 = radians(lat1), radians(lat2)
@@ -56,6 +66,77 @@ def _haversine(lon1, lat1, lon2, lat2):
     dn = radians(lon2 - lon1)
     a = sin(dl / 2) ** 2 + cos(rl1) * cos(rl2) * sin(dn / 2) ** 2
     return 2 * _EARTH_R * asin(sqrt(a))
+
+
+def _segment_sinuosities(nodes: list[tuple[int, float, float]],
+                         window_m: float = _SINUOSITY_WINDOW_M
+                         ) -> list[float]:
+    """Per-segment sinuosity over a polyline window centered on each segment.
+
+    For each of the N-1 segments in `nodes`, returns
+        actual_polyline_length / straight_line_distance
+    computed over a window of ~`window_m` polyline meters centered on
+    the segment's midpoint, clamped to [_SINUOSITY_MIN, _SINUOSITY_MAX].
+
+    O(N) per way (two-pointer window advancement).
+    """
+    n = len(nodes)
+    if n < 2:
+        return []
+
+    # Cumulative polyline length per node: cumlen[i] = polyline distance
+    # from nodes[0] to nodes[i]. cumlen[0] == 0; cumlen[n-1] == total.
+    cumlen = [0.0] * n
+    for i in range(n - 1):
+        _, ln1, lt1 = nodes[i]
+        _, ln2, lt2 = nodes[i + 1]
+        cumlen[i + 1] = cumlen[i] + _haversine(ln1, lt1, ln2, lt2)
+    total_length = cumlen[-1]
+
+    # Way is shorter than ~1.5×window — local-vs-global distinction
+    # doesn't apply; fall back to whole-way sinuosity for every segment.
+    if total_length <= window_m * 1.5:
+        end_dist = _haversine(nodes[0][1], nodes[0][2],
+                              nodes[-1][1], nodes[-1][2])
+        if end_dist <= 0.0:
+            sin_global = _SINUOSITY_MAX
+        else:
+            sin_global = max(_SINUOSITY_MIN,
+                             min(_SINUOSITY_MAX, total_length / end_dist))
+        return [sin_global] * (n - 1)
+
+    half = window_m / 2.0
+    a = 0           # window start node index
+    b = 0           # window end node index
+    out: list[float] = []
+    for i in range(n - 1):
+        mid = (cumlen[i] + cumlen[i + 1]) * 0.5
+        lo = mid - half
+        hi = mid + half
+        # Advance window-start until cumlen[a] <= lo and cumlen[a+1] > lo.
+        # i.e. a is the latest node at or before the window's lower edge.
+        while a + 1 < n and cumlen[a + 1] <= lo:
+            a += 1
+        # Advance window-end until cumlen[b] >= hi (or hit the end).
+        while b + 1 < n and cumlen[b] < hi:
+            b += 1
+
+        if b <= a:
+            # Degenerate window (shouldn't really happen given the
+            # short-way fallback above, but be defensive).
+            out.append(_SINUOSITY_MIN)
+            continue
+        win_length = cumlen[b] - cumlen[a]
+        win_endpoint = _haversine(
+            nodes[a][1], nodes[a][2],
+            nodes[b][1], nodes[b][2],
+        )
+        if win_endpoint <= 0.0:
+            out.append(_SINUOSITY_MAX)
+        else:
+            out.append(max(_SINUOSITY_MIN,
+                           min(_SINUOSITY_MAX, win_length / win_endpoint)))
+    return out
 
 
 def _create_staging(cur):
@@ -195,25 +276,15 @@ class _PgIngestHandler(osmium.SimpleHandler):
         if len(nodes) < 2:
             return
 
-        # Per-way sinuosity: total polyline length / endpoint distance.
-        total_length = 0.0
-        for i in range(len(nodes) - 1):
-            _, ln1, lt1 = nodes[i]
-            _, ln2, lt2 = nodes[i + 1]
-            total_length += _haversine(ln1, lt1, ln2, lt2)
-        end_dist = _haversine(nodes[0][1], nodes[0][2],
-                              nodes[-1][1], nodes[-1][2])
-        if end_dist <= 0.0:
-            # Closed loop or coincident endpoints — sinuosity is
-            # undefined; treat as curvy.
-            sinuosity = _SINUOSITY_MAX
-        else:
-            sinuosity = max(_SINUOSITY_MIN,
-                            min(_SINUOSITY_MAX, total_length / end_dist))
+        # Per-segment sinuosity (windowed; see _segment_sinuosities).
+        seg_sinuosities = _segment_sinuosities(nodes)
 
-        # Pass 2: emit nodes and per-segment edges.
+        # Pass 2: emit nodes and per-segment edges, each stamped with
+        # its own locally-windowed sinuosity so a steep curvy 1 km of
+        # a longer way isn't averaged away.
         prev_id = None
         prev_lon = prev_lat = 0.0
+        seg_idx = 0
         for osm_id, lon, lat in nodes:
             self._node_buf.append((osm_id, lon, lat))
             if prev_id is not None:
@@ -226,6 +297,9 @@ class _PgIngestHandler(osmium.SimpleHandler):
                         cost, rev = fwd_cost, -1.0
                     else:                         # reverse only
                         cost, rev = -1.0, fwd_cost
+                    sinuosity = (seg_sinuosities[seg_idx]
+                                 if seg_idx < len(seg_sinuosities)
+                                 else _SINUOSITY_MIN)
                     self._edge_buf.append((
                         int(w.id), prev_id, osm_id,
                         cost, rev, float(length_m), bool(is_ferry),
@@ -233,6 +307,7 @@ class _PgIngestHandler(osmium.SimpleHandler):
                         bicycle, cycleway, bicycle_road, access,
                         float(sinuosity),
                     ))
+                seg_idx += 1
             prev_id = osm_id
             prev_lon = lon
             prev_lat = lat
