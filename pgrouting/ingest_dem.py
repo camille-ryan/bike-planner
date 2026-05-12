@@ -109,11 +109,15 @@ def ingest(conn: psycopg.Connection, dem_dir: Path | None = None) -> None:
     total_skipped_no_data = 0
 
     with conn.cursor() as cur:
+        # NB: no ON COMMIT DROP — we commit per-tile (so a long run can
+        # resume by re-running with the remaining `elev_m IS NULL`
+        # vertices). Temp tables are session-scoped by default; the
+        # connection closing at end of `ingest()` cleans up.
         cur.execute("""
-            CREATE TEMP TABLE _vertex_elev (
+            CREATE TEMP TABLE IF NOT EXISTS _vertex_elev (
                 id     bigint PRIMARY KEY,
                 elev_m real NOT NULL
-            ) ON COMMIT DROP
+            )
         """)
         # Each tile is independent; commit per-tile so a long run can
         # be resumed by re-running ingest (incremental: WHERE elev_m IS NULL).
