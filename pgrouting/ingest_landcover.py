@@ -31,14 +31,32 @@ import config
 
 BATCH_SIZE = 1000
 
-# Tag combinations we accept as "tree cover." `landuse=forest` is the
-# canonical land-use designation; `natural=wood` is the natural-feature
-# variant — both correspond to "this polygon is wooded."
+# Tag combinations we accept. Three classes flow from the landuse PBFs:
+#
+#   forest  — `landuse=forest` (canonical) or `natural=wood` (natural-
+#             feature variant). Both = "this polygon is wooded."
+#   water   — `natural=water` lakes, ponds, wide-river polygons, plus
+#             `landuse=reservoir` (artificial water bodies). Big rivers
+#             like the Mur, Donau show up here when their banks are
+#             wide enough to be polygon-mapped. Narrow streams are
+#             waterway=* lines and come in via ingest_waterways.py.
+#   wetland — `natural=wetland` (any sub-type: marsh, reedbed, bog,
+#             saltmarsh, etc.). Visually distinct biome — open
+#             horizons, bird life. Rider passes alongside; usually
+#             un-rideable.
+#
+# Anything else returns None and is skipped.
 def _classify(tags: dict) -> str | None:
     if tags.get("landuse") == "forest":
         return "forest"
     if tags.get("natural") == "wood":
         return "forest"
+    if tags.get("natural") == "water":
+        return "water"
+    if tags.get("landuse") == "reservoir":
+        return "water"
+    if tags.get("natural") == "wetland":
+        return "wetland"
     return None
 
 
@@ -130,7 +148,7 @@ def _stage_pbf(conn: psycopg.Connection,
     if rows:
         inserted += _flush(conn, rows)
     print(f"[landcover]   {pbf.name}: scanned {seen_areas:,} areas, "
-          f"staged {inserted:,} forest polygons "
+          f"staged {inserted:,} polygons "
           f"(skipped {skipped_invalid:,} invalid, "
           f"{skipped_bbox:,} outside bbox)")
     return inserted
@@ -216,7 +234,18 @@ def ingest(conn: psycopg.Connection,
         print(f"[landcover] streaming {pbf.name} (country={country})"
               + (f" bbox={bbox}" if bbox else ""))
         total += _stage_pbf(conn, pbf, country, bbox=bbox)
-    print(f"[landcover] {total:,} forest polygons total")
+    print(f"[landcover] {total:,} polygons total")
+
+    # Per-class summary so the operator can sanity-check the
+    # forest/water/wetland breakdown for the ingested countries.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT class, COUNT(*) FROM landcover "
+            "WHERE country = ANY(%s) GROUP BY class ORDER BY class",
+            (countries,),
+        )
+        for cls, n in cur.fetchall():
+            print(f"[landcover]   class={cls}: {n:,}")
 
     print("[landcover] ANALYZE landcover")
     with conn.cursor() as cur:

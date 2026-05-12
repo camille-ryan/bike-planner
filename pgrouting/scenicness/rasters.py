@@ -226,6 +226,36 @@ def _colormap_green(values: np.ndarray) -> np.ndarray:
     return rgba
 
 
+def _colormap_blue(values: np.ndarray) -> np.ndarray:
+    """Blue gradient colormap for water-family signals (water, sea,
+    waterway). Same shape as _colormap_green but in the blue end of
+    the spectrum so water + forest overlays are visually
+    distinguishable when toggled together.
+    """
+    v = np.clip(values, 0.0, 1.0).astype(np.float32)
+    h, w = v.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[..., 0] = (10 + 20 * v).astype(np.uint8)      # R: stays low
+    rgba[..., 1] = (50 + 80 * v).astype(np.uint8)      # G: mid for cyan tint
+    rgba[..., 2] = (120 + 130 * v).astype(np.uint8)    # B: strong
+    rgba[..., 3] = (170 * v).astype(np.uint8)          # alpha
+    return rgba
+
+
+def _colormap_teal(values: np.ndarray) -> np.ndarray:
+    """Teal gradient for wetlands. Sits between green (forest) and
+    blue (water) — wetlands are conceptually that mix.
+    """
+    v = np.clip(values, 0.0, 1.0).astype(np.float32)
+    h, w = v.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[..., 0] = (10 + 20 * v).astype(np.uint8)
+    rgba[..., 1] = (100 + 120 * v).astype(np.uint8)    # G: stronger
+    rgba[..., 2] = (90 + 80 * v).astype(np.uint8)      # B: moderate
+    rgba[..., 3] = (170 * v).astype(np.uint8)
+    return rgba
+
+
 def _colormap_intensity(values: np.ndarray,
                         vmax: float
                         ) -> np.ndarray:
@@ -298,6 +328,17 @@ COLORMAPS: dict[str, dict] = {
     "regional_relief":  {"kind": "intensity", "vmax": 250.0},  # broader saturation
     "distance_to_drama": {"kind": "inverse_intensity", "vmax": 15000.0},  # 15 km fade
     "canopy_frac":    {"kind": "green"},
+    # Water family: blue gradient. Sea slightly more saturated than
+    # water_local downstream by virtue of larger contiguous polygons
+    # (don't need a separate colormap).
+    "water_local":          {"kind": "blue"},
+    "water_wide":           {"kind": "blue"},
+    "sea_local":            {"kind": "blue"},
+    "sea_wide":             {"kind": "blue"},
+    "waterway_along_edge":  {"kind": "blue"},
+    "waterway_local":       {"kind": "blue"},
+    # Wetlands sit between forest and water visually + conceptually.
+    "wetland_local":        {"kind": "teal"},
 }
 
 
@@ -311,6 +352,10 @@ def write_signal_png(raster: np.ndarray,
     cm = COLORMAPS.get(column, {"kind": "green"})
     if cm["kind"] == "green":
         rgba = _colormap_green(raster)
+    elif cm["kind"] == "blue":
+        rgba = _colormap_blue(raster)
+    elif cm["kind"] == "teal":
+        rgba = _colormap_teal(raster)
     elif cm["kind"] == "diverging":
         rgba = _colormap_diverging(raster, vmax=cm["vmax"])
     elif cm["kind"] == "intensity":

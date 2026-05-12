@@ -155,6 +155,88 @@ SIGNALS: dict[str, Signal] = {
         sample_mode="at_midpoint",
         description="DEM elevation minus 2 km Gaussian blur — meters above local mean.",
     ),
+    # --- Water / wetland family (V2 Phase A.3 second batch) ----------
+    # Three landcover classes feeding these signals: 'water' (lakes,
+    # ponds, wide-river polygons), 'sea' (pre-built coastline polygons),
+    # 'waterway' (buffered river/canal/stream centerlines), 'wetland'
+    # (`natural=wetland` polygons). Sea is split from water because
+    # ocean/sea vistas materially exceed lake vistas; waterway is split
+    # because riding *along* a flowing river ("Mur cycle path") is a
+    # distinct experience from "lake nearby".
+    "water_local": Signal(
+        name="water_local",
+        column="water_local",
+        source=Source(kind="polygons", landcover_class="water"),
+        kernel=Kernel(kind="uniform_blur", param_m=200.0),
+        sample_mode="at_midpoint",
+        description="Fraction of a 200 m disc around the edge that's "
+                    "lake / pond / wide-river polygon.",
+    ),
+    "water_wide": Signal(
+        name="water_wide",
+        column="water_wide",
+        source=Source(kind="polygons", landcover_class="water"),
+        kernel=Kernel(kind="uniform_blur", param_m=2000.0),
+        sample_mode="at_midpoint",
+        description="Fraction of a 2 km disc around the edge that's "
+                    "lake / pond / wide-river. Water-rich landscape.",
+    ),
+    "sea_local": Signal(
+        name="sea_local",
+        column="sea_local",
+        source=Source(kind="polygons", landcover_class="sea"),
+        kernel=Kernel(kind="uniform_blur", param_m=200.0),
+        sample_mode="at_midpoint",
+        description="Fraction of a 200 m disc around the edge that's "
+                    "ocean / sea (pre-built coastline polygons).",
+    ),
+    "sea_wide": Signal(
+        name="sea_wide",
+        column="sea_wide",
+        source=Source(kind="polygons", landcover_class="sea"),
+        kernel=Kernel(kind="uniform_blur", param_m=2000.0),
+        sample_mode="at_midpoint",
+        description="Fraction of a 2 km disc around the edge that's "
+                    "ocean / sea — coastal proximity.",
+    ),
+    # Sample the *raw* (un-blurred) buffered-waterway mask along the
+    # edge centerline. Returns the fraction of N points along this
+    # edge that fall inside a buffered river/canal/stream polygon —
+    # i.e. how much of the edge literally runs along a waterway. This
+    # is the "Mur cycle path" signal: it lights up when the rider is
+    # *on* the river path, not just near it.
+    "waterway_along_edge": Signal(
+        name="waterway_along_edge",
+        column="waterway_along_edge",
+        source=Source(kind="polygons", landcover_class="waterway"),
+        kernel=None,  # use the raw binary mask
+        sample_mode="along_edge",
+        description="Fraction of the edge centerline that runs inside "
+                    "a 10 m-buffered river/canal/stream polygon.",
+    ),
+    # Forgiving "stream visible from this road" — 200 m blur of the
+    # waterway mask, sampled at midpoint. Lights up for roads that
+    # run *near* (but not on) a stream too. Pair with along_edge in
+    # cost to distinguish "alongside the river" (along_edge ~ 1) from
+    # "across the valley from a creek" (local high, along_edge low).
+    "waterway_local": Signal(
+        name="waterway_local",
+        column="waterway_local",
+        source=Source(kind="polygons", landcover_class="waterway"),
+        kernel=Kernel(kind="uniform_blur", param_m=200.0),
+        sample_mode="at_midpoint",
+        description="Fraction of a 200 m disc that contains buffered "
+                    "river/canal/stream polygons — waterway proximity.",
+    ),
+    "wetland_local": Signal(
+        name="wetland_local",
+        column="wetland_local",
+        source=Source(kind="polygons", landcover_class="wetland"),
+        kernel=Kernel(kind="uniform_blur", param_m=200.0),
+        sample_mode="at_midpoint",
+        description="Fraction of a 200 m disc that's wetland (marsh, "
+                    "reedbed, bog, saltmarsh, etc.).",
+    ),
 }
 
 

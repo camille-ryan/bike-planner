@@ -62,7 +62,15 @@ const state = {
 // --- map sources / layers (initialized once map loads) -----------------
 
 map.on("load", () => {
-  map.addSource("route-active", { type: "geojson", data: emptyFC() });
+  // tolerance: 0 disables MapLibre's Douglas-Peucker simplification of
+  // the route geometry at low zoom — the default 0.375 px tolerance
+  // drops vertices aggressively at zoom <10, which makes a long
+  // multi-leg route look like a series of disjoint segments. The route
+  // is at most ~10k points; the memory cost of keeping every vertex at
+  // every zoom is negligible.
+  map.addSource("route-active", {
+    type: "geojson", data: emptyFC(), tolerance: 0,
+  });
   map.addLayer({
     id: "route-active-line",
     type: "line",
@@ -669,7 +677,7 @@ async function ensureLandcoverLayers() {
     const r = await fetch("/data/landcover_corridor.geojson");
     if (!r.ok) throw new Error(`landcover: ${r.status}`);
     const fc = await r.json();
-    map.addSource("landcover", { type: "geojson", data: fc });
+    map.addSource("landcover", { type: "geojson", data: fc, tolerance: 0 });
     map.addLayer({
       id: "landcover-fill",
       type: "fill",
@@ -684,7 +692,33 @@ async function ensureLandcoverLayers() {
           "wetland",      LANDCOVER_COLORS.wetland,
           "#666",
         ],
-        "fill-opacity": 0.45,
+        "fill-opacity": 0.30,
+      },
+    }, "cell-gradient-lines");
+    // Outline layer on top of fill for ground-truth polygon alignment
+    // checks (so the scenicness raster overlays can be compared against
+    // crisp OSM polygon borders, not just a fuzzy fill).
+    map.addLayer({
+      id: "landcover-outline",
+      type: "line",
+      source: "landcover",
+      paint: {
+        "line-color": [
+          "match", ["get", "class"],
+          "forest",       LANDCOVER_COLORS.forest,
+          "agricultural", LANDCOVER_COLORS.agricultural,
+          "urban",        LANDCOVER_COLORS.urban,
+          "water",        LANDCOVER_COLORS.water,
+          "wetland",      LANDCOVER_COLORS.wetland,
+          "#999",
+        ],
+        "line-width": [
+          "interpolate", ["linear"], ["zoom"],
+          8,  0.5,
+          12, 1.0,
+          16, 2.0,
+        ],
+        "line-opacity": 0.95,
       },
     }, "cell-gradient-lines");
     landcoverLoaded = true;
@@ -703,9 +737,11 @@ document.getElementById("show-landcover").addEventListener("change", async (e) =
       e.target.checked = false;
       return;
     }
-    map.setLayoutProperty("landcover-fill", "visibility", "visible");
+    map.setLayoutProperty("landcover-fill",    "visibility", "visible");
+    map.setLayoutProperty("landcover-outline", "visibility", "visible");
   } else if (landcoverLoaded) {
-    map.setLayoutProperty("landcover-fill", "visibility", "none");
+    map.setLayoutProperty("landcover-fill",    "visibility", "none");
+    map.setLayoutProperty("landcover-outline", "visibility", "none");
   }
 });
 

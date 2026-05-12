@@ -53,6 +53,8 @@ import ingest_pbf
 import ingest_boundaries
 import ingest_dem
 import ingest_landcover
+import ingest_coastline
+import ingest_waterways
 import compute_canopy_frac
 import compute_canopy_frac_raster
 from scenicness import bake as scenicness_bake
@@ -120,6 +122,36 @@ def cmd_landcover_ingest(args) -> None:
     with psycopg.connect(config.PG_DSN) as conn:
         ingest_landcover.ingest(conn, pbfs, countries, bbox=bbox)
     print("[main] landcover-ingest done")
+
+
+def cmd_coastline_ingest(args) -> None:
+    """One-shot global ingest of pre-built sea polygons into landcover.
+
+    Downloads simplified-water-polygons-split-3857.zip from
+    osmdata.openstreetmap.de on first run (~23 MB) and inserts every
+    polygon with class='sea', country='_coastline'. Re-runs are
+    idempotent: the `_coastline` rows are cleared and reloaded.
+    """
+    print("[main] coastline-ingest")
+    with psycopg.connect(config.PG_DSN) as conn:
+        ingest_coastline.ingest(conn)
+    print("[main] coastline-ingest done")
+
+
+def cmd_waterway_ingest(args) -> None:
+    """Stream full country PBFs for waterway lines, buffer to ~10m
+    polygons, insert as class='waterway'. Requires the landcover table
+    to already exist (run landcover-ingest first).
+    """
+    countries = [c.strip() for c in args.countries.split(",") if c.strip()]
+    # Full country PBFs (not the landuse extract — too aggressive a filter
+    # upstream drops most waterway lines).
+    pbfs = [config.OSM_DIR / f"{c}-latest.osm.pbf" for c in countries]
+    bbox = _parse_bbox(args.bbox)
+    print(f"[main] waterway-ingest countries={countries} bbox={bbox}")
+    with psycopg.connect(config.PG_DSN) as conn:
+        ingest_waterways.ingest(conn, pbfs, countries, bbox=bbox)
+    print("[main] waterway-ingest done")
 
 
 def cmd_canopy_compute(args) -> None:
@@ -300,6 +332,8 @@ def main() -> None:
         ("dem-download", cmd_dem_download),
         ("dem-ingest", cmd_dem_ingest),
         ("landcover-ingest", cmd_landcover_ingest),
+        ("coastline-ingest", cmd_coastline_ingest),
+        ("waterway-ingest", cmd_waterway_ingest),
         ("canopy-compute", cmd_canopy_compute),
         ("canopy-compute-raster", cmd_canopy_compute_raster),
         ("scenicness-bake", cmd_scenicness_bake),
