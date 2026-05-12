@@ -82,6 +82,90 @@
         "kind": "diverging",
         "vmax": 200.0
       }
+    },
+    "water_local": {
+      "name": "water_local",
+      "description": "Fraction of a 200 m disc around the edge that's lake / pond / wide-river polygon.",
+      "png": "water_local.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "blue"
+      }
+    },
+    "water_wide": {
+      "name": "water_wide",
+      "description": "Fraction of a 2 km disc around the edge that's lake / pond / wide-river. Water-rich landscape.",
+      "png": "water_wide.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "blue"
+      }
+    },
+    "sea_local": {
+      "name": "sea_local",
+      "description": "Fraction of a 200 m disc around the edge that's ocean / sea (pre-built coastline polygons).",
+      "png": "sea_local.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "blue"
+      }
+    },
+    "sea_wide": {
+      "name": "sea_wide",
+      "description": "Fraction of a 2 km disc around the edge that's ocean / sea \u2014 coastal proximity.",
+      "png": "sea_wide.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "blue"
+      }
+    },
+    "waterway_along_edge": {
+      "name": "waterway_along_edge",
+      "description": "Fraction of the edge centerline that runs inside a 10 m-buffered river/canal/stream polygon.",
+      "png": "waterway_along_edge.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "blue"
+      }
+    },
+    "waterway_local": {
+      "name": "waterway_local",
+      "description": "Fraction of a 200 m disc that contains buffered river/canal/stream polygons \u2014 waterway proximity.",
+      "png": "waterway_local.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "blue"
+      }
+    },
+    "wetland_local": {
+      "name": "wetland_local",
+      "description": "Fraction of a 200 m disc that's wetland (marsh, reedbed, bog, saltmarsh, etc.).",
+      "png": "wetland_local.png",
+      "shape": [
+        9436,
+        9348
+      ],
+      "colormap": {
+        "kind": "teal"
+      }
     }
   }
 }

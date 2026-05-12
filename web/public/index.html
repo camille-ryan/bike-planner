@@ -74,13 +74,19 @@
         <label class="checkbox"><input type="checkbox" id="show-landcover" />Land cover (forest / agricultural / urban / water / wetland)</label>
         <label class="checkbox"><input type="checkbox" id="show-hillshade" />Terrain hillshade (AWS Open Data, terrarium-encoded)</label>
         <label class="checkbox"><input type="checkbox" id="show-graz-wien-compare" />Graz→Wien: with vs. without canopy bonus</label>
+        <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name. Land cover: OSM landuse polygons rolled up to 5 classes — captures actual transitions between forest, cropland and urban for the corridor (AT, CZ, DE, DK only). Graz→Wien compare: same V2 cost (elevation + curvature always on). Gray = no canopy term. Green = + 0.9× multiplier where the edge centerline runs under a forest polygon.</p>
       </section>
 
       <section id="scenicness-section">
         <h2>Scenicness signals</h2>
-        <p class="hint">Rasters produced by <code>scenicness-bake</code>. Each layer is a single PNG image overlay covering the bbox (currently the Graz↔Wien corridor). Toggle on demand — PNGs are tens of MB.</p>
+        <p class="hint">Per-edge rasters produced by <code>scenicness-bake</code>. Each layer is a single PNG image overlay covering the bbox (currently the Graz↔Wien corridor). Toggle on demand — PNGs are tens of MB. Families:</p>
+        <ul class="hint">
+          <li><strong>Forest</strong> (green): <code>forest_local</code> 200 m disc, <code>forest_wide</code> 2 km disc.</li>
+          <li><strong>Terrain</strong>: <code>local_relief</code> 500 m σ, <code>regional_relief</code> 10 km σ, <code>distance_to_drama</code> meters to nearest cell with local_relief ≥ 80 m, <code>view_dominance</code> = DEM − 2 km Gaussian (ridge prominence; ±).</li>
+          <li><strong>Water</strong> (blue): <code>water_local</code> / <code>water_wide</code> = lakes &amp; wide-river polygons. <code>sea_local</code> / <code>sea_wide</code> = ocean/sea (separated so the cost function can weight ocean vistas above lake vistas). <code>waterway_local</code> = 200 m disc of buffered river/canal/stream lines. <code>waterway_along_edge</code> = fraction of <em>this edge</em> that literally runs inside a 10 m-buffered waterway polygon — the "Mur cycle path" detector.</li>
+          <li><strong>Wetland</strong> (teal): <code>wetland_local</code> = 200 m disc of <code>natural=wetland</code> polygons (marsh, reedbed, bog, saltmarsh, …).</li>
+        </ul>
         <div id="scenicness-toggles"><em class="hint">Loading manifest…</em></div>
-        <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name. Land cover: OSM landuse polygons rolled up to 5 classes — captures actual transitions between forest, cropland and urban for the corridor (AT, CZ, DE, DK only). Graz→Wien compare: same V2 cost (elevation + curvature always on). Gray = no canopy term. Green = + 0.9× multiplier where the edge centerline runs under a forest polygon.</p>
       </section>
 
       <section id="results"></section>

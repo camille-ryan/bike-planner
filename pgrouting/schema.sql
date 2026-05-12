@@ -119,6 +119,22 @@ ALTER TABLE ways ADD COLUMN IF NOT EXISTS view_dominance real NOT NULL DEFAULT 0
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS local_relief   real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS regional_relief   real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS distance_to_drama real NOT NULL DEFAULT 0.0;
+-- V2 scenicness water/wetland signals. Fed by 4 landcover classes:
+--   water     lakes + wide-river polygons from `natural=water`
+--   sea       pre-built coastline polygons (osmdata.openstreetmap.de)
+--   waterway  buffered `waterway in (river,canal,stream)` lines
+--   wetland   `natural=wetland` polygons
+-- Sea is split from water because oceans/seas afford materially better
+-- vistas than lakes. Waterway is split from water because riding along
+-- the bank of a flowing river ("Mur cycle path") is a distinct
+-- experience worth weighting separately from "there's a lake nearby".
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS water_local         real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS water_wide          real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS sea_local           real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS sea_wide            real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS waterway_along_edge real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS waterway_local      real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS wetland_local       real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways DROP COLUMN IF EXISTS sinuosity;
 CREATE INDEX IF NOT EXISTS ways_source_idx ON ways(source);
 CREATE INDEX IF NOT EXISTS ways_target_idx ON ways(target);

@@ -6,3 +6,9 @@ shapely==2.0.6
 # V2 Phase A.2 — DEM ingest + vertex elevation sampling
 rasterio==1.4.2
 requests==2.32.3
+# V2 Phase A.3 — water/wetland ingest. pyshp reads the pre-built
+# coastline shapefile from osmdata.openstreetmap.de (no PBF source
+# available for the closed sea polygons). Geometry reprojection from
+# EPSG:3857 to 4326 is delegated to PostGIS at insert time so pyproj
+# is not required.
+pyshp==2.3.1

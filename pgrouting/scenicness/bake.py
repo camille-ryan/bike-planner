@@ -159,7 +159,33 @@ def bake(conn: psycopg.Connection,
     # manifest for the web app.
     if export_rasters_dir is not None:
         export_rasters_dir.mkdir(parents=True, exist_ok=True)
-        manifest = {"bbox": list(bbox), "res_m": res_m, "signals": {}}
+        manifest_path = export_rasters_dir / "manifest.json"
+        # Merge with any prior manifest in the same directory so a multi-
+        # pass bake (split for memory safety) accumulates signals rather
+        # than overwriting them. Bbox/res_m must match across passes —
+        # if they differ we drop the prior entries with a warning rather
+        # than emitting an inconsistent manifest.
+        manifest: dict
+        if manifest_path.exists():
+            try:
+                prior = json.loads(manifest_path.read_text())
+                if (prior.get("bbox") == list(bbox)
+                        and prior.get("res_m") == res_m):
+                    manifest = prior
+                    manifest.setdefault("signals", {})
+                    print(f"[scenicness] merging into existing manifest "
+                          f"({len(manifest['signals'])} prior signals)",
+                          flush=True)
+                else:
+                    print(f"[scenicness] WARNING: prior manifest bbox/res "
+                          f"mismatch — replacing", flush=True)
+                    manifest = {"bbox": list(bbox), "res_m": res_m, "signals": {}}
+            except (OSError, ValueError) as e:
+                print(f"[scenicness] could not read prior manifest "
+                      f"({e}); starting fresh", flush=True)
+                manifest = {"bbox": list(bbox), "res_m": res_m, "signals": {}}
+        else:
+            manifest = {"bbox": list(bbox), "res_m": res_m, "signals": {}}
         for sig in sigs:
             raster, _transform = _ensure_final(sig)
             png_path = export_rasters_dir / f"{sig.column}.png"
@@ -173,9 +199,9 @@ def bake(conn: psycopg.Connection,
             }
             print(f"[scenicness] wrote PNG {png_path} "
                   f"({raster.shape[1]}x{raster.shape[0]})", flush=True)
-        manifest_path = export_rasters_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2))
-        print(f"[scenicness] wrote manifest {manifest_path}", flush=True)
+        print(f"[scenicness] wrote manifest {manifest_path} "
+              f"({len(manifest['signals'])} signals total)", flush=True)
 
     # ----------------------------------------------------------------
     # 3) Stream edges + 4) sample + 5) COPY into temp table.
