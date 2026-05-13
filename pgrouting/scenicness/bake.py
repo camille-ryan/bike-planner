@@ -189,7 +189,10 @@ def bake(conn: psycopg.Connection,
         for sig in sigs:
             raster, _transform = _ensure_final(sig)
             png_path = export_rasters_dir / f"{sig.column}.png"
-            rasters.write_signal_png(raster, png_path, sig.column)
+            # Pass bbox so write_signal_png warps the rows from linear-in-
+            # lat to linear-in-mercator — required for MapLibre's image
+            # source to display each pixel at its intended latitude.
+            rasters.write_signal_png(raster, png_path, sig.column, bbox=bbox)
             manifest["signals"][sig.column] = {
                 "name": sig.name,
                 "description": sig.description,
