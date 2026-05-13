@@ -342,13 +342,63 @@ COLORMAPS: dict[str, dict] = {
 }
 
 
+def warp_lat_to_mercator_rows(rgba: np.ndarray,
+                              bbox: tuple[float, float, float, float],
+                              ) -> np.ndarray:
+    """Resample a raster's rows from linear-in-latitude spacing to
+    linear-in-mercator-Y spacing.
+
+    Necessary because MapLibre's image source renders the image quad
+    by bilinear interpolation in mercator (display) space, while our
+    rasterio.transform.from_bounds raster is generated with uniform
+    latitude per row. At Austrian latitudes that mismatch puts each
+    row's data ~1 km too far north when displayed; the fix is to
+    pre-warp the PNG so MapLibre's mercator interpolation sees the
+    intended geographic alignment.
+
+    Columns are NOT warped: longitude is linear in mercator-X (and at
+    our small bbox sizes the cos-correction is well under a pixel),
+    so column-wise alignment was never the problem.
+
+    Nearest-neighbor row resampling. Linear interpolation would be
+    smoother but the worst case is sub-pixel at our 20 m resolution.
+    """
+    h, w = rgba.shape[:2]
+    min_lat, max_lat = bbox[1], bbox[3]
+    # Mercator Y in dimensionless units (R_earth scaling cancels in the
+    # ratio below).
+    def lat_to_y(lat_deg):
+        return np.log(np.tan(np.pi / 4 + np.radians(lat_deg) / 2))
+    def y_to_lat(y):
+        return np.degrees(2 * (np.arctan(np.exp(y)) - np.pi / 4))
+    y_top = lat_to_y(max_lat)
+    y_bot = lat_to_y(min_lat)
+    # For each OUTPUT row R_out, MapLibre will display its content at
+    # the lat that mercator-Y-interpolates to (linear in mercator).
+    # We want that displayed lat to equal the lat our SOURCE row R_src
+    # was generated for (linear in lat). Solve for R_src(R_out):
+    R_out = np.arange(h)
+    y_at_out = y_top - (R_out / h) * (y_top - y_bot)
+    lat_at_out = y_to_lat(y_at_out)
+    R_src = (max_lat - lat_at_out) / (max_lat - min_lat) * h
+    R_src_int = np.clip(R_src.astype(np.int64), 0, h - 1)
+    return rgba[R_src_int]
+
+
 def write_signal_png(raster: np.ndarray,
                      out_path: Path,
-                     column: str
+                     column: str,
+                     bbox: tuple[float, float, float, float] | None = None,
                      ) -> None:
     """Render a signal raster to a web-ready PNG with the column's
     colormap. Geographic registration is carried in the bake manifest
-    alongside the PNG, not embedded in the file."""
+    alongside the PNG, not embedded in the file.
+
+    If `bbox` is supplied the output rows are warped to linear-in-
+    mercator-Y spacing so MapLibre's image-source renderer (which
+    interpolates the quad linearly in mercator) places each row at
+    its intended geographic latitude. Omit `bbox` only for synthetic
+    test rasters or non-geographic use."""
     cm = COLORMAPS.get(column, {"kind": "green"})
     if cm["kind"] == "green":
         rgba = _colormap_green(raster)
@@ -364,6 +414,8 @@ def write_signal_png(raster: np.ndarray,
         rgba = _colormap_inverse_intensity(raster, vmax=cm["vmax"])
     else:
         raise ValueError(f"unknown colormap kind: {cm['kind']}")
+    if bbox is not None:
+        rgba = warp_lat_to_mercator_rows(rgba, bbox)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Write via rasterio with the PNG driver. RGBA → 4 bands.
     h, w = rgba.shape[:2]
