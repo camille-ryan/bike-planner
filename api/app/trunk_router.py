@@ -264,11 +264,40 @@ def _walk(
 # Public entrypoint
 # ---------------------------------------------------------------------
 
+def _decimate_polyline(
+    coords: list[list[float]], min_step_m: float,
+) -> list[list[float]]:
+    """Keep coords[0]; drop subsequent coords closer than `min_step_m`
+    (haversine) to the last kept point. Always keep coords[-1] so the
+    line still reaches the destination.
+
+    For a 1,300 km route with ~one point per 35 m (35 K coords),
+    `min_step_m=100` drops it to ~13 K — visually identical at any
+    realistic zoom, ~3× smaller payload, ~3× faster client parse.
+    """
+    if len(coords) <= 2 or min_step_m <= 0:
+        return coords
+    out = [coords[0]]
+    last_lon, last_lat = coords[0]
+    for i in range(1, len(coords) - 1):
+        lon, lat = coords[i]
+        if _haversine_m(last_lon, last_lat, lon, lat) >= min_step_m:
+            out.append(coords[i])
+            last_lon, last_lat = lon, lat
+    out.append(coords[-1])
+    return out
+
+
 def route(
     start: tuple[float, float], end: tuple[float, float], profile: str,
+    simplify_m: float = 100.0,
 ) -> dict:
     """Plan a Graz→Cph-style route and return a GeoJSON Feature with
     a LineString geometry + diagnostic properties.
+
+    `simplify_m`: drop polyline points closer together than this many
+    meters before returning (default 100 m — visually equivalent to
+    full-fidelity, ~3× smaller payload). Pass 0 to disable.
     """
     prof = _load_profile(profile)
 
@@ -327,12 +356,17 @@ def route(
         cur_lon = float(arr["lon"][idxs[-1]])
     t_walk = time.time() - t2
 
-    # Cheap gross-length stat for the response.
+    # Cheap gross-length stat for the response (over the full polyline,
+    # before simplification — that's the geometrically correct length).
     gross_m = 0.0
     for k in range(1, len(coords)):
         gross_m += _haversine_m(
             coords[k-1][0], coords[k-1][1], coords[k][0], coords[k][1],
         )
+
+    full_vertex_count = len(coords)
+    if simplify_m > 0:
+        coords = _decimate_polyline(coords, simplify_m)
 
     # Human-readable chain names for UI display.
     name_by_idx = {int(c["city_idx"]): c["name"] for c in prof.cities}
@@ -350,6 +384,8 @@ def route(
             "chain_names":        chain_names,
             "leg_count":          len(chain) - 1,
             "vertex_count":       len(coords),
+            "vertex_count_full":  full_vertex_count,
+            "simplify_m":         simplify_m,
             "gross_length_m":     round(gross_m, 1),
             "bridges":            bridges,
             "start_city_idx":     start_city,

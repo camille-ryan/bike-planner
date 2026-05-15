@@ -904,103 +904,183 @@ function renderElevationProfile(features) {
 // Built by pgrouting/export_route_compare.py; rerun before/after a
 // canopy recompute to refresh either variant in place.
 
+// Per-variant rendering: color, label, draw-order. Higher z = drawn on
+// top. The 5 expected variants come from two generations of compare
+// exports — the legacy canopy A/B (no_canopy / with_canopy) plus the
+// V2 Phase A.3b profile sweep (lht / balanced / scenic).
 const COMPARE_STYLES = {
-  no_canopy:   { color: "#8a8d92", label: "no canopy term" },
-  with_canopy: { color: "#2ca02c", label: "with canopy bonus" },
+  // Production
+  direct:   { color: "#888888", label: "direct (no scenic preference)",  z: 1 },
+  balanced: { color: "#3a8dde", label: "balanced (~20% detour budget)",  z: 2 },
+  scenic:   { color: "#d8423a", label: "scenic (~50% detour budget)",    z: 3 },
+  // Experiment 1 — grade variants
+  direct_thresh5: { color: "#f5b524", label: "direct, no uphill ≤5%",       z: 4 },
+  direct_minus3:  { color: "#e07a3a", label: "direct, uphill shift 3%",     z: 5 },
+  // Experiment 2 — scenic weight multipliers
+  direct_scenic_2x:  { color: "#b16dde", label: "direct + scenic × 2",  z: 6 },
+  direct_scenic_5x:  { color: "#7a3acb", label: "direct + scenic × 5",  z: 7 },
+  direct_scenic_10x: { color: "#4b18a3", label: "direct + scenic × 10", z: 8 },
+  // Experiment 3 — interaction-softening
+  direct_interactive:    { color: "#2c8c4e", label: "direct + interaction-softening",            z: 9 },
+  direct_interactive_vp: { color: "#0e5a2e", label: "direct + interaction-softening + viewpoints", z: 10 },
+  // Experiment 4 — per-signal multiplicative
+  direct_multi:          { color: "#c97a00", label: "direct + per-signal multiplicative scenic",    z: 11 },
+  // Experiment 5 — uphill_offset=3 + multi
+  direct_minus3_multi:   { color: "#a13c00", label: "direct + uphill_offset=3 + multi scenic",      z: 12 },
+  // V2 Phase A.3e — multi-axis profiles
+  vineyard_lover: { color: "#7a3380", label: "vineyard lover",  z: 20 },   // wine purple
+  forest_lover:   { color: "#1f7a3a", label: "forest lover",    z: 21 },   // deep green
+  views:          { color: "#d4623a", label: "viewpoints",      z: 22 },   // amber
+  water:          { color: "#2a6dc4", label: "water lover",     z: 23 },   // strong blue
 };
 
-let grazWienCompareLoaded = false;
+// Track which compare-overlay files are loaded so toggling on/off
+// doesn't re-fetch. Keyed by the toggle's id.
+const _compareLoaded = {};
 
-async function ensureGrazWienCompareLayers() {
-  if (grazWienCompareLoaded) return;
-  setBusy("Loading Graz→Wien comparison…");
-  try {
-    const r = await fetch("/data/graz_wien_compare.geojson?ts=" + Date.now());
-    if (!r.ok) throw new Error(`compare: ${r.status}`);
-    const fc = await r.json();
-    map.addSource("graz-wien-compare", { type: "geojson", data: fc });
-    // no_canopy underneath, with_canopy on top.
-    map.addLayer({
-      id: "graz-wien-no-canopy",
-      type: "line",
-      source: "graz-wien-compare",
-      filter: ["==", ["get", "variant"], "no_canopy"],
-      paint: {
-        "line-color": COMPARE_STYLES.no_canopy.color,
-        "line-width": 4,
-        "line-opacity": 0.85,
-      },
-    });
-    map.addLayer({
-      id: "graz-wien-with-canopy",
-      type: "line",
-      source: "graz-wien-compare",
-      filter: ["==", ["get", "variant"], "with_canopy"],
-      paint: {
-        "line-color": COMPARE_STYLES.with_canopy.color,
-        "line-width": 4,
-        "line-opacity": 0.85,
-      },
-    });
-    for (const id of ["graz-wien-no-canopy", "graz-wien-with-canopy"]) {
-      map.on("click", id, (e) => {
-        const p = e.features[0].properties;
-        document.getElementById("results").innerHTML =
-          `<div class="route-card"><strong>${p.name}</strong>` +
-          `<div class="stat">Edges: ${p.edges}</div>` +
-          `<div class="stat">Length: ${p.length_km} km</div>` +
-          `<div class="stat">Climb: ${p.climb_m} m</div>` +
-          `<div class="stat">Under canopy: ${p.canopy_km ?? 0} km</div></div>`;
-      });
-      map.on("mouseenter", id, () => map.getCanvas().style.cursor = "crosshair");
-      map.on("mouseleave", id, () => map.getCanvas().style.cursor = "");
-    }
-    grazWienCompareLoaded = true;
-    map.fitBounds([[15.0, 46.9], [16.8, 48.4]], { padding: 60, duration: 500 });
-    renderElevationProfile(fc.features);
-
-    const byVariant = Object.fromEntries(
-      fc.features.map(f => [f.properties.variant, f.properties])
-    );
-    const lines = ["no_canopy", "with_canopy"]
-      .filter(v => byVariant[v])
-      .map(v => {
-        const p = byVariant[v];
-        return `<div class="stat" style="color:${COMPARE_STYLES[v].color}">` +
-          `▬ ${p.name}: ${p.edges} edges, ${p.length_km} km, ` +
-          `${p.climb_m} m climb, ${p.canopy_km ?? 0} km under canopy</div>`;
-      }).join("");
-    const missing = ["no_canopy", "with_canopy"].filter(v => !byVariant[v]);
-    const note = missing.length
-      ? `<div class="stat"><em>Missing variant(s): ${missing.join(", ")}. ` +
-        `Re-run export_route_compare.py to generate them.</em></div>`
-      : `<div class="stat"><em>V2 cost held constant (elev + curv always on); ` +
-        `the only difference is the per-edge canopy multiplier ` +
-        `(1 - 0.1 × canopy_frac).</em></div>`;
-    document.getElementById("results").innerHTML =
-      `<div class="route-card"><strong>Graz→Wien canopy comparison</strong>` +
-      lines + note + `</div>`;
-  } catch (e) {
-    setError(`compare load failed: ${e.message}`);
-    throw e;
-  }
+function _featuresBbox(features) {
+  let n = -90, s = 90, e = -180, w = 180;
+  const visit = (arr) => {
+    if (typeof arr[0] === "number") {
+      if (arr[0] < w) w = arr[0]; if (arr[0] > e) e = arr[0];
+      if (arr[1] < s) s = arr[1]; if (arr[1] > n) n = arr[1];
+    } else for (const x of arr) visit(x);
+  };
+  for (const f of features) visit(f.geometry.coordinates);
+  return [[w, s], [e, n]];
 }
 
-document.getElementById("show-graz-wien-compare").addEventListener("change", async (e) => {
-  if (e.target.checked) {
-    try {
-      await ensureGrazWienCompareLayers();
-    } catch {
-      e.target.checked = false;
-      return;
-    }
-    map.setLayoutProperty("graz-wien-no-canopy", "visibility", "visible");
-    map.setLayoutProperty("graz-wien-with-canopy", "visibility", "visible");
-  } else if (grazWienCompareLoaded) {
-    map.setLayoutProperty("graz-wien-no-canopy", "visibility", "none");
-    map.setLayoutProperty("graz-wien-with-canopy", "visibility", "none");
-    document.getElementById("elevation").innerHTML = "";
+// Generic compare overlay loader. Handles any GeoJSON FeatureCollection
+// whose features have `properties.variant` matching one of COMPARE_STYLES.
+// Renders one line layer per present variant, ordered by `z` (lowest
+// underneath). Adds click/hover handlers and the elevation profile chart.
+async function ensureCompareLayers(opts) {
+  const { toggleId, file, sourceId, layerPrefix, title, fitPadding=60 } = opts;
+  if (_compareLoaded[toggleId]) return;
+  setBusy(`Loading ${title}…`);
+  const r = await fetch(`/data/${file}?ts=${Date.now()}`);
+  if (!r.ok) throw new Error(`compare: ${r.status}`);
+  const fc = await r.json();
+  map.addSource(sourceId, { type: "geojson", data: fc, tolerance: 0 });
+
+  const variantsPresent = fc.features
+    .map(f => f.properties.variant)
+    .filter(v => COMPARE_STYLES[v]);
+  // Sort by z so layers stack correctly.
+  variantsPresent.sort(
+    (a, b) => COMPARE_STYLES[a].z - COMPARE_STYLES[b].z,
+  );
+
+  for (const variant of variantsPresent) {
+    const layerId = `${layerPrefix}-${variant}`;
+    map.addLayer({
+      id: layerId,
+      type: "line",
+      source: sourceId,
+      filter: ["==", ["get", "variant"], variant],
+      paint: {
+        "line-color": COMPARE_STYLES[variant].color,
+        "line-width": 4,
+        "line-opacity": 0.85,
+      },
+    });
+    map.on("click", layerId, (e) => {
+      const p = e.features[0].properties;
+      document.getElementById("results").innerHTML =
+        `<div class="route-card"><strong>${p.name}</strong>` +
+        `<div class="stat">Edges: ${p.edges}</div>` +
+        `<div class="stat">Length: ${p.length_km} km</div>` +
+        `<div class="stat">Climb: ${p.climb_m} m</div>` +
+        `<div class="stat">Under canopy: ${p.canopy_km ?? 0} km</div></div>`;
+    });
+    map.on("mouseenter", layerId, () => map.getCanvas().style.cursor = "crosshair");
+    map.on("mouseleave", layerId, () => map.getCanvas().style.cursor = "");
   }
+
+  _compareLoaded[toggleId] = true;
+  // Auto-fit bbox derived from the features.
+  map.fitBounds(_featuresBbox(fc.features),
+    { padding: fitPadding, duration: 500, maxZoom: 11 });
+  renderElevationProfile(fc.features);
+
+  const byVariant = Object.fromEntries(
+    fc.features.map(f => [f.properties.variant, f.properties])
+  );
+  const lines = variantsPresent.map(v => {
+    const p = byVariant[v];
+    return `<div class="stat" style="color:${COMPARE_STYLES[v].color}">` +
+      `▬ ${p.name}: ${p.edges} edges, ${p.length_km} km, ` +
+      `${p.climb_m} m climb, ${p.canopy_km ?? 0} km under canopy</div>`;
+  }).join("");
+  document.getElementById("results").innerHTML =
+    `<div class="route-card"><strong>${title}</strong>` + lines + `</div>`;
+
+  // Stash so the toggle handler can toggle visibility per layer.
+  return variantsPresent.map(v => `${layerPrefix}-${v}`);
+}
+
+function _bindCompareToggle(opts) {
+  let layerIds = null;
+  document.getElementById(opts.toggleId).addEventListener("change", async (e) => {
+    if (e.target.checked) {
+      try {
+        layerIds = await ensureCompareLayers(opts) || layerIds;
+      } catch (err) {
+        setError(`compare load failed: ${err.message}`);
+        e.target.checked = false;
+        return;
+      }
+      for (const id of (layerIds || []))
+        map.setLayoutProperty(id, "visibility", "visible");
+    } else if (_compareLoaded[opts.toggleId]) {
+      for (const id of (layerIds || []))
+        map.setLayoutProperty(id, "visibility", "none");
+      document.getElementById("elevation").innerHTML = "";
+    }
+  });
+}
+
+_bindCompareToggle({
+  toggleId:    "show-graz-wien-compare",
+  file:        "graz_wien_compare.geojson",
+  sourceId:    "graz-wien-compare",
+  layerPrefix: "graz-wien",
+  title:       "Graz→Wien route comparison",
+});
+_bindCompareToggle({
+  toggleId:    "show-graz-hainburg-axes",
+  file:        "graz_hainburg_scenic_axes.geojson",
+  sourceId:    "graz-hainburg-axes",
+  layerPrefix: "graz-hainburg-axes",
+  title:       "Graz→Hainburg: scenic axes (vineyards / forest / views / water)",
+});
+_bindCompareToggle({
+  toggleId:    "show-graz-hainburg-production",
+  file:        "graz_hainburg_production_candidate.geojson",
+  sourceId:    "graz-hainburg-production",
+  layerPrefix: "graz-hainburg-production",
+  title:       "Graz→Hainburg: production candidate (direct vs direct_minus3 vs direct_multi)",
+});
+_bindCompareToggle({
+  toggleId:    "show-graz-hainburg-compare",
+  file:        "graz_hainburg_compare.geojson",
+  sourceId:    "graz-hainburg-compare",
+  layerPrefix: "graz-hainburg",
+  title:       "Graz→Hainburg: ALL variants",
+});
+_bindCompareToggle({
+  toggleId:    "show-graz-hainburg-grade",
+  file:        "graz_hainburg_grade.geojson",
+  sourceId:    "graz-hainburg-grade",
+  layerPrefix: "graz-hainburg-grade",
+  title:       "Graz→Hainburg: uphill-formula experiment",
+});
+_bindCompareToggle({
+  toggleId:    "show-graz-hainburg-scenic-weights",
+  file:        "graz_hainburg_scenic_weights.geojson",
+  sourceId:    "graz-hainburg-scenic-weights",
+  layerPrefix: "graz-hainburg-scenic-weights",
+  title:       "Graz→Hainburg: scenic-weight multiplier experiment",
 });
 
 // --- status helpers ---------------------------------------------------

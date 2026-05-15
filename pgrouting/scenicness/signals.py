@@ -19,10 +19,13 @@ class Source:
     """How to build the base raster.
 
     kind = 'polygons':  rasterize landcover.geom WHERE class = landcover_class
-    kind = 'dem':       stitch Copernicus DEM tiles (landcover_class ignored)
+    kind = 'dem':       stitch Copernicus DEM tiles
+    kind = 'points':    rasterize POI points from data/pois/pois.sqlite where
+                        category = poi_category (one pixel per POI)
     """
     kind: str
     landcover_class: str | None = None
+    poi_category:    str | None = None
 
 
 @dataclass(frozen=True)
@@ -236,6 +239,39 @@ SIGNALS: dict[str, Signal] = {
         sample_mode="at_midpoint",
         description="Fraction of a 200 m disc that's wetland (marsh, "
                     "reedbed, bog, saltmarsh, etc.).",
+    ),
+    # V2 Phase A.3c: vineyards. Cultivated wine country — pleasant and
+    # typically hilly. We don't blanket-positive-score farmland because
+    # it's too generic; vineyards are singled out.
+    "vineyard_local": Signal(
+        name="vineyard_local",
+        column="vineyard_local",
+        source=Source(kind="polygons", landcover_class="vineyard"),
+        kernel=Kernel(kind="uniform_blur", param_m=200.0),
+        sample_mode="at_midpoint",
+        description="Fraction of a 200 m disc that's vineyard (landuse=vineyard).",
+    ),
+    # V2 Phase A.3d: viewpoint POIs. EDA showed 77% of Austrian
+    # corridor viewpoints sit within 10 m of a way (they're typically
+    # tagged at road pullouts or trail lookouts), so a tight local
+    # radius captures "you're at the viewpoint". The 2 km regional
+    # version captures viewpoint-rich territory (Wienerwald, hills)
+    # even when the immediate edge has no viewpoint.
+    "viewpoint_local": Signal(
+        name="viewpoint_local",
+        column="viewpoint_local",
+        source=Source(kind="points", poi_category="viewpoint"),
+        kernel=Kernel(kind="uniform_blur", param_m=100.0),
+        sample_mode="at_midpoint",
+        description="Viewpoint POI density in 100 m disc (binary mask × uniform blur).",
+    ),
+    "viewpoint_regional": Signal(
+        name="viewpoint_regional",
+        column="viewpoint_regional",
+        source=Source(kind="points", poi_category="viewpoint"),
+        kernel=Kernel(kind="uniform_blur", param_m=2000.0),
+        sample_mode="at_midpoint",
+        description="Viewpoint POI density in 2 km disc — viewpoint-rich territory.",
     ),
 }
 

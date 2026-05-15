@@ -57,6 +57,12 @@ def _classify(tags: dict) -> str | None:
         return "water"
     if tags.get("natural") == "wetland":
         return "wetland"
+    # V2 Phase A.3c: vineyards. Singled out from generic farmland as a
+    # positive scenic feature — wine country tends to be hilly + open
+    # + pleasant. We don't tag generic farmland here because it's too
+    # heterogeneous (canola vs wheat vs grass).
+    if tags.get("landuse") == "vineyard":
+        return "vineyard"
     return None
 
 

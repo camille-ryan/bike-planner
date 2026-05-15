@@ -73,7 +73,12 @@
         <label class="checkbox"><input type="checkbox" id="show-biome" />Biome / ecoregion (Resolve 2017)</label>
         <label class="checkbox"><input type="checkbox" id="show-landcover" />Land cover (forest / agricultural / urban / water / wetland)</label>
         <label class="checkbox"><input type="checkbox" id="show-hillshade" />Terrain hillshade (AWS Open Data, terrarium-encoded)</label>
-        <label class="checkbox"><input type="checkbox" id="show-graz-wien-compare" />Graz→Wien: with vs. without canopy bonus</label>
+        <label class="checkbox"><input type="checkbox" id="show-graz-wien-compare" />Graz→Wien: route variants (direct / balanced / scenic)</label>
+        <label class="checkbox"><input type="checkbox" id="show-graz-hainburg-axes" />Graz→Hainburg: <strong>scenic axes</strong> (vineyards / forest / views / water)</label>
+        <label class="checkbox"><input type="checkbox" id="show-graz-hainburg-production" />Graz→Hainburg: production candidate (direct / direct_minus3 / direct_multi)</label>
+        <label class="checkbox"><input type="checkbox" id="show-graz-hainburg-grade" />Graz→Hainburg: grade-math experiment (uphill_threshold + uphill_offset)</label>
+        <label class="checkbox"><input type="checkbox" id="show-graz-hainburg-scenic-weights" />Graz→Hainburg: scenic-detour experiments (the Wienerwald-corridor family)</label>
+        <label class="checkbox"><input type="checkbox" id="show-graz-hainburg-compare" />Graz→Hainburg: ALL variants (busy)</label>
         <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name. Land cover: OSM landuse polygons rolled up to 5 classes — captures actual transitions between forest, cropland and urban for the corridor (AT, CZ, DE, DK only). Graz→Wien compare: same V2 cost (elevation + curvature always on). Gray = no canopy term. Green = + 0.9× multiplier where the edge centerline runs under a forest polygon.</p>
       </section>
 

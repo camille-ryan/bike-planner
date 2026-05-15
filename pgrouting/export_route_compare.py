@@ -47,8 +47,33 @@ DEFAULT_OUT = Path("/mnt/e/proj/bike/web/public/data/graz_wien_compare.geojson")
 # Variant -> human-readable display name. Stored in feature.properties.name
 # so the web app can render it without hard-coded mappings.
 VARIANT_NAMES = {
-    "no_canopy":   "V2 (elev+curv, no canopy)",
-    "with_canopy": "V2 + canopy bonus",
+    # V2 Phase A.3b — profile-aware scenic costs. Each is captured by
+    # running `recompute-cost --profile <name>` (which overwrites
+    # ways.cost in place) then re-running this export.
+    "direct":   "Direct (no scenic preference)",
+    "balanced": "Balanced (~20% detour budget for scenic)",
+    "scenic":   "Scenic (~50% detour budget for scenic)",
+    # Experiment 1 — grade variants on direct base
+    "direct_thresh5": "Direct, no uphill cost ≤ 5% grade",
+    "direct_minus3":  "Direct, uphill formula shifted by 3%",
+    # Experiment 2 — scenic weight multipliers, no surface softening
+    "direct_scenic_2x":  "Direct + scenic_score × 2",
+    "direct_scenic_5x":  "Direct + scenic_score × 5",
+    "direct_scenic_10x": "Direct + scenic_score × 10",
+    # Experiment 3 — interaction-softening: only soften surface penalty
+    # where scenic_score is high (no ugly shortcuts)
+    "direct_interactive": "Direct + interaction-softening (k=0.30, mult=3, threshold=0.5)",
+    # Experiment 3.b — same shape, plus viewpoint POI signals
+    "direct_interactive_vp": "Direct + interaction-softening + viewpoints",
+    # Experiment 4 — per-signal multiplicative scenic factor
+    "direct_multi": "Direct + multiplicative per-signal scenic + interaction-softening",
+    # Experiment 5 — uphill_offset=3 + per-signal multi
+    "direct_minus3_multi": "Direct + uphill_offset=3 + multiplicative scenic",
+    # V2 Phase A.3e — multi-axis scenic profiles
+    "vineyard_lover":  "Vineyard-emphasis profile",
+    "forest_lover":    "Forest-emphasis profile",
+    "views":           "Viewpoint + vista-emphasis profile",
+    "water":           "Waterway + lake-emphasis profile",
 }
 
 
@@ -65,44 +90,61 @@ def snap_vertex(cur, lon: float, lat: float) -> int:
     return int(row[0])
 
 
-def build_feature(conn, variant: str) -> dict:
-    """pgr_dijkstra Graz->Wien, return the GeoJSON feature."""
+def build_feature(conn, variant: str,
+                  start_lonlat: tuple[float, float] = (GRAZ_LON, GRAZ_LAT),
+                  end_lonlat:   tuple[float, float] = (WIEN_LON, WIEN_LAT),
+                  ) -> dict:
+    """pgr_dijkstra between two lon/lat pairs, return the GeoJSON feature.
+    Default OD is Graz->Wien for backward compatibility."""
     with conn.cursor() as cur:
-        cur.execute("SET work_mem = '2GB'")
-        start_vid = snap_vertex(cur, GRAZ_LON, GRAZ_LAT)
-        end_vid   = snap_vertex(cur, WIEN_LON, WIEN_LAT)
-        print(f"[export]   start_vid={start_vid} end_vid={end_vid}")
+        # Smaller work_mem leaves more memory for pgr_dijkstra's heap.
+        # The prior 2GB setting effectively starved the dijkstra step
+        # and let the 6 GB postgres container OOM. compare_corridors.py
+        # uses 256MB successfully against the same corridor.
+        cur.execute("SET max_parallel_workers_per_gather = 0")
+        cur.execute("SET work_mem = '256MB'")
+        start_vid = snap_vertex(cur, *start_lonlat)
+        end_vid   = snap_vertex(cur, *end_lonlat)
+        print(f"[export]   start={start_lonlat} (vid={start_vid}) "
+              f"end={end_lonlat} (vid={end_vid})")
 
         # Bbox the inner edges_sql — loading the full 22 M-edge graph
-        # OOMs the 6 GB Postgres container. Floats are safe to inline
-        # into the SQL string.
+        # OOMs the 6 GB Postgres container.
         b = CORRIDOR_BBOX
         edges_sql = (
-            f"SELECT w.gid AS id, w.source, w.target, "
-            f"       w.cost, w.reverse_cost "
-            f"FROM ways w "
-            f"JOIN ways_vertices_pgr vs ON vs.id = w.source "
-            f"JOIN ways_vertices_pgr vt ON vt.id = w.target "
+            "SELECT w.gid AS id, w.source, w.target, "
+            "       w.cost, w.reverse_cost "
+            "FROM ways w "
+            "JOIN ways_vertices_pgr vs ON vs.id = w.source "
+            "JOIN ways_vertices_pgr vt ON vt.id = w.target "
             f"WHERE vs.lon BETWEEN {b[0]} AND {b[2]} "
             f"  AND vs.lat BETWEEN {b[1]} AND {b[3]} "
             f"  AND vt.lon BETWEEN {b[0]} AND {b[2]} "
             f"  AND vt.lat BETWEEN {b[1]} AND {b[3]}"
         )
-
-        cur.execute(
+        # Inline EVERYTHING into the outer SQL — edges_sql as a quoted
+        # literal, start/end vids as integer literals. Passing ANY of
+        # these as %s parameters forces postgres into a generic plan
+        # that OOMs the backend under SIGKILL. The values being inlined
+        # are all from our control (ints + floats), so SQL injection
+        # is not a concern. Matches the working pattern in
+        # compare_corridors.py.
+        sql_quoted = edges_sql.replace("'", "''")
+        full_sql = (
             "SELECT p.path_seq, p.node, p.edge, "
             "       w.source AS w_source, w.length_m, w.canopy_frac, "
             "       vs.elev_m AS elev_src, vt.elev_m AS elev_dst, "
             "       ST_X(vs.the_geom) AS slon, ST_Y(vs.the_geom) AS slat, "
             "       ST_X(vt.the_geom) AS tlon, ST_Y(vt.the_geom) AS tlat "
-            "FROM pgr_dijkstra(%s, %s, %s, true) p "
+            f"FROM pgr_dijkstra('{sql_quoted}', {int(start_vid)}, "
+            f"                  {int(end_vid)}, true) p "
             "JOIN ways w ON w.gid = p.edge "
             "JOIN ways_vertices_pgr vs ON vs.id = w.source "
             "JOIN ways_vertices_pgr vt ON vt.id = w.target "
             "WHERE p.edge != -1 "
-            "ORDER BY p.path_seq",
-            (edges_sql, start_vid, end_vid),
+            "ORDER BY p.path_seq"
         )
+        cur.execute(full_sql)
         rows = cur.fetchall()
 
     if not rows:

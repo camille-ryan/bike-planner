@@ -1,20 +1,17 @@
 {
   "bbox": [
-    14.5,
-    46.8,
-    17.0,
-    48.5
+    9.2710769,
+    46.3691647,
+    17.1785223,
+    49.0270459
   ],
   "res_m": 20.0,
+  "tile_size_deg": 1.0,
   "signals": {
     "forest_local": {
       "name": "forest_local",
       "description": "Fraction of a 200 m disc around the edge that's forest.",
       "png": "forest_local.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "green"
       }
@@ -23,10 +20,6 @@
       "name": "forest_wide",
       "description": "Fraction of a 2 km disc around the edge that's forest.",
       "png": "forest_wide.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "green"
       }
@@ -35,10 +28,6 @@
       "name": "local_relief",
       "description": "Std-dev of elevation in 500 m window (meters of terrain variation \u2014 high in gorges and on mountainsides).",
       "png": "local_relief.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "intensity",
         "vmax": 120.0
@@ -48,10 +37,6 @@
       "name": "regional_relief",
       "description": "Std-dev of elevation in 10 km window \u2014 regional mountainous-ness, even where local terrain is flat.",
       "png": "regional_relief.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "intensity",
         "vmax": 250.0
@@ -61,10 +46,6 @@
       "name": "distance_to_drama",
       "description": "Meters to nearest cell with local_relief \u2265 80 m. Small = visible mountains nearby. ~0 inside dramatic terrain.",
       "png": "distance_to_drama.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "inverse_intensity",
         "vmax": 15000.0
@@ -74,10 +55,6 @@
       "name": "view_dominance",
       "description": "DEM elevation minus 2 km Gaussian blur \u2014 meters above local mean.",
       "png": "view_dominance.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "diverging",
         "vmax": 200.0
@@ -87,10 +64,6 @@
       "name": "water_local",
       "description": "Fraction of a 200 m disc around the edge that's lake / pond / wide-river polygon.",
       "png": "water_local.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "blue"
       }
@@ -99,10 +72,6 @@
       "name": "water_wide",
       "description": "Fraction of a 2 km disc around the edge that's lake / pond / wide-river. Water-rich landscape.",
       "png": "water_wide.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "blue"
       }
@@ -111,10 +80,6 @@
       "name": "sea_local",
       "description": "Fraction of a 200 m disc around the edge that's ocean / sea (pre-built coastline polygons).",
       "png": "sea_local.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "blue"
       }
@@ -123,10 +88,6 @@
       "name": "sea_wide",
       "description": "Fraction of a 2 km disc around the edge that's ocean / sea \u2014 coastal proximity.",
       "png": "sea_wide.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "blue"
       }
@@ -135,10 +96,6 @@
       "name": "waterway_along_edge",
       "description": "Fraction of the edge centerline that runs inside a 10 m-buffered river/canal/stream polygon.",
       "png": "waterway_along_edge.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "blue"
       }
@@ -147,10 +104,6 @@
       "name": "waterway_local",
       "description": "Fraction of a 200 m disc that contains buffered river/canal/stream polygons \u2014 waterway proximity.",
       "png": "waterway_local.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "blue"
       }
@@ -159,12 +112,34 @@
       "name": "wetland_local",
       "description": "Fraction of a 200 m disc that's wetland (marsh, reedbed, bog, saltmarsh, etc.).",
       "png": "wetland_local.png",
-      "shape": [
-        9436,
-        9348
-      ],
       "colormap": {
         "kind": "teal"
+      }
+    },
+    "vineyard_local": {
+      "name": "vineyard_local",
+      "description": "Fraction of a 200 m disc that's vineyard (landuse=vineyard).",
+      "png": "vineyard_local.png",
+      "colormap": {
+        "kind": "purple"
+      }
+    },
+    "viewpoint_local": {
+      "name": "viewpoint_local",
+      "description": "Viewpoint POI density in 100 m disc (binary mask \u00d7 uniform blur).",
+      "png": "viewpoint_local.png",
+      "colormap": {
+        "kind": "intensity",
+        "vmax": 0.03
+      }
+    },
+    "viewpoint_regional": {
+      "name": "viewpoint_regional",
+      "description": "Viewpoint POI density in 2 km disc \u2014 viewpoint-rich territory.",
+      "png": "viewpoint_regional.png",
+      "colormap": {
+        "kind": "intensity",
+        "vmax": 0.0008
       }
     }
   }

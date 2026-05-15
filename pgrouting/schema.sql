@@ -135,6 +135,17 @@ ALTER TABLE ways ADD COLUMN IF NOT EXISTS sea_wide            real NOT NULL DEFA
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS waterway_along_edge real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS waterway_local      real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS wetland_local       real NOT NULL DEFAULT 0.0;
+-- V2 Phase A.3c: vineyard scenic signal — pleasant cultivated land,
+-- often in hilly wine country. Other agricultural classes (farmland,
+-- meadow) are too generic to score positively; we only single out
+-- vineyards (and could add orchards similarly).
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS vineyard_local      real NOT NULL DEFAULT 0.0;
+-- V2 Phase A.3d: viewpoint POI signals. Source is points (not polygons)
+-- from pois.sqlite category='viewpoint'. EDA found 77% of Austrian
+-- viewpoints are within 10 m of a way, so local radius is tight (100 m)
+-- and regional is wider (2 km).
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS viewpoint_local     real NOT NULL DEFAULT 0.0;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS viewpoint_regional  real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways DROP COLUMN IF EXISTS sinuosity;
 CREATE INDEX IF NOT EXISTS ways_source_idx ON ways(source);
 CREATE INDEX IF NOT EXISTS ways_target_idx ON ways(target);

@@ -76,6 +76,12 @@ async def trunk_route(
     from_: str = Query(..., alias="from", description="lon,lat"),
     to: str = Query(..., description="lon,lat"),
     profile: str = DEFAULT_PROFILE,
+    simplify_m: float = Query(
+        100.0,
+        description="Decimate polyline: drop points closer than this many "
+                    "meters apart (default 100 m, visually equivalent at "
+                    "any zoom; pass 0 to disable).",
+    ),
 ) -> dict:
     """Paired-trunk routing: snap endpoints, run city_graph Dijkstra,
     then walk in-memory trunk arrays leg by leg. Trunks are preloaded
@@ -84,7 +90,7 @@ async def trunk_route(
     a = _parse_lonlat(from_, "from")
     b = _parse_lonlat(to, "to")
     try:
-        feat = trunk_router.route(a, b, profile)
+        feat = trunk_router.route(a, b, profile, simplify_m=simplify_m)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))
     except RuntimeError as exc:

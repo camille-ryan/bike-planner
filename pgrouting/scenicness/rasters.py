@@ -32,13 +32,22 @@ _M_PER_DEG_LAT = 111_000.0
 
 
 def grid_dims(bbox: tuple[float, float, float, float],
-              res_m: float
+              res_m: float,
+              cos_lat: float | None = None,
               ) -> tuple[int, int, "rasterio.Affine"]:
     """Compute (width, height, transform) for a meter-resolution grid
-    over the given lon/lat bbox."""
+    over the given lon/lat bbox.
+
+    `cos_lat` overrides the latitude-correction factor used for the
+    longitudinal pixel size. Passing a fixed cos_lat across all tiles
+    in a tiled bake keeps pixel sizes consistent so the tile slices
+    paste together without drift; default (None) computes cos(mid_lat)
+    from the bbox.
+    """
     min_lon, min_lat, max_lon, max_lat = bbox
-    mid_lat = (min_lat + max_lat) / 2.0
-    deg_lon_per_m = 1.0 / (_M_PER_DEG_LAT * np.cos(np.radians(mid_lat)))
+    if cos_lat is None:
+        cos_lat = float(np.cos(np.radians((min_lat + max_lat) / 2.0)))
+    deg_lon_per_m = 1.0 / (_M_PER_DEG_LAT * cos_lat)
     deg_lat_per_m = 1.0 / _M_PER_DEG_LAT
     px_lon = res_m * deg_lon_per_m
     px_lat = res_m * deg_lat_per_m
@@ -65,15 +74,57 @@ def res_to_pixels(transform: "rasterio.Affine", meters: float) -> float:
 # Sources
 # ---------------------------------------------------------------------
 
+def rasterize_points(sqlite_path,
+                     category: str,
+                     bbox: tuple[float, float, float, float],
+                     res_m: float,
+                     cos_lat: float | None = None,
+                     ) -> tuple[np.ndarray, "rasterio.Affine"]:
+    """Rasterize POIs (single-pixel hits) of the given category onto a
+    binary uint8 mask. Returns (mask, transform).
+
+    The pois.sqlite DB uses SpatiaLite, but for *reading* X/Y of points
+    we don't need the extension — store schema includes geom but a
+    plain X(geom)/Y(geom) requires SpatiaLite functions. Load the
+    mod_spatialite extension to access them."""
+    import sqlite3
+    width, height, transform = grid_dims(bbox, res_m, cos_lat=cos_lat)
+    out = np.zeros((height, width), dtype=np.uint8)
+    con = sqlite3.connect(str(sqlite_path))
+    con.enable_load_extension(True)
+    con.execute("SELECT load_extension('mod_spatialite')")
+    rows = con.execute("""
+        SELECT X(geom), Y(geom) FROM pois
+        WHERE category = ?
+          AND X(geom) BETWEEN ? AND ?
+          AND Y(geom) BETWEEN ? AND ?
+    """, (category, bbox[0], bbox[2], bbox[1], bbox[3])).fetchall()
+    con.close()
+    # Inverse-transform each (lon, lat) → (col, row) once. Affine inverse
+    # gives a callable that handles the +0.5 corner→center semantics.
+    inv = ~transform
+    n_in = 0
+    for lon, lat in rows:
+        col, row = inv * (lon, lat)
+        c, r = int(col), int(row)
+        if 0 <= c < width and 0 <= r < height:
+            out[r, c] = 1
+            n_in += 1
+    print(f"[rasters] points/{category}: {len(rows):,} POIs, "
+          f"{n_in:,} inside grid ({width}x{height})", flush=True)
+    return out, transform
+
+
 def rasterize_polygons(conn,
                        landcover_class: str,
                        bbox: tuple[float, float, float, float],
                        res_m: float,
+                       cos_lat: float | None = None,
                        ) -> tuple[np.ndarray, "rasterio.Affine"]:
     """Rasterize every `landcover` polygon of the given class within
     bbox into a binary uint8 mask. Returns (mask, transform).
     """
-    width, height, transform = grid_dims(bbox, res_m)
+    width, height, transform = grid_dims(bbox, res_m, cos_lat=cos_lat)
     t0 = time.time()
     with conn.cursor() as cur:
         cur.execute(
@@ -106,6 +157,7 @@ def rasterize_polygons(conn,
 def stitch_dem(dem_dir: Path,
                bbox: tuple[float, float, float, float],
                res_m: float,
+               cos_lat: float | None = None,
                ) -> tuple[np.ndarray, "rasterio.Affine"]:
     """Stitch Copernicus DEM GLO-30 tiles intersecting bbox into a
     single float32 raster at the target resolution.
@@ -115,7 +167,7 @@ def stitch_dem(dem_dir: Path,
     signals we derive). No-data cells become NaN.
     """
     min_lon, min_lat, max_lon, max_lat = bbox
-    width, height, transform = grid_dims(bbox, res_m)
+    width, height, transform = grid_dims(bbox, res_m, cos_lat=cos_lat)
     out = np.full((height, width), np.nan, dtype=np.float32)
     inv = ~transform
     # Tile filenames look like Copernicus_DSM_COG_10_N47_00_E015_00_DEM.tif,
@@ -256,19 +308,37 @@ def _colormap_teal(values: np.ndarray) -> np.ndarray:
     return rgba
 
 
+def _colormap_purple(values: np.ndarray) -> np.ndarray:
+    """Wine-purple gradient for vineyards. Distinct from the diverging
+    (red/blue) and intensity (amber/red) maps used by terrain signals."""
+    v = np.clip(values, 0.0, 1.0).astype(np.float32)
+    h, w = v.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[..., 0] = (90  + 90  * v).astype(np.uint8)
+    rgba[..., 1] = (30  + 30  * v).astype(np.uint8)
+    rgba[..., 2] = (110 + 100 * v).astype(np.uint8)
+    rgba[..., 3] = (170 * v).astype(np.uint8)
+    return rgba
+
+
 def _colormap_intensity(values: np.ndarray,
                         vmax: float
                         ) -> np.ndarray:
     """Single-hue intensity colormap: transparent → amber → red.
     Used for unsigned magnitude signals like local_relief.
+
+    NaN cells become fully transparent (no-data regions).
     """
-    v = np.clip(values / max(vmax, 1e-6), 0.0, 1.0).astype(np.float32)
+    invalid = np.isnan(values)
+    v = np.where(invalid, 0.0,
+                 np.clip(values / max(vmax, 1e-6), 0.0, 1.0)).astype(np.float32)
     h, w = v.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[..., 0] = (200 + 55 * v).astype(np.uint8)        # R: bright at high
-    rgba[..., 1] = (160 - 80 * v).astype(np.uint8)        # G: pulls warm
-    rgba[..., 2] = (40 + 20 * (1 - v)).astype(np.uint8)   # B: small
-    rgba[..., 3] = (180 * v).astype(np.uint8)             # alpha by magnitude
+    rgba[..., 0] = (200 + 55 * v).astype(np.uint8)
+    rgba[..., 1] = (160 - 80 * v).astype(np.uint8)
+    rgba[..., 2] = (40 + 20 * (1 - v)).astype(np.uint8)
+    alpha = (180 * v).astype(np.uint8)
+    rgba[..., 3] = np.where(invalid, 0, alpha).astype(np.uint8)
     return rgba
 
 
@@ -278,15 +348,20 @@ def _colormap_inverse_intensity(values: np.ndarray,
     """Inverse intensity: bright purple at low values, transparent
     at high. For distance-style signals where SMALL = interesting
     (e.g. distance_to_drama — closer to mountains is more visible).
+
+    NaN cells become fully transparent (no-data regions).
     """
-    # Treat values >= vmax as fully faded.
-    v = 1.0 - np.clip(values / max(vmax, 1e-6), 0.0, 1.0).astype(np.float32)
+    invalid = np.isnan(values)
+    v = np.where(invalid, 1.0,
+                 1.0 - np.clip(values / max(vmax, 1e-6), 0.0, 1.0)
+                 ).astype(np.float32)
     h, w = v.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[..., 0] = (140 + 70 * v).astype(np.uint8)        # R: purple
-    rgba[..., 1] = (40 + 30 * (1 - v)).astype(np.uint8)   # G: low
-    rgba[..., 2] = (180 + 60 * v).astype(np.uint8)        # B: purple
-    rgba[..., 3] = (180 * v).astype(np.uint8)             # alpha by closeness
+    rgba[..., 0] = (140 + 70 * v).astype(np.uint8)
+    rgba[..., 1] = (40 + 30 * (1 - v)).astype(np.uint8)
+    rgba[..., 2] = (180 + 60 * v).astype(np.uint8)
+    alpha = (180 * v).astype(np.uint8)
+    rgba[..., 3] = np.where(invalid, 0, alpha).astype(np.uint8)
     return rgba
 
 
@@ -297,24 +372,25 @@ def _colormap_diverging(values: np.ndarray,
 
     Input: float32 (signed). Output: (H, W, 4) uint8 RGBA.
     `vmax` is the absolute value at full saturation; symmetric.
+
+    NaN cells become fully transparent (no-data regions).
     """
-    v = values.astype(np.float32)
+    invalid = np.isnan(values)
+    v = np.where(invalid, 0.0, values).astype(np.float32)
     v = np.clip(v / max(vmax, 1e-6), -1.0, 1.0)
     h, w = v.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    neg = v < 0
-    pos = v > 0
+    neg = (v < 0) & ~invalid
+    pos = (v > 0) & ~invalid
     a = np.abs(v)
-    # Negative (valleys) → cool blue
     rgba[neg, 0] = (40 + 40 * (1 - a[neg])).astype(np.uint8)
     rgba[neg, 1] = (80 + 60 * (1 - a[neg])).astype(np.uint8)
     rgba[neg, 2] = (140 + 100 * a[neg]).astype(np.uint8)
-    # Positive (ridges) → warm brown / red
     rgba[pos, 0] = (140 + 100 * a[pos]).astype(np.uint8)
     rgba[pos, 1] = (90 + 30 * (1 - a[pos])).astype(np.uint8)
     rgba[pos, 2] = (40 + 30 * (1 - a[pos])).astype(np.uint8)
-    # Alpha: more visible near extremes, transparent at zero
-    rgba[..., 3] = (180 * a).astype(np.uint8)
+    alpha = (180 * a).astype(np.uint8)
+    rgba[..., 3] = np.where(invalid, 0, alpha).astype(np.uint8)
     return rgba
 
 
@@ -339,6 +415,13 @@ COLORMAPS: dict[str, dict] = {
     "waterway_local":       {"kind": "blue"},
     # Wetlands sit between forest and water visually + conceptually.
     "wetland_local":        {"kind": "teal"},
+    # Vineyards: distinct purple — cultivated land but positively scored.
+    "vineyard_local":       {"kind": "purple"},
+    # Viewpoints: POI-density values are tiny (binary mask × uniform
+    # blur), so use intensity with a vmax matched to observed maxima.
+    # Bake summary (Austria-wide): vp_local max=0.074, vp_regional max=0.0013.
+    "viewpoint_local":      {"kind": "intensity", "vmax": 0.03},
+    "viewpoint_regional":   {"kind": "intensity", "vmax": 0.0008},
 }
 
 
@@ -406,6 +489,8 @@ def write_signal_png(raster: np.ndarray,
         rgba = _colormap_blue(raster)
     elif cm["kind"] == "teal":
         rgba = _colormap_teal(raster)
+    elif cm["kind"] == "purple":
+        rgba = _colormap_purple(raster)
     elif cm["kind"] == "diverging":
         rgba = _colormap_diverging(raster, vmax=cm["vmax"])
     elif cm["kind"] == "intensity":
@@ -427,29 +512,40 @@ def write_signal_png(raster: np.ndarray,
             dst.write(rgba[..., b], b + 1)
 
 
+def _nan_uniform_filter(arr: np.ndarray, size: int) -> np.ndarray:
+    """Uniform-window mean over valid (non-NaN) cells. Output is NaN
+    where no valid cells are in the window. Used so DEM no-data regions
+    don't bias kernel outputs toward 0 at their boundaries.
+    """
+    valid = ~np.isnan(arr)
+    arr_zero = np.where(valid, arr, 0.0).astype(np.float32)
+    valid_f = valid.astype(np.float32)
+    sum_avg = scipy.ndimage.uniform_filter(arr_zero, size=size, mode="nearest")
+    valid_avg = scipy.ndimage.uniform_filter(valid_f, size=size, mode="nearest")
+    out = np.where(valid_avg > 1e-6, sum_avg / valid_avg, np.nan)
+    return out.astype(np.float32)
+
+
 def stddev_filter(raster: np.ndarray,
                   transform: "rasterio.Affine",
                   radius_m: float
                   ) -> np.ndarray:
-    """Per-pixel standard deviation within a (2·radius+1)² window.
+    """Per-pixel standard deviation within a (2·radius+1)² window,
+    computed only over valid (non-NaN) cells.
 
-    Uses the identity σ = √(E[X²] − E[X]²) with two separable
-    uniform_filter calls, so cost is O(W·H) regardless of radius.
-    NaN cells (DEM no-data) are zero-filled before filtering — fine
-    in regions with continuous DEM coverage; small bias on tile
-    boundaries.
+    NaN-aware: DEM no-data regions don't bias the filter. Cells whose
+    entire window is NaN come out as NaN (preserved through colormap
+    → fully transparent in the PNG).
 
-    For the elevation signal `local_relief`, the result is "meters
-    of terrain variation within radius_m of this pixel" — high on
-    gorge walls / mountainsides, ~0 on flat plains.
+    Uses σ = √(E[X²] − E[X]²) with two NaN-aware uniform filters, so
+    cost is O(W·H) regardless of radius.
     """
     radius_px = max(1, int(round(res_to_pixels(transform, radius_m))))
     size = 2 * radius_px + 1
     t0 = time.time()
     arr = raster.astype(np.float32)
-    arr = np.where(np.isnan(arr), 0.0, arr)
-    mean = scipy.ndimage.uniform_filter(arr, size=size, mode="nearest")
-    mean_sq = scipy.ndimage.uniform_filter(arr * arr, size=size, mode="nearest")
+    mean = _nan_uniform_filter(arr, size)
+    mean_sq = _nan_uniform_filter(arr * arr, size)
     var = np.maximum(mean_sq - mean * mean, 0.0)
     out = np.sqrt(var).astype(np.float32)
     print(f"[kernels] stddev_filter r={radius_m:.0f}m "
@@ -466,25 +562,21 @@ def distance_to_high_relief(raster: np.ndarray,
     threshold_m`. "Drama proximity" — captures "you can see distant
     mountains" without doing real viewshed math.
 
-    Internally: stddev_filter(raster, relief_radius_m) → threshold →
-    distance_transform_edt. The intermediate stddev pass is roughly
-    the same as the `local_relief` signal would compute on its own,
-    so re-running it here costs a few extra seconds vs full
-    chained-kernel plumbing.
+    Internally: stddev_filter (NaN-aware) → threshold → distance
+    transform. Cells whose source DEM was NaN come out as NaN (the
+    distance from missing data is meaningless and would otherwise
+    show as "very far from drama" everywhere outside coverage).
     """
     t0 = time.time()
     relief = stddev_filter(raster, transform, relief_radius_m)
-    mask = relief > threshold_m
-    # distance_transform_edt returns Euclidean distance (in pixel
-    # units) from each cell to the nearest zero cell. We want each
-    # cell's distance to the nearest "drama" cell, so the input mask
-    # is inverted: drama cells = 0, others = 1.
+    # NaN-aware threshold: NaN > threshold → False, so NaN cells are
+    # treated as "not drama" (correct — they're unknown, not dramatic).
+    mask = np.where(np.isnan(relief), False, relief > threshold_m)
     dist_px = scipy.ndimage.distance_transform_edt(~mask)
-    # Pixel size in meters. The raster grid is constructed to be
-    # locally square in meters (see grid_dims), so latitudinal pixel
-    # size suffices.
     res_m = abs(transform.e) * _M_PER_DEG_LAT
     dist_m = (dist_px * res_m).astype(np.float32)
+    # Wherever DEM was missing, the "distance to drama" is undefined.
+    dist_m[np.isnan(raster) | np.isnan(relief)] = np.nan
     print(f"[kernels] distance_to_high_relief threshold={threshold_m:.0f}m "
           f"(relief r={relief_radius_m:.0f}m) in {time.time()-t0:.1f}s",
           flush=True)
@@ -495,24 +587,25 @@ def subtract_gaussian_blur(raster: np.ndarray,
                            transform: "rasterio.Affine",
                            sigma_m: float
                            ) -> np.ndarray:
-    """Return `raster - gaussian_blur(raster, sigma=sigma_m)`.
-
-    For elevation rasters, this yields a "local prominence" signal:
-    positive where the cell is higher than its neighborhood average
-    (ridges, summits), negative where lower (valleys). The Gaussian
-    is separable so the cost is O(width × height) regardless of
-    sigma.
+    """Return `raster - gaussian_blur(raster, sigma=sigma_m)`,
+    NaN-aware: the blur is the Gaussian-weighted mean over valid
+    cells only, so DEM no-data regions don't drag down the blur of
+    nearby valid cells. NaN propagates through the subtraction so
+    output pixels with no source data remain NaN.
     """
     sigma_px = max(1.0, res_to_pixels(transform, sigma_m))
     t0 = time.time()
     src = raster.astype(np.float32)
-    # NaN-safe Gaussian: replace NaN with neighborhood mean via a
-    # weighted blur. For simplicity here we just fill NaN with 0
-    # before blurring; the subtract step preserves NaN in the
-    # output via the source-side NaN.
-    src_filled = np.where(np.isnan(src), 0.0, src)
-    blur = scipy.ndimage.gaussian_filter(src_filled, sigma=sigma_px,
-                                          mode="nearest")
+    valid = ~np.isnan(src)
+    src_zero = np.where(valid, src, 0.0).astype(np.float32)
+    valid_f = valid.astype(np.float32)
+    sum_blur = scipy.ndimage.gaussian_filter(
+        src_zero, sigma=sigma_px, mode="nearest")
+    valid_blur = scipy.ndimage.gaussian_filter(
+        valid_f, sigma=sigma_px, mode="nearest")
+    blur = np.where(valid_blur > 1e-6,
+                    sum_blur / valid_blur,
+                    np.nan).astype(np.float32)
     out = src - blur
     print(f"[kernels] subtract_gaussian_blur σ={sigma_m:.0f}m "
           f"({sigma_px:.1f}px) in {time.time()-t0:.1f}s", flush=True)

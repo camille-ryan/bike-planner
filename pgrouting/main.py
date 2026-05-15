@@ -162,11 +162,64 @@ def cmd_canopy_compute(args) -> None:
     print("[main] canopy-compute done")
 
 
+def cmd_restitch_overlays(args) -> None:
+    """Re-stitch global PNG overlays from existing per-tile PNGs.
+
+    Reads {export_rasters}/manifest.json + {export_rasters}/tiles/*.png
+    and rewrites {export_rasters}/<col>.png with the current
+    _stitch_signal logic. Useful after changing stitch/downsample
+    behavior — avoids re-running the multi-hour bake when only the
+    final overlay rendering changed.
+    """
+    import json
+    import numpy as np
+    if not args.export_rasters:
+        raise SystemExit("restitch-overlays requires --export-rasters")
+    export_dir = Path(args.export_rasters)
+    tiles_dir = export_dir / "tiles"
+    manifest_path = export_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise SystemExit(f"no manifest: {manifest_path}")
+    if not tiles_dir.is_dir():
+        raise SystemExit(f"no tiles dir: {tiles_dir}")
+    manifest = json.loads(manifest_path.read_text())
+    extent = tuple(manifest["bbox"])
+    res_m = float(manifest["res_m"])
+    tile_size_deg = float(manifest.get("tile_size_deg", 1.0))
+    cos_lat = float(np.cos(np.radians((extent[1] + extent[3]) / 2.0)))
+    # Reconstruct per-signal tile entries from filenames.
+    # Filename pattern: <col>_t<NNN>.png ; the index encodes the tile's
+    # position in _iter_tiles() ordering.
+    all_tiles = scenicness_bake._iter_tiles(extent, tile_size_deg)
+    print(f"[restitch] extent={extent} res_m={res_m} "
+          f"tile_size_deg={tile_size_deg} cos_lat={cos_lat:.4f}")
+    print(f"[restitch] {len(all_tiles)} candidate tiles, "
+          f"{len(manifest['signals'])} signals")
+    for col in manifest["signals"]:
+        tile_pngs = sorted(tiles_dir.glob(f"{col}_t*.png"))
+        if not tile_pngs:
+            print(f"[restitch]   {col}: no tile PNGs, skipping")
+            continue
+        entries = []
+        for png_path in tile_pngs:
+            stem = png_path.stem  # e.g. "forest_local_t007"
+            ti = int(stem.rsplit("_t", 1)[1])
+            tile_bbox = all_tiles[ti]
+            entries.append((col, png_path, None, tile_bbox))
+        out_path = export_dir / f"{col}.png"
+        print(f"\n[restitch] {col}: {len(entries)} tiles -> {out_path}")
+        scenicness_bake._stitch_signal(
+            col, entries, extent, res_m, out_path, cos_lat,
+        )
+    print("[restitch] done")
+
+
 def cmd_scenicness_bake(args) -> None:
-    """Compute per-edge scenicness signals in one pass."""
+    """Compute per-edge scenicness signals in one pass.
+
+    --bbox is optional. When omitted, bakes the full ways-table extent
+    via internal tiling (see bake.py)."""
     bbox = _parse_bbox(args.bbox)
-    if bbox is None:
-        raise SystemExit("scenicness-bake requires --bbox")
     if args.signals:
         names = [s.strip() for s in args.signals.split(",") if s.strip()]
     else:
@@ -176,14 +229,17 @@ def cmd_scenicness_bake(args) -> None:
         raise SystemExit(f"unknown signal(s): {unknown}; "
                          f"available: {list(scenicness_signals.SIGNALS.keys())}")
     res_m = float(args.res_m) if args.res_m else 20.0
+    tile_size_deg = float(args.tile_size_deg) if args.tile_size_deg else 1.0
     export_dir = Path(args.export_rasters) if args.export_rasters else None
-    print(f"[main] scenicness-bake bbox={bbox} res_m={res_m} signals={names} "
+    print(f"[main] scenicness-bake bbox={bbox} res_m={res_m} "
+          f"tile_size_deg={tile_size_deg} signals={names} "
           f"export_rasters={export_dir}")
     with psycopg.connect(config.PG_DSN) as conn:
         scenicness_bake.bake(
             conn, names, bbox, res_m=res_m,
             dem_dir=config.DEM_DIR,
             export_rasters_dir=export_dir,
+            tile_size_deg=tile_size_deg,
         )
     print("[main] scenicness-bake done")
 
@@ -233,9 +289,23 @@ def cmd_compare_canopy(args) -> None:
 
 def cmd_recompute_cost(args) -> None:
     bbox = _parse_bbox(args.bbox)
-    print(f"[main] recompute-cost bbox={bbox}")
+    # Map legacy "lht" alias to "direct" for backward compat. The
+    # shared --profile argparse default is "lht" (used by spts/paired
+    # as an output-directory name), so existing recompute-cost callers
+    # without --profile get "lht" → mapped to "direct" here.
+    profile = args.profile or "direct"
+    if profile == "lht":
+        profile = "direct"
+    # Import here to avoid circular import at module load.
+    from cost import _PROFILES
+    if profile not in _PROFILES:
+        raise SystemExit(
+            f"unknown --profile={profile!r}; "
+            f"expected one of {sorted(_PROFILES.keys())}"
+        )
+    print(f"[main] recompute-cost bbox={bbox} profile={profile}")
     with psycopg.connect(config.PG_DSN) as conn:
-        recompute_cost.recompute(conn, bbox=bbox)
+        recompute_cost.recompute(conn, bbox=bbox, profile=profile)
     print("[main] recompute-cost done")
 
 
@@ -247,10 +317,28 @@ def cmd_export_route_compare(args) -> None:
     out = Path(args.out) if args.out else (config.DATA_DIR / "graz_wien_compare.geojson")
     if not args.variant:
         raise SystemExit("export-route-compare requires --variant (no_canopy | with_canopy)")
-    print(f"[main] export-route-compare variant={args.variant} -> {out}")
+
+    # Optional OD override. Each must be "lon,lat". If omitted, build_feature
+    # defaults to Graz<->Wien (the historical OD pair for this script).
+    def _parse_pt(s: str | None) -> tuple[float, float] | None:
+        if not s:
+            return None
+        parts = tuple(float(x) for x in s.split(","))
+        if len(parts) != 2:
+            raise SystemExit(f"expected lon,lat pair, got {s!r}")
+        return parts
+    start_pt = _parse_pt(args.start_lonlat)
+    end_pt   = _parse_pt(args.end_lonlat)
+
+    print(f"[main] export-route-compare variant={args.variant} -> {out}"
+          + (f"  start={start_pt}" if start_pt else "")
+          + (f"  end={end_pt}" if end_pt else ""))
     import json
     with psycopg.connect(config.PG_DSN) as conn:
-        feat = export_route_compare.build_feature(conn, args.variant)
+        kw = {}
+        if start_pt is not None: kw["start_lonlat"] = start_pt
+        if end_pt is not None:   kw["end_lonlat"]   = end_pt
+        feat = export_route_compare.build_feature(conn, args.variant, **kw)
     if out.exists():
         with out.open() as h:
             fc = json.load(h)
@@ -337,6 +425,7 @@ def main() -> None:
         ("canopy-compute", cmd_canopy_compute),
         ("canopy-compute-raster", cmd_canopy_compute_raster),
         ("scenicness-bake", cmd_scenicness_bake),
+        ("restitch-overlays", cmd_restitch_overlays),
         ("compare-canopy", cmd_compare_canopy),
         ("reannotate-canopy-km", cmd_reannotate_canopy_km),
         ("recompute-cost", cmd_recompute_cost),
@@ -363,6 +452,12 @@ def main() -> None:
             help="export-route-compare: output path. Default writes inside "
                  "the container to /data/graz_wien_compare.geojson — copy out "
                  "to web/public/data/ to view.")
+        sp.add_argument("--start-lonlat", default=None,
+            help="export-route-compare: start point as lon,lat. "
+                 "Default = Graz (15.4395,47.0707).")
+        sp.add_argument("--end-lonlat", default=None,
+            help="export-route-compare: end point as lon,lat. "
+                 "Default = Wien (16.3725,48.2082).")
         sp.add_argument("--res-m", default=None,
             help="canopy-compute-raster / scenicness-bake: raster "
                  "resolution in meters (default 20).")
@@ -372,6 +467,9 @@ def main() -> None:
         sp.add_argument("--export-rasters", default=None,
             help="scenicness-bake: write PNG overlays + manifest.json "
                  "to this directory (e.g. /data/web_overlays/scenicness).")
+        sp.add_argument("--tile-size-deg", default=None,
+            help="scenicness-bake: tile size in degrees (default 1.0). "
+                 "Lower values reduce per-tile memory at higher tile-count cost.")
         sp.set_defaults(func=func)
 
     args = p.parse_args()
