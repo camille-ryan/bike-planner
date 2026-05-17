@@ -745,6 +745,187 @@ document.getElementById("show-landcover").addEventListener("change", async (e) =
   }
 });
 
+// --- Passenger rail overlays -------------------------------------------
+// Static GeoJSON at /data/rail_lines.geojson, /data/rail_stations.geojson,
+// produced by `export-rails`. Lines come from OSM track geometry,
+// spatially filtered to lines that pass within 200 m of any GTFS-served
+// station. Stations come from the national GTFS feed and represent the
+// definitive "served" list (with route count per stop).
+let railLinesLoaded = false;
+let railStationsLoaded = false;
+
+async function ensureRailLinesLayer() {
+  if (railLinesLoaded) return;
+  setBusy("Loading rail lines…");
+  try {
+    const r = await fetch("/data/rail_lines.geojson");
+    if (!r.ok) throw new Error(`rail_lines: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("rail-lines", { type: "geojson", data: fc, tolerance: 0 });
+    map.addLayer({
+      id: "rail-lines-layer",
+      type: "line",
+      source: "rail-lines",
+      paint: {
+        // Dark slate with subtle "ties" effect via dasharray; visible
+        // against both green/forest backgrounds and the white basemap.
+        "line-color": "#2a2a3a",
+        "line-width": [
+          "interpolate", ["linear"], ["zoom"],
+          7,  0.8,
+          10, 1.6,
+          14, 2.4,
+        ],
+        "line-opacity": 0.85,
+      },
+    });
+    railLinesLoaded = true;
+    document.getElementById("results").innerHTML = "";
+  } catch (e) {
+    setError(`rail_lines load failed: ${e.message}`);
+    throw e;
+  }
+}
+
+async function ensureRailStationsLayer() {
+  if (railStationsLoaded) return;
+  setBusy("Loading rail stations…");
+  try {
+    const r = await fetch("/data/rail_stations.geojson");
+    if (!r.ok) throw new Error(`rail_stations: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("rail-stations", { type: "geojson", data: fc });
+    map.addLayer({
+      id: "rail-stations-circle",
+      type: "circle",
+      source: "rail-stations",
+      paint: {
+        // Radius scales gently with n_routes (busier = bigger dot).
+        "circle-radius": [
+          "interpolate", ["linear"], ["get", "n_routes"],
+          1,  3,
+          10, 5,
+          50, 8,
+        ],
+        "circle-color": "#c43a3a",
+        "circle-stroke-color": "#ffffff",
+        "circle-stroke-width": 1.2,
+        "circle-opacity": 0.9,
+      },
+    });
+    map.addLayer({
+      id: "rail-stations-label",
+      type: "symbol",
+      source: "rail-stations",
+      // Only label busier stops so the map stays readable.
+      filter: [">=", ["get", "n_routes"], 4],
+      layout: {
+        "text-field": ["get", "name"],
+        "text-size": 11,
+        "text-offset": [0, 0.9],
+        "text-anchor": "top",
+        "text-allow-overlap": false,
+      },
+      paint: {
+        "text-color": "#2a2a3a",
+        "text-halo-color": "#ffffff",
+        "text-halo-width": 1.4,
+      },
+    });
+    railStationsLoaded = true;
+    document.getElementById("results").innerHTML = "";
+  } catch (e) {
+    setError(`rail_stations load failed: ${e.message}`);
+    throw e;
+  }
+}
+
+function _bindRailToggle(toggleId, ensureFn, layerIds) {
+  document.getElementById(toggleId).addEventListener("change", async (e) => {
+    if (e.target.checked) {
+      try {
+        await ensureFn();
+      } catch {
+        e.target.checked = false;
+        return;
+      }
+      for (const lid of layerIds) {
+        map.setLayoutProperty(lid, "visibility", "visible");
+      }
+    } else {
+      for (const lid of layerIds) {
+        if (map.getLayer(lid)) {
+          map.setLayoutProperty(lid, "visibility", "none");
+        }
+      }
+    }
+  });
+}
+
+_bindRailToggle("show-rail-lines",    ensureRailLinesLayer,    ["rail-lines-layer"]);
+_bindRailToggle("show-rail-stations", ensureRailStationsLayer, ["rail-stations-circle", "rail-stations-label"]);
+
+
+// --- City-pair best routes (per profile) ------------------------------
+// Static GeoJSON at /data/city_routes.geojson, produced by
+// `route-city-pairs` for each of the 5 profiles. One feature per
+// (a, b, profile). Color by profile so the 5 variants per city pair
+// fan out visually; line-width thinned so overlapping segments don't
+// drown each other.
+const CITY_ROUTE_COLORS = {
+  direct:         "#888888",
+  vineyard_lover: "#7a3380",
+  forest_lover:   "#1f7a3a",
+  views:          "#d4623a",
+  water:          "#2a6dc4",
+};
+
+let cityRoutesLoaded = false;
+
+async function ensureCityRoutesLayer() {
+  if (cityRoutesLoaded) return;
+  setBusy("Loading city pair routes…");
+  try {
+    const r = await fetch("/data/city_routes.geojson?ts=" + Date.now());
+    if (!r.ok) throw new Error(`city_routes: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("city-routes", { type: "geojson", data: fc, tolerance: 0 });
+    map.addLayer({
+      id: "city-routes-line",
+      type: "line",
+      source: "city-routes",
+      paint: {
+        "line-color": [
+          "match", ["get", "profile"],
+          "direct",         CITY_ROUTE_COLORS.direct,
+          "vineyard_lover", CITY_ROUTE_COLORS.vineyard_lover,
+          "forest_lover",   CITY_ROUTE_COLORS.forest_lover,
+          "views",          CITY_ROUTE_COLORS.views,
+          "water",          CITY_ROUTE_COLORS.water,
+          "#888888",
+        ],
+        "line-width": 3,
+        "line-opacity": 0.75,
+      },
+    });
+    map.on("click", "city-routes-line", (e) => {
+      const p = e.features[0].properties;
+      document.getElementById("results").innerHTML =
+        `<div class="route-card"><strong>${p.a} → ${p.b} — ${p.profile}</strong>` +
+        `<div class="stat">Length: ${Number(p.length_km).toFixed(1)} km</div>` +
+        `<div class="stat">Cost: ${Number(p.cost).toFixed(0)}</div>` +
+        `<div class="stat">Edges: ${p.n_edges}</div></div>`;
+    });
+    cityRoutesLoaded = true;
+    document.getElementById("results").innerHTML = "";
+  } catch (e) {
+    setError(`city_routes load failed: ${e.message}`);
+    throw e;
+  }
+}
+
+_bindRailToggle("show-city-routes", ensureCityRoutesLayer, ["city-routes-line"]);
+
 // --- Terrain hillshade overlay ---------------------------------------
 // Public DEM tiles from AWS Open Data, terrarium-encoded. MapLibre
 // renders shaded relief from the raster-dem source via the hillshade

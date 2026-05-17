@@ -134,6 +134,26 @@ ALTER TABLE ways ADD COLUMN IF NOT EXISTS sea_local           real NOT NULL DEFA
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS sea_wide            real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS waterway_along_edge real NOT NULL DEFAULT 0.0;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS waterway_local      real NOT NULL DEFAULT 0.0;
+
+-- V3 per-profile cost columns. Each of the 5 production profiles gets
+-- its own (cost, reverse_cost) pair so we can pre-compute all of them
+-- without overwriting each other. Routing picks the right column via
+-- SQL alias at query time. NULL means "not yet recomputed for this
+-- profile" — pgr_dijkstra/pgr_bdAstar will reject NULL costs, so the
+-- column must be fully populated before routing against it.
+-- Stored as `real` (float32) — ~7 sig figs is plenty for routing
+-- since the inputs (scenicness signals, kernel outputs) are already
+-- coarse approximations. Saves ~50% on disk vs double precision.
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS cost_direct          real;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS reverse_cost_direct  real;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS cost_vineyard_lover  real;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS reverse_cost_vineyard_lover real;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS cost_forest_lover    real;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS reverse_cost_forest_lover   real;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS cost_views           real;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS reverse_cost_views   real;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS cost_water           real;
+ALTER TABLE ways ADD COLUMN IF NOT EXISTS reverse_cost_water   real;
 ALTER TABLE ways ADD COLUMN IF NOT EXISTS wetland_local       real NOT NULL DEFAULT 0.0;
 -- V2 Phase A.3c: vineyard scenic signal — pleasant cultivated land,
 -- often in hilly wine country. Other agricultural classes (farmland,
@@ -190,3 +210,59 @@ CREATE INDEX IF NOT EXISTS landcover_geom_idx
     ON landcover USING gist(geom);
 CREATE INDEX IF NOT EXISTS landcover_class_idx ON landcover(class);
 CREATE INDEX IF NOT EXISTS landcover_country_idx ON landcover(country);
+
+
+-- V3 passenger rails: stations + lines for routing context and (later)
+-- multi-modal routing. Stations come from a national GTFS feed (only
+-- stops actually served by rail routes — definitive "active" list).
+-- Lines come from OSM `railway=rail|light_rail` with usage=main|branch,
+-- spatially filtered post-ingest to lines that pass within 200 m of
+-- any served station (drops freight-only mainlines).
+CREATE TABLE IF NOT EXISTS rail_stations (
+    id          bigserial PRIMARY KEY,
+    gtfs_id     text NOT NULL,
+    name        text NOT NULL,
+    n_routes    integer NOT NULL DEFAULT 0,   -- distinct rail routes serving the stop
+    country     text NOT NULL,
+    geom        geometry(Point, 4326) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rail_stations_geom_idx
+    ON rail_stations USING gist(geom);
+CREATE INDEX IF NOT EXISTS rail_stations_country_idx
+    ON rail_stations(country);
+CREATE UNIQUE INDEX IF NOT EXISTS rail_stations_country_gtfs_idx
+    ON rail_stations(country, gtfs_id);
+
+CREATE TABLE IF NOT EXISTS rail_lines (
+    id          bigserial PRIMARY KEY,
+    osm_id      bigint NOT NULL,
+    name        text,
+    operator    text,
+    usage       text,
+    electrified text,
+    country     text NOT NULL,
+    geom        geometry(LineString, 4326) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rail_lines_geom_idx
+    ON rail_lines USING gist(geom);
+CREATE INDEX IF NOT EXISTS rail_lines_country_idx
+    ON rail_lines(country);
+
+
+-- V3 lodging POIs (subset of `pois.sqlite` materialized for fast
+-- spatial joins from postgres — e.g. "does this rail station have a
+-- hotel within 3 km?"). Holds all `tourism in (hotel, guest_house,
+-- hostel, motel, camp_site, wilderness_hut)` points. Idempotent per
+-- country.
+CREATE TABLE IF NOT EXISTS lodging (
+    id        bigserial PRIMARY KEY,
+    osm_id    text,
+    name      text,
+    subtype   text NOT NULL,
+    country   text,
+    geom      geometry(Point, 4326) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS lodging_geom_idx
+    ON lodging USING gist(geom);
+CREATE INDEX IF NOT EXISTS lodging_subtype_idx ON lodging(subtype);
+CREATE INDEX IF NOT EXISTS lodging_country_idx ON lodging(country);

@@ -55,6 +55,10 @@ import ingest_dem
 import ingest_landcover
 import ingest_coastline
 import ingest_waterways
+import ingest_railways
+import ingest_lodging
+import download_gtfs
+import route_city_pairs
 import compute_canopy_frac
 import compute_canopy_frac_raster
 from scenicness import bake as scenicness_bake
@@ -136,6 +140,205 @@ def cmd_coastline_ingest(args) -> None:
     with psycopg.connect(config.PG_DSN) as conn:
         ingest_coastline.ingest(conn)
     print("[main] coastline-ingest done")
+
+
+def cmd_gtfs_download(args) -> None:
+    """Download national GTFS feeds for the railway ingest."""
+    countries = [c.strip() for c in args.countries.split(",") if c.strip()]
+    force = bool(getattr(args, "force", False))
+    for c in countries:
+        download_gtfs.download(c, force=force)
+
+
+def cmd_railway_ingest(args) -> None:
+    """GTFS stations + OSM lines + spatial filter → rail_stations / rail_lines.
+
+    Per-country, idempotent. Requires the GTFS zip in `data/gtfs/` and
+    the country PBF in `data/osm/`. Run `gtfs-download` first.
+    """
+    countries = [c.strip() for c in args.countries.split(",") if c.strip()]
+    print(f"[main] railway-ingest countries={countries}")
+    with psycopg.connect(config.PG_DSN) as conn:
+        for c in countries:
+            gtfs_zip = download_gtfs.feed_path(c)
+            if not gtfs_zip.exists():
+                raise SystemExit(
+                    f"missing GTFS zip for {c}: {gtfs_zip}. "
+                    f"Run gtfs-download first."
+                )
+            pbf = config.OSM_DIR / f"{c}-latest.osm.pbf"
+            if not pbf.exists():
+                raise SystemExit(f"missing PBF for {c}: {pbf}")
+            ingest_railways.ingest(conn, c, gtfs_zip, pbf)
+    print("[main] railway-ingest done")
+
+
+def cmd_route_city_pairs(args) -> None:
+    """Pre-compute all 15 city-pair routes for ONE cost profile against
+    the currently-loaded ways.cost column.
+
+    Appends one Feature per pair to <out> (creates the file or merges
+    into an existing FeatureCollection). The outer pipeline calls
+    `recompute-cost --profile X` before each invocation to refresh
+    ways.cost for that profile.
+    """
+    import json
+    from cost import _PROFILES
+    profile = args.profile or "direct"
+    if profile == "lht":
+        profile = "direct"
+    if profile not in _PROFILES:
+        raise SystemExit(f"unknown profile {profile!r}; have {sorted(_PROFILES)}")
+    out_path = Path(args.out) if args.out else (
+        config.DATA_DIR / "web_overlays" / "city_routes.geojson"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Optional pair filter, e.g. "INN-WIE" or "INN-WIE,SAL-LIN" — useful
+    # for smoke-testing on the historically OOM-prone Innsbruck-Vienna
+    # pair before committing to all 15.
+    if args.pairs:
+        wanted = set()
+        for token in args.pairs.split(","):
+            a, b = token.strip().split("-")
+            wanted.add(frozenset({a.upper(), b.upper()}))
+        pairs = [(a, b) for (a, b) in route_city_pairs.all_pairs()
+                 if frozenset({a, b}) in wanted]
+    else:
+        pairs = None  # all 15
+    corridor_m = float(args.corridor_m) if args.corridor_m else None
+    kwargs = {"corridor_m": corridor_m} if corridor_m is not None else {}
+    print(f"[main] route-city-pairs profile={profile} "
+          f"pairs={[(a,b) for a,b in (pairs or route_city_pairs.all_pairs())]} "
+          f"corridor_m={corridor_m}")
+    with psycopg.connect(config.PG_DSN) as conn:
+        results = route_city_pairs.route_all_pairs(conn, profile, pairs=pairs, **kwargs)
+    # Read-modify-write: append features to existing FeatureCollection.
+    if out_path.exists():
+        fc = json.loads(out_path.read_text())
+        features = fc.get("features", [])
+    else:
+        features = []
+    # Drop any prior features for the (a,b,profile) tuples we just ran
+    # so re-runs replace rather than duplicate.
+    redo_keys = {(r.a, r.b, r.profile) for r in results}
+    features = [
+        f for f in features
+        if (f["properties"].get("a"),
+            f["properties"].get("b"),
+            f["properties"].get("profile")) not in redo_keys
+    ]
+    for r in results:
+        features.append({
+            "type": "Feature",
+            "geometry": json.loads(r.geom_geojson),
+            "properties": {
+                "a": r.a, "b": r.b, "profile": r.profile,
+                "length_km": r.length_km, "cost": r.cost,
+                "n_edges": r.n_edges,
+            },
+        })
+    out_path.write_text(json.dumps({
+        "type": "FeatureCollection", "features": features,
+    }))
+    print(f"[main] route-city-pairs wrote {len(results)} routes → {out_path} "
+          f"(file now contains {len(features)} features total)")
+
+
+def cmd_lodging_ingest(args) -> None:
+    """Materialize lodging POIs from pois.sqlite into postgres."""
+    countries = [c.strip() for c in args.countries.split(",") if c.strip()]
+    print(f"[main] lodging-ingest countries={countries}")
+    with psycopg.connect(config.PG_DSN) as conn:
+        ingest_lodging.ingest(conn, countries=countries)
+    print("[main] lodging-ingest done")
+
+
+def cmd_export_rails(args) -> None:
+    """Dump rail_stations + rail_lines for one or more countries into
+    GeoJSON files for the web overlay.
+
+    Stations are filtered to those with at least one lodging point
+    (hotel / guest_house / hostel / motel) within `--lodging-radius-m`
+    of the station (default 3000 m). Pass `--lodging-radius-m 0` to
+    disable the filter entirely.
+
+    Output: <data-dir>/rail_stations.geojson, rail_lines.geojson
+    """
+    import json
+    countries = [c.strip() for c in args.countries.split(",") if c.strip()]
+    out_dir = Path(args.out) if args.out else (config.DATA_DIR / "web_overlays")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stations_path = out_dir / "rail_stations.geojson"
+    lines_path = out_dir / "rail_lines.geojson"
+    lodging_radius_m = float(args.lodging_radius_m) if args.lodging_radius_m else 3000.0
+    # The "real" lodging types for the daily-meet use case — campsites
+    # and wilderness huts are excluded from the station-filter signal.
+    lodging_subtypes = ("hotel", "guest_house", "hostel", "motel")
+    print(f"[main] export-rails countries={countries} → {out_dir} "
+          f"lodging_radius_m={lodging_radius_m:.0f}")
+    with psycopg.connect(config.PG_DSN) as conn, conn.cursor() as cur:
+        # Stations + lodging count via LATERAL spatial join.
+        if lodging_radius_m > 0:
+            cur.execute(
+                "SELECT s.gtfs_id, s.name, s.n_routes, s.country, "
+                "       ST_X(s.geom), ST_Y(s.geom), nl.n_lodging "
+                "FROM rail_stations s "
+                "JOIN LATERAL (SELECT COUNT(*) AS n_lodging FROM lodging l "
+                "  WHERE l.subtype = ANY(%s) "
+                "    AND ST_DWithin(l.geom::geography, s.geom::geography, %s)"
+                ") nl ON TRUE "
+                "WHERE s.country = ANY(%s) AND nl.n_lodging >= 1 "
+                "ORDER BY s.n_routes DESC",
+                (list(lodging_subtypes), lodging_radius_m, countries),
+            )
+        else:
+            cur.execute(
+                "SELECT gtfs_id, name, n_routes, country, "
+                "       ST_X(geom), ST_Y(geom), 0 "
+                "FROM rail_stations WHERE country = ANY(%s) "
+                "ORDER BY n_routes DESC",
+                (countries,),
+            )
+        stations_features = [
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": {
+                    "gtfs_id": gtfs_id, "name": name,
+                    "n_routes": n_routes, "country": country,
+                    "n_lodging": int(n_lodging),
+                },
+            }
+            for gtfs_id, name, n_routes, country, lon, lat, n_lodging in cur
+        ]
+        # Lines
+        cur.execute(
+            "SELECT osm_id, name, operator, usage, electrified, country, "
+            "       ST_AsGeoJSON(geom) "
+            "FROM rail_lines WHERE country = ANY(%s)",
+            (countries,),
+        )
+        lines_features = [
+            {
+                "type": "Feature",
+                "geometry": json.loads(geom_json),
+                "properties": {
+                    "osm_id": osm_id, "name": name,
+                    "operator": operator, "usage": usage,
+                    "electrified": electrified, "country": country,
+                },
+            }
+            for osm_id, name, operator, usage, electrified, country, geom_json in cur
+        ]
+    stations_path.write_text(json.dumps({
+        "type": "FeatureCollection", "features": stations_features,
+    }))
+    lines_path.write_text(json.dumps({
+        "type": "FeatureCollection", "features": lines_features,
+    }))
+    print(f"[main] wrote {len(stations_features):,} stations → "
+          f"{stations_path}")
+    print(f"[main] wrote {len(lines_features):,} lines → {lines_path}")
 
 
 def cmd_waterway_ingest(args) -> None:
@@ -422,6 +625,11 @@ def main() -> None:
         ("landcover-ingest", cmd_landcover_ingest),
         ("coastline-ingest", cmd_coastline_ingest),
         ("waterway-ingest", cmd_waterway_ingest),
+        ("gtfs-download", cmd_gtfs_download),
+        ("railway-ingest", cmd_railway_ingest),
+        ("lodging-ingest", cmd_lodging_ingest),
+        ("export-rails", cmd_export_rails),
+        ("route-city-pairs", cmd_route_city_pairs),
         ("canopy-compute", cmd_canopy_compute),
         ("canopy-compute-raster", cmd_canopy_compute_raster),
         ("scenicness-bake", cmd_scenicness_bake),
@@ -470,6 +678,18 @@ def main() -> None:
         sp.add_argument("--tile-size-deg", default=None,
             help="scenicness-bake: tile size in degrees (default 1.0). "
                  "Lower values reduce per-tile memory at higher tile-count cost.")
+        sp.add_argument("--force", action="store_true",
+            help="gtfs-download: redownload even if the local zip exists.")
+        sp.add_argument("--lodging-radius-m", default=None,
+            help="export-rails: only include stations with ≥1 lodging POI "
+                 "(hotel / guest_house / hostel / motel) within this many "
+                 "meters (default 3000). 0 disables the filter.")
+        sp.add_argument("--pairs", default=None,
+            help="route-city-pairs: comma-separated pair list "
+                 "(e.g. 'INN-WIE,GRA-KLA'). Default = all 15.")
+        sp.add_argument("--corridor-m", default=None,
+            help="route-city-pairs: half-width of the line-buffer "
+                 "corridor in meters (default 30000).")
         sp.set_defaults(func=func)
 
     args = p.parse_args()
