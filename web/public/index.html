@@ -38,7 +38,7 @@
           <button id="route-btn" disabled>Route</button>
           <button id="clear-btn">Clear</button>
         </div>
-        <p class="hint">Routing runs all 5 profiles in parallel and overlays the result. Profiles: <span style="color:#888">direct</span>, <span style="color:#7a3380">vineyard lover</span>, <span style="color:#1f7a3a">forest lover</span>, <span style="color:#d4623a">views</span>, <span style="color:#2a6dc4">water</span>.</p>
+        <p class="hint">Routing runs all profiles in parallel and overlays the result. Profiles: <span style="color:#888">direct</span>, <span style="color:#d4623a">views</span>.</p>
       </section>
 
       <section id="layers">
@@ -51,25 +51,12 @@
         <p class="hint">POIs load while you pan / zoom (max 500 in view).</p>
       </section>
 
-      <section id="cells-section">
-        <h2>Cells &amp; gradients</h2>
-        <label class="checkbox"><input type="checkbox" id="show-anchors" />Show city anchors</label>
-        <div class="row">
-          <label>SPT max cost (km)
-            <input type="number" id="max-cost-km" min="1" max="100" step="1" value="15" />
-          </label>
-        </div>
-        <p class="hint">Click an anchor to overlay its <em>SPT</em> — every reachable road edge within the cost limit, colored by cost-from-anchor. Lower = sharper + faster; higher (up to 100 km cap) = more reach but laggier. Click again to clear.</p>
-      </section>
-
       <section id="biome-section">
         <h2>Map overlays</h2>
         <label class="checkbox"><input type="checkbox" id="show-biome" />Biome / ecoregion (Resolve 2017)</label>
         <label class="checkbox"><input type="checkbox" id="show-rail-lines" />Passenger rail: lines (OSM track geometry, filtered to served by GTFS)</label>
         <label class="checkbox"><input type="checkbox" id="show-rail-stations" />Passenger rail: stations (GTFS-served only)</label>
         <label class="checkbox"><input type="checkbox" id="show-hillshade" />Terrain hillshade (AWS Open Data, terrarium-encoded)</label>
-        <label class="checkbox"><input type="checkbox" id="show-coverage-gap" />Coverage gap: roads &gt; 15 km from any anchor (paired-SPT dead zone)</label>
-        <label class="checkbox"><input type="checkbox" id="show-promoted-corridor" />Corridor village candidates (proposed new anchors on primary/trunk/motorway)</label>
         <label class="checkbox"><input type="checkbox" id="show-way-graph-edges" />Way-graph edges (Voronoi adjacency on trunk + primary)</label>
         <label class="checkbox"><input type="checkbox" id="show-way-graph-nodes" />Way-graph anchors (cities + towns + villages on the road set)</label>
         <label class="checkbox"><input type="checkbox" id="show-way-graph-polygons" />SPT polygons (1.5-hop hull ∪ 5 km disc) <span id="spt-status-badge" class="hint" style="margin-left:0.5em;"></span></label>
@@ -84,7 +71,7 @@
             <option value="2000000">2M (all)</option>
           </select>
         </label>
-        <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name. Coverage gap: red lines mark road edges where both endpoints are beyond a 15 km buffer around any anchor — paired-SPT routing approximates poorly here and gets pushed into detours. Use this to spot where new corridor anchors would most help. Way-graph: experimental chain backbone built from highway topology — each line connects two anchors with no third anchor between them along the trunk/primary corridor; colour = corridor distance (green&lt;10 km → red&gt;100 km). Lines pass through every kink the actual road makes.</p>
+        <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name. Way-graph: experimental chain backbone built from highway topology — each line connects two anchors with no third anchor between them along the trunk/primary corridor; colour = corridor distance (green&lt;10 km → red&gt;100 km). Lines pass through every kink the actual road makes.</p>
       </section>
 
       <section id="scenicness-section">

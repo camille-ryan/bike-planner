@@ -3,22 +3,11 @@
 
 const API = "/api";
 
-// V3 multi-profile routing: every Route click fires one request per
-// profile in parallel; the map renders all 5 result lines colored by
-// profile. Color set matches the bake-time / city-routes palette so
-// the UI stays visually consistent across the codebase.
-const PROFILES = ["direct", "vineyard_lover", "forest_lover", "views", "water"];
+const PROFILES = ["direct", "views"];
 const PROFILE_COLORS = {
-  direct:         "#888888",
-  vineyard_lover: "#7a3380",
-  forest_lover:   "#1f7a3a",
-  views:          "#d4623a",
-  water:          "#2a6dc4",
+  direct: "#888888",
+  views:  "#d4623a",
 };
-// Fixed profile used for non-routing UI bits (SPT cell visualization,
-// anchor availability check). `direct` is the broadest, most-populated
-// profile; using a single profile here avoids re-introducing a dropdown.
-const UI_PROFILE = "direct";
 
 // --- map setup ---------------------------------------------------------
 
@@ -59,19 +48,16 @@ map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "
 const state = {
   // Each waypoint: { role: 'start'|'mid'|'end', coord: [lon, lat]|null,
   //                  input: HTMLInputElement, row: HTMLElement }
-  // The chainless SPT engine routes pairwise; midpoints chain N legs.
+  // Routes pairwise; midpoints chain N legs.
   waypoints: [],
   pickArmed: null,    // waypoint expecting next map click, or null
   // routesByProfile: { profile: GeoJSON Feature } — one merged
   // multi-leg route per profile. Cleared on Clear; populated by
-  // routeNow with the 5 parallel /trunk/route results.
+  // routeNow with the parallel /trunk/route results.
   routesByProfile: {},
   routeReqId: 0,      // increments per routeNow; stale responses are discarded
   poiMarkers: { viewpoint: [], lodging: [], food: [], bike_service: [], water: [] },
   waypointMarkers: [],
-  cities: null,
-  anchorMarkers: [],
-  shownCellIdx: null,
 };
 
 // --- map sources / layers (initialized once map loads) -----------------
@@ -93,44 +79,14 @@ map.on("load", () => {
     paint: {
       "line-color": [
         "match", ["get", "profile"],
-        "direct",         PROFILE_COLORS.direct,
-        "vineyard_lover", PROFILE_COLORS.vineyard_lover,
-        "forest_lover",   PROFILE_COLORS.forest_lover,
-        "views",          PROFILE_COLORS.views,
-        "water",          PROFILE_COLORS.water,
+        "direct", PROFILE_COLORS.direct,
+        "views",  PROFILE_COLORS.views,
         "#aaa",
       ],
       "line-width": 4,
       "line-opacity": 0.85,
     },
   });
-
-  map.addSource("cell-gradient", { type: "geojson", data: emptyFC() });
-  // SPT visualization: each non-seed vertex's edge to its parent_local,
-  // colored by cost-from-anchor. Lives below the route line so an
-  // active route stays readable on top.
-  map.addLayer({
-    id: "cell-gradient-lines",
-    type: "line",
-    source: "cell-gradient",
-    layout: { "line-cap": "butt", "line-join": "miter" },
-    paint: {
-      "line-width": [
-        "interpolate", ["linear"], ["zoom"],
-        6,  1,
-        10, 1.5,
-        13, 2.5,
-        16, 4,
-      ],
-      "line-color": [
-        "interpolate", ["linear"], ["get", "cost"],
-        0,       "#10b981",
-        50000,   "#facc15",
-        100000,  "#dc2626",
-      ],
-      "line-opacity": 0.7,
-    },
-  }, "routes-multi-line");
 });
 
 // --- helpers -----------------------------------------------------------
@@ -488,150 +444,6 @@ document.querySelectorAll('#layers input[type=checkbox]').forEach(c => {
   c.addEventListener("change", refreshPois);
 });
 
-// --- Anchors + SPT overlay ---------------------------------------------
-//
-// Anchor list comes from /live/cities (Postgres-backed). Click an
-// anchor to overlay /spt/cell/<idx> — the per-anchor SPT from the
-// chainless preprocess, colored by cost-from-anchor — and load that
-// anchor's amenities (POIs grouped by category) into the sidebar.
-
-async function loadCities() {
-  // Filter to anchors that have an npz on disk under UI_PROFILE.
-  // spts-multi writes all 5 profile npzs in lockstep, so a vertex
-  // having one means it has all five — a single-profile check is
-  // sufficient for "is this anchor routable yet".
-  const profile = UI_PROFILE;
-  try {
-    const r = await api("/live/cities", { profile });
-    state.cities = r.cities;
-    document.getElementById("show-anchors").disabled = false;
-    if (document.getElementById("show-anchors").checked) renderAnchors();
-  } catch (e) {
-    state.cities = null;
-    document.getElementById("show-anchors").checked = false;
-    document.getElementById("show-anchors").disabled = true;
-    clearAnchorMarkers();
-  }
-}
-
-function clearAnchorMarkers() {
-  state.anchorMarkers.forEach(m => m.remove());
-  state.anchorMarkers = [];
-}
-
-function renderAnchors() {
-  clearAnchorMarkers();
-  if (!state.cities) return;
-  for (const c of state.cities) {
-    const el = document.createElement("div");
-    const isCity = c.place === "city";
-    const size = isCity ? 12 : 8;
-    el.style.cssText = `width:${size}px;height:${size}px;border-radius:50%;background:#1d4ed8;border:1.5px solid white;box-shadow:0 0 2px rgba(0,0,0,0.4);cursor:pointer;`;
-    el.title = c.name;
-    el.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      toggleSpt(c.city_idx, c.name);
-    });
-    const m = new maplibregl.Marker({ element: el }).setLngLat([c.lon, c.lat]).addTo(map);
-    state.anchorMarkers.push(m);
-  }
-}
-
-async function toggleSpt(idx, name) {
-  if (state.shownCellIdx === idx) {
-    map.getSource("cell-gradient").setData(emptyFC());
-    state.shownCellIdx = null;
-    document.getElementById("results").innerHTML = "";
-    return;
-  }
-  setBusy(`Loading SPT for ${name}…`);
-  try {
-    const profile = UI_PROFILE;
-    // Default cost filter — sharp unsubsampled view of the ~15 km
-    // bike-cost vicinity. At 30 km Graz produces 78 MB / 528 K edges
-    // and MapLibre is laggy; 15 km is roughly a quarter of that and
-    // still shows the full local road network. Read from the input
-    // box so users can widen/narrow.
-    const maxCostInput = document.getElementById("max-cost-km");
-    const max_cost_km = Math.max(1, +maxCostInput?.value || 15);
-    const max_cost = max_cost_km * 1000;
-    // Fetch the SPT and the amenities in parallel — independent reads.
-    const [spt, amenities] = await Promise.all([
-      api(`/spt/cell/${idx}`, { profile, max_cost }),
-      api(`/spt/cell/${idx}/amenities`).catch(e => {
-        console.warn("amenities fetch failed", e);
-        return null;
-      }),
-    ]);
-    map.getSource("cell-gradient").setData(spt);
-    state.shownCellIdx = idx;
-    // Stretch the color ramp across the *shown* cost range, not the
-    // full-SPT range. Otherwise filtering to a small max_cost (say
-    // 15 km of a 100 km SPT) leaves every shown edge in the bottom
-    // 15% of the ramp — visually all green.
-    const lo = spt.shown_cost_min ?? spt.cost_min ?? 0;
-    const hi = spt.shown_cost_max ?? spt.cost_max ?? 100000;
-    const mid = lo + (hi - lo) / 2;
-    map.setPaintProperty("cell-gradient-lines", "line-color", [
-      "interpolate", ["linear"], ["get", "cost"],
-      lo,  "#10b981",
-      mid, "#facc15",
-      hi,  "#dc2626",
-    ]);
-    showSptInfo(name, spt, amenities);
-  } catch (e) {
-    setError(e.message);
-  }
-}
-
-function showSptInfo(name, spt, amenities) {
-  const lo = spt.cost_min, hi = spt.cost_max;
-  const km = (n) => (n / 1000).toFixed(1) + " km-equiv";
-  const filtered = spt.filtered_max_cost
-    ? `, filtered to <${(spt.filtered_max_cost/1000).toFixed(0)} km`
-    : "";
-  const renderMode = spt.subsampled
-    ? `subsampled (grid ~${(spt.grid_deg * 111).toFixed(2)} km)`
-    : "all kept edges";
-  let amenityHtml = "";
-  if (amenities && amenities.by_category) {
-    const cats = Object.entries(amenities.by_category);
-    if (cats.length > 0) {
-      amenityHtml = `
-        <div class="route-card">
-          <div class="name">${name}: amenities (${amenities.footprint})</div>
-          ${cats.map(([cat, info]) => `
-            <div class="stat"><span>${cat}</span><span>${info.count}</span></div>
-            <div class="hint" style="margin-top:-2px;font-size:10px;">${info.samples.slice(0, 4).map(s => s.name).join(" · ")}${info.count > 4 ? " …" : ""}</div>
-          `).join("")}
-        </div>`;
-    } else {
-      amenityHtml = `<div class="route-card"><div class="name">${name}: no POIs in footprint</div></div>`;
-    }
-  }
-  const showLo = spt.shown_cost_min ?? lo;
-  const showHi = spt.shown_cost_max ?? hi;
-  document.getElementById("results").innerHTML = `
-    <div class="route-card">
-      <div class="name">${name}: SPT${filtered}</div>
-      <div class="stat"><span>reachable nodes</span><span>${(spt.total_visited || 0).toLocaleString()}</span></div>
-      <div class="stat"><span>shown</span><span>${spt.features.length.toLocaleString()} edges (${renderMode})</span></div>
-      <div class="stat"><span>shown cost range</span><span>${km(showLo)} → ${km(showHi)}</span></div>
-      <div class="stat"><span>full SPT cost range</span><span>${lo == null ? "—" : km(lo) + " → " + km(hi)}</span></div>
-    </div>
-    ${amenityHtml}
-  `;
-}
-
-document.getElementById("show-anchors").addEventListener("change", (e) => {
-  if (e.target.checked) renderAnchors();
-  else {
-    clearAnchorMarkers();
-    map.getSource("cell-gradient").setData(emptyFC());
-    state.shownCellIdx = null;
-  }
-});
-
 // --- Biome overlay (Resolve 2017 ecoregions) ---------------------------
 //
 // Static GeoJSON at /data/ecoregions_europe.geojson — clipped to Europe
@@ -659,7 +471,7 @@ async function ensureBiomeLayers() {
         "fill-color": ["get", "COLOR_BIO"],
         "fill-opacity": 0.30,
       },
-    }, "cell-gradient-lines");
+    }, "routes-multi-line");
     map.addLayer({
       id: "ecoregions-outline",
       type: "line",
@@ -669,7 +481,7 @@ async function ensureBiomeLayers() {
         "line-width": 0.6,
         "line-opacity": 0.8,
       },
-    }, "cell-gradient-lines");
+    }, "routes-multi-line");
     map.on("click", "ecoregions-fill", (e) => {
       const f = e.features?.[0];
       if (!f) return;
@@ -864,118 +676,6 @@ function ensureHillshade() {
   if (map.getLayer("routes-multi-line")) map.moveLayer("routes-multi-line");
   hillshadeLoaded = true;
 }
-
-// --- Coverage gap overlay -------------------------------------------
-// Static GeoJSON at /data/web_overlays/coverage_gap.geojson produced
-// by `dump_coverage_gap.py`. Each feature is a road edge whose both
-// endpoints sit >15 km euclidean from every anchor — i.e., outside
-// the "comfortable" zone where paired-SPT routing is accurate.
-// Filtered to length_m ≥ 100 m so urban connector noise doesn't
-// drown the corridor patterns.
-
-let coverageGapLoaded = false;
-
-async function ensureCoverageGapLayer() {
-  if (coverageGapLoaded) return;
-  setBusy("Loading coverage gap…");
-  try {
-    const r = await fetch("/data/coverage_gap.geojson?ts=" + Date.now());
-    if (!r.ok) throw new Error(`coverage_gap: ${r.status}`);
-    const fc = await r.json();
-    map.addSource("coverage-gap", { type: "geojson", data: fc, tolerance: 0 });
-    map.addLayer({
-      id: "coverage-gap-line",
-      type: "line",
-      source: "coverage-gap",
-      paint: {
-        "line-color": "#dc2626",
-        "line-width": [
-          "interpolate", ["linear"], ["zoom"],
-          7,  0.6,
-          10, 1.2,
-          14, 2.0,
-        ],
-        "line-opacity": 0.65,
-      },
-    });
-    coverageGapLoaded = true;
-    document.getElementById("results").innerHTML = "";
-  } catch (e) {
-    setError(`coverage_gap load failed: ${e.message}`);
-    throw e;
-  }
-}
-
-document.getElementById("show-coverage-gap").addEventListener("change", async (e) => {
-  if (e.target.checked) {
-    try { await ensureCoverageGapLayer(); }
-    catch { e.target.checked = false; return; }
-    map.setLayoutProperty("coverage-gap-line", "visibility", "visible");
-  } else if (coverageGapLoaded) {
-    map.setLayoutProperty("coverage-gap-line", "visibility", "none");
-  }
-});
-
-// --- Promoted corridor villages overlay ------------------------------
-// Static GeoJSON at /data/promoted_villages_corridor.geojson produced
-// by promote_villages_corridor.py. Yellow dots = OSM place=village
-// candidates within 200 m of a primary/trunk/motorway road, 5 km
-// spaced. Visual sanity-check before committing to an INSERT + full
-// preprocess rebuild.
-
-let promotedCorridorLoaded = false;
-
-async function ensurePromotedCorridorLayer() {
-  if (promotedCorridorLoaded) return;
-  setBusy("Loading corridor village candidates…");
-  try {
-    const r = await fetch("/data/promoted_villages_corridor.geojson?ts=" + Date.now());
-    if (!r.ok) throw new Error(`promoted_villages_corridor: ${r.status}`);
-    const fc = await r.json();
-    map.addSource("promoted-corridor", { type: "geojson", data: fc });
-    map.addLayer({
-      id: "promoted-corridor-circles",
-      type: "circle",
-      source: "promoted-corridor",
-      paint: {
-        "circle-color": "#facc15",
-        "circle-radius": [
-          "interpolate", ["linear"], ["zoom"],
-          5,  3,
-          10, 5,
-          14, 8,
-        ],
-        "circle-stroke-color": "#000",
-        "circle-stroke-width": 1.2,
-        "circle-opacity": 0.9,
-      },
-    });
-    map.on("click", "promoted-corridor-circles", (e) => {
-      const p = e.features[0].properties;
-      document.getElementById("results").innerHTML =
-        `<div class="route-card"><strong>${p.name}</strong>` +
-        `<div class="stat"><span>population</span><span>${p.population ?? "—"}</span></div>` +
-        `<div class="stat"><span>osm_id</span><span>${p.osm_id}</span></div></div>`;
-    });
-    map.on("mouseenter", "promoted-corridor-circles", () => map.getCanvas().style.cursor = "pointer");
-    map.on("mouseleave", "promoted-corridor-circles", () => map.getCanvas().style.cursor = "");
-    promotedCorridorLoaded = true;
-    document.getElementById("results").innerHTML = "";
-  } catch (e) {
-    setError(`promoted_villages_corridor load failed: ${e.message}`);
-    throw e;
-  }
-}
-
-document.getElementById("show-promoted-corridor").addEventListener("change", async (e) => {
-  if (e.target.checked) {
-    try { await ensurePromotedCorridorLayer(); }
-    catch { e.target.checked = false; return; }
-    map.setLayoutProperty("promoted-corridor-circles", "visibility", "visible");
-  } else if (promotedCorridorLoaded) {
-    map.setLayoutProperty("promoted-corridor-circles", "visibility", "none");
-  }
-});
 
 document.getElementById("show-hillshade").addEventListener("change", (e) => {
   if (e.target.checked) {
@@ -1468,6 +1168,5 @@ map.on("load", () => {
   ];
   refreshWaypointMarkers();
   updateRouteButton();
-  loadCities();
   initScenicnessOverlays();
 });
