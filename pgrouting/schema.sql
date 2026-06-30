@@ -1,17 +1,14 @@
 -- Schema for the pgRouting-backed bike graph.
 --
--- Chainless SPT preprocess: per-city multi-source Dijkstra from each
--- anchor's polygon, no global K=1 partition. Tables:
---
+-- Tables:
 --   ways_vertices_pgr  road graph vertices
 --   ways               directed edges with bike-cost weights
 --   anchors            place=city|town POIs + their OSM admin polygons
 --
--- compute_spts.py loads the graph into scipy CSR once, then runs a
--- bounded Dijkstra per anchor and writes <city_idx>.npz under
--- data/spt/<profile>/spt/. No `visited` or `city_adjacency` SQL tables
--- — adjacency is derived post-hoc from SPT overlaps and stored as
--- city_graph.json next to the npz files.
+-- The V4 polygon-SPT pipeline lives outside this schema: edges are
+-- exported to per-cell .npz files via export_cells.py, polygon-bounded
+-- SPTs are built by compute_spts_polygon.py, and the trunk DB is
+-- assembled by build_polygon_paired_db.py.
 --
 -- Run idempotently: every CREATE has IF NOT EXISTS so re-running
 -- against an existing DB is a no-op for schema. Drop the tables

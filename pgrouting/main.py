@@ -8,11 +8,8 @@
   python3 main.py landcover-ingest   --countries austria
   python3 main.py canopy-compute
   python3 main.py recompute-cost
-  python3 main.py spts               --profile lht
-  python3 main.py paired             --profile lht
-  python3 main.py all                --countries austria --profile lht
 
-Subcommands (run order):
+Subcommands:
   ingest            stream OSM PBFs into Postgres ways + ways_vertices_pgr
                     (V2: also persists raw OSM tags + per-edge curvature)
   snap              load anchors from pois.sqlite, snap to nearest graph vertex
@@ -29,19 +26,12 @@ Subcommands (run order):
   recompute-cost    re-apply bike_edge_cost over every edge with grade_pct +
                     curvature + canopy_frac; writes cost / reverse_cost
                     in place
-  spts              per-anchor 30 km multi-source Dijkstra → SPT npzs;
-                    also writes road_topology/<id>.npz (lon/lat per vertex,
-                    shared across profiles) and city_graph.json (with ferry
-                    chain edges added for long sea/lake crossings)
-  paired            pruned paired SPTs as a SQLite trunk DB plus optional
-                    per-pair npzs (for trace-level inspection)
-  all               ingest → snap → boundaries → dem-download → dem-ingest →
-                    landcover-ingest → canopy-compute → recompute-cost →
-                    spts → paired
 
-`profile` is the output-directory name. cost.py is currently the only
-profile but the pipeline is structured to support more (topology stays
-shared; SPT and trunk DB are per-profile).
+The polygon-SPT pipeline (V4) is driven separately via export_cells.py,
+compute_anchor_spt_polygons.py, compute_spts_polygon.py,
+adapt_polygon_to_paired.py, and build_polygon_paired_db.py.
+
+`profile` is the output-directory name.
 """
 import argparse
 from pathlib import Path
@@ -67,7 +57,6 @@ from scenicness import tiles as scenicness_tiles
 import compare_canopy
 import reannotate_canopy_km
 import snap_anchors
-import compute_spts
 import download_dem
 import recompute_cost
 import export_route_compare
@@ -616,72 +605,6 @@ def _parse_bbox(arg: str | None) -> tuple[float, float, float, float] | None:
     return parts  # type: ignore[return-value]
 
 
-def cmd_spts(args) -> None:
-    out_dir = config.SPT_DIR / args.profile
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[main] spts profile={args.profile} -> {out_dir}")
-    with psycopg.connect(config.PG_DSN) as conn:
-        compute_spts.run(conn, out_dir)
-    print("[main] spts done")
-
-
-def cmd_spts_multi(args) -> None:
-    """Multi-profile per-anchor backward SPTs over a shared CSR.
-
-    V3 replacement for cmd_spts. Loads the global edge graph once into
-    an in-memory transposed CSR with all profile cost columns attached,
-    then dispatches (anchor × profile) dijkstras against it. See
-    compute_spts_multi.py module docstring for design notes.
-    """
-    import compute_spts_multi
-
-    profiles = (
-        tuple(s.strip() for s in args.profiles.split(","))
-        if args.profiles else compute_spts_multi.PROFILES
-    )
-    cache_path = Path(args.cache_path) if args.cache_path else None
-    compute_spts_multi.run(
-        profiles=profiles,
-        anchor_filter=args.anchor,
-        max_radius_m=float(args.max_radius_m) if args.max_radius_m else
-            compute_spts_multi.SPT_RADIUS_M_DEFAULT,
-        force=args.force,
-        cache_path=cache_path,
-        force_cache=args.force_cache,
-    )
-
-
-def cmd_paired(args) -> None:
-    """Build pruned paired SPTs corridor-wide, output a trunk DB.
-
-    The build script reads chain pairs from city_graph.json (now
-    ferry-augmented), and writes:
-      data/spt/<profile>/paired_trunks.db   (SQLite, indexed)
-      data/spt/<profile>/paired/{a}_{b}.npz (optional, per-pair, if --keep-npzs)
-    """
-    import build_paired_corridor
-    out_dir = config.SPT_DIR / args.profile
-    print(f"[main] paired profile={args.profile} -> {out_dir}")
-    build_paired_corridor.run(
-        out_dir, polyline=args.polyline, max_km=args.max_km,
-        prune=True, keep_npzs=args.keep_npzs,
-    )
-    print("[main] paired done")
-
-
-def cmd_all(args) -> None:
-    cmd_ingest(args)
-    cmd_snap(args)
-    cmd_boundaries(args)
-    cmd_dem_download(args)
-    cmd_dem_ingest(args)
-    cmd_landcover_ingest(args)
-    cmd_canopy_compute(args)
-    cmd_recompute_cost(args)
-    cmd_spts(args)
-    cmd_paired(args)
-
-
 def main() -> None:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -709,20 +632,10 @@ def main() -> None:
         ("reannotate-canopy-km", cmd_reannotate_canopy_km),
         ("recompute-cost", cmd_recompute_cost),
         ("export-route-compare", cmd_export_route_compare),
-        ("spts", cmd_spts),
-        ("spts-multi", cmd_spts_multi),
-        ("paired", cmd_paired),
-        ("all", cmd_all),
     ):
         sp = sub.add_parser(name)
         sp.add_argument("--profile",   default="lht")
         sp.add_argument("--countries", default="austria")
-        sp.add_argument("--polyline",  default=None,
-            help="lon,lat,lon,lat,... — corridor polyline. paired-only.")
-        sp.add_argument("--max-km",    type=float, default=80.0,
-            help="Anchor inclusion radius around polyline. paired-only.")
-        sp.add_argument("--keep-npzs", action="store_true",
-            help="Also write per-pair npzs alongside the trunk DB. paired-only.")
         sp.add_argument("--bbox", default=None,
             help="min_lon,min_lat,max_lon,max_lat — bbox-restrict canopy-compute "
                  "and recompute-cost (validation runs).")
@@ -766,20 +679,6 @@ def main() -> None:
         sp.add_argument("--corridor-m", default=None,
             help="route-city-pairs: half-width of the line-buffer "
                  "corridor in meters (default 30000).")
-        sp.add_argument("--anchor", default=None,
-            help="spts-multi: anchor name ILIKE substring "
-                 "(default: all anchors).")
-        sp.add_argument("--profiles", default=None,
-            help="spts-multi: comma-separated profile names "
-                 "(default: all 5 V3 profiles). NOTE: --profile (singular) "
-                 "is unused by spts-multi; use this plural form instead.")
-        sp.add_argument("--max-radius-m", default=None,
-            help="spts-multi: per-anchor SPT GEOGRAPHIC radius in meters "
-                 "(default 30000). Spatial slice via postgres ST_DWithin.")
-        sp.add_argument("--cache-path", default=None,
-            help="spts-multi: override the global graph cache path.")
-        sp.add_argument("--force-cache", action="store_true",
-            help="spts-multi: rebuild the global graph cache.")
         sp.set_defaults(func=func)
 
     args = p.parse_args()

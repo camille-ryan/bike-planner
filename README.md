@@ -97,40 +97,35 @@ docker compose exec -u postgres postgres psql -U bike -d bike \
 ### Run the preprocess
 
 Smoke (Austria):
-```sh
-docker compose --profile preprocess run --rm pgrouting all --countries austria
-```
-
-Full corridor:
-```sh
-docker compose --profile preprocess run --rm pgrouting all \
-    --countries austria,czech-republic,germany,denmark
-```
-
 Subcommands (run independently):
 ```sh
-docker compose --profile preprocess run --rm pgrouting ingest --countries austria
-docker compose --profile preprocess run --rm pgrouting snap   --countries austria
-docker compose --profile preprocess run --rm pgrouting spts   --profile lht
+docker compose --profile preprocess run --rm pgrouting ingest         --countries austria
+docker compose --profile preprocess run --rm pgrouting snap           --countries austria
+docker compose --profile preprocess run --rm pgrouting recompute-cost --profile views
+```
+
+The V4 polygon-SPT pipeline runs outside `main.py`:
+```
+export_cells.py                  edges → per-1°-cell .npz files
+compute_anchor_spt_polygons.py   1.5-hop hull + 5 km discs per anchor
+compute_spts_polygon.py          polygon-bounded multi-source Dijkstras
+adapt_polygon_to_paired.py       cities.json + city_graph.json
+build_polygon_paired_db.py       SQLite trunk DB consumed by the API
 ```
 
 Output lands at `data/spt/<profile>/`:
 ```
-cities.json         anchor list (city_idx, name, lon, lat, snap_vertex_id, ...)
-city_graph.json     (from_city, to_city, weight) adjacency
-spt/<idx>.npz       per-city SPT: node_global, parent_local, cost
+cities.json         anchor list (city_idx, name, lon, lat, snap_vids, ...)
+city_graph.json     (from_city, to_city, weight, geom) adjacency
+<idx>.npz           per-anchor polygon SPT: node_global, parent, cost, coords_lonlat
+paired_trunks.db    SQLite trunk DB consumed by /trunk/route
 ```
-
-The pgrouting pipeline does **not** currently emit `graph_nodes.npz`,
-`global_assignment.npz`, or `cells.geojson` — the API consumer side
-is being rewritten to query Postgres directly instead of reading those
-legacy artifacts.
 
 ---
 
 ## Phase 3 — FastAPI service
 
-A small Python service that serves SPT routes and POI lookups.
+A small Python service that serves bike routes and POI lookups.
 
 ```sh
 docker compose up -d api
@@ -148,23 +143,20 @@ curl http://localhost:8001/health
 # {"status":"ok"}
 ```
 
-#### `GET /spt/route?from=lon,lat&to=lon,lat&profile=lht`
+#### `GET /trunk/route?from=lon,lat&to=lon,lat&profile=views`
 
-SPT-based routing — sub-second on any distance once preprocess has run.
-Snaps endpoints to the road graph, plans a city sequence on the city
-graph, walks per-city SPT parent pointers to assemble the path.
+Paired-trunk routing — hot-path ~25 ms. Snaps endpoints to the nearest
+anchor pair, looks up the precomputed trunk path from the SQLite
+trunk DB, and stitches in first/last-mile straight segments.
 
-> **Note:** the underlying loader is being rewritten to read from
-> Postgres rather than the legacy npz artifacts; this endpoint is
-> in-flight until the pgrouting preprocess settles.
+#### `GET /way-graph/spt/{city_idx}?profile=direct_polygon`
 
-#### `GET /cells/cities?profile=lht`
+Per-anchor polygon-bounded SPT for visualization in the UI.
 
-List the anchors with precomputed cells.
+#### `GET /way-graph/spt-status?profile=direct_polygon`
 
-#### `GET /cells/{city_idx}?profile=lht`
-
-Voronoi cell polygon for a given anchor, plus its neighbor list.
+Which anchor SPTs have been written so far — lets the UI light up
+anchors as the overnight build progresses.
 
 #### `GET /pois?bbox=minlon,minlat,maxlon,maxlat&category=lodging,food&limit=500`
 
@@ -188,8 +180,6 @@ docker compose up -d --build
 Open `http://localhost:8080` (or via Tailscale,
 `http://desktop-nk6flc3.tail9115a7.ts.net:8080`).
 
-The UI's BRouter "Engine" path is dead code pending cleanup — only the
-SPT engine reflects the current backend.
 
 ---
 
@@ -208,25 +198,28 @@ bike/
 │   ├── extract_pois.py    # osmium tags-filter wrapper
 │   ├── build_db.py        # PBF → GeoJSON-Seq → SpatiaLite
 │   └── main.py
-├── pgrouting/             # Phase 2 — SQL-backed SPT preprocess
+├── pgrouting/             # Phase 2 — SQL-backed preprocess
 │   ├── Dockerfile
-│   ├── schema.sql         # ways, ways_vertices_pgr, anchors, visited, city_adjacency
+│   ├── schema.sql         # ways, ways_vertices_pgr, anchors
 │   ├── cost.py            # per-edge bike cost function (port of lht.brf semantics)
 │   ├── ingest_pbf.py      # streaming PBF -> Postgres staging tables
 │   ├── snap_anchors.py    # SpatiaLite anchors -> Postgres + KNN snap
-│   ├── compute_spts.py    # multi-source Bellman-Ford waves + per-city dump
+│   ├── export_cells.py    # ways -> per-1°-cell .npz files
+│   ├── compute_anchor_spt_polygons.py
+│   ├── compute_spts_polygon.py    # polygon-bounded multi-source Dijkstra
+│   ├── adapt_polygon_to_paired.py
+│   ├── build_polygon_paired_db.py # SQLite trunk DB
 │   ├── config.py
-│   └── main.py            # subcommands: ingest, snap, spts, all
+│   └── main.py            # ingest, snap, dem-*, landcover-*, recompute-cost, …
 ├── api/                   # Phase 3 — FastAPI service
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── app/
-│       ├── main.py        # /health, /spt/route, /cells/*, /pois
+│       ├── main.py        # /health, /trunk/route, /way-graph/*, /pois
 │       ├── settings.py
 │       ├── geo.py
 │       ├── pois.py        # SpatiaLite POI lookups
-│       ├── cells_api.py   # legacy npz-format reader (rewrite pending)
-│       └── spt_router.py  # legacy npz-format reader (rewrite pending)
+│       └── trunk_router.py  # paired-trunk lookup
 ├── web/                   # Phase 4 — static SPA + nginx proxy
 └── data/                  # populated by ingest + preprocess (gitignored)
     ├── osm/      *.osm.pbf
