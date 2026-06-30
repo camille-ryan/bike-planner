@@ -3,9 +3,22 @@
 
 const API = "/api";
 
-// Default route on app load.
-const DEFAULT_START = [15.4395, 47.0707];   // Graz
-const DEFAULT_END   = [12.5683, 55.6761];   // København
+// V3 multi-profile routing: every Route click fires one request per
+// profile in parallel; the map renders all 5 result lines colored by
+// profile. Color set matches the bake-time / city-routes palette so
+// the UI stays visually consistent across the codebase.
+const PROFILES = ["direct", "vineyard_lover", "forest_lover", "views", "water"];
+const PROFILE_COLORS = {
+  direct:         "#888888",
+  vineyard_lover: "#7a3380",
+  forest_lover:   "#1f7a3a",
+  views:          "#d4623a",
+  water:          "#2a6dc4",
+};
+// Fixed profile used for non-routing UI bits (SPT cell visualization,
+// anchor availability check). `direct` is the broadest, most-populated
+// profile; using a single profile here avoids re-introducing a dropdown.
+const UI_PROFILE = "direct";
 
 // --- map setup ---------------------------------------------------------
 
@@ -49,8 +62,10 @@ const state = {
   // The chainless SPT engine routes pairwise; midpoints chain N legs.
   waypoints: [],
   pickArmed: null,    // waypoint expecting next map click, or null
-  routes: [],         // merged GeoJSON Feature(s) from leg concat
-  activeIdx: 0,
+  // routesByProfile: { profile: GeoJSON Feature } — one merged
+  // multi-leg route per profile. Cleared on Clear; populated by
+  // routeNow with the 5 parallel /trunk/route results.
+  routesByProfile: {},
   routeReqId: 0,      // increments per routeNow; stale responses are discarded
   poiMarkers: { viewpoint: [], lodging: [], food: [], bike_service: [], water: [] },
   waypointMarkers: [],
@@ -68,14 +83,26 @@ map.on("load", () => {
   // multi-leg route look like a series of disjoint segments. The route
   // is at most ~10k points; the memory cost of keeping every vertex at
   // every zoom is negligible.
-  map.addSource("route-active", {
+  map.addSource("routes-multi", {
     type: "geojson", data: emptyFC(), tolerance: 0,
   });
   map.addLayer({
-    id: "route-active-line",
+    id: "routes-multi-line",
     type: "line",
-    source: "route-active",
-    paint: { "line-color": "#2c5", "line-width": 5, "line-opacity": 0.95 },
+    source: "routes-multi",
+    paint: {
+      "line-color": [
+        "match", ["get", "profile"],
+        "direct",         PROFILE_COLORS.direct,
+        "vineyard_lover", PROFILE_COLORS.vineyard_lover,
+        "forest_lover",   PROFILE_COLORS.forest_lover,
+        "views",          PROFILE_COLORS.views,
+        "water",          PROFILE_COLORS.water,
+        "#aaa",
+      ],
+      "line-width": 4,
+      "line-opacity": 0.85,
+    },
   });
 
   map.addSource("cell-gradient", { type: "geojson", data: emptyFC() });
@@ -103,7 +130,7 @@ map.on("load", () => {
       ],
       "line-opacity": 0.7,
     },
-  }, "route-active-line");
+  }, "routes-multi-line");
 });
 
 // --- helpers -----------------------------------------------------------
@@ -272,11 +299,10 @@ function clearAll() {
   }
   state.waypoints = state.waypoints.filter(w => w.role !== "mid");
   disarmPick();
-  state.routes = [];
-  state.activeIdx = 0;
+  state.routesByProfile = {};
   state.waypointMarkers.forEach(m => m.remove());
   state.waypointMarkers = [];
-  if (map.getSource("route-active")) map.getSource("route-active").setData(emptyFC());
+  if (map.getSource("routes-multi")) map.getSource("routes-multi").setData(emptyFC());
   document.getElementById("results").innerHTML = "";
   document.getElementById("elevation").innerHTML = "";
   updateRouteButton();
@@ -289,31 +315,42 @@ document.getElementById("route-btn").addEventListener("click", routeNow);
 async function routeNow() {
   const valid = state.waypoints.filter(w => w.coord);
   if (valid.length < 2) return;
-  const profile = document.getElementById("profile").value;
   const legCount = valid.length - 1;
-  // Bump the request id so any in-flight earlier routeNow (e.g. the
-  // ~10 s cold first-page-load default route) becomes stale and its
-  // late-arriving response is dropped instead of overwriting this one.
+  // Bump the request id so any in-flight earlier routeNow becomes
+  // stale and its late-arriving responses are dropped instead of
+  // overwriting this one.
   const myReqId = ++state.routeReqId;
-  setBusy(`Routing ${legCount} leg${legCount > 1 ? "s" : ""}…`);
-  try {
-    const legs = await Promise.all(
-      Array.from({ length: legCount }, (_, i) =>
-        api("/trunk/route", {
-          from: valid[i].coord.join(","),
-          to:   valid[i + 1].coord.join(","),
-          profile,
-        })
-      )
-    );
-    if (myReqId !== state.routeReqId) return;   // superseded
-    state.routes = [mergeLegs(legs.map(r => r.route))];
-    state.activeIdx = 0;
-    renderRoutes();
-  } catch (e) {
-    if (myReqId !== state.routeReqId) return;   // superseded
-    setError(e.message);
+  setBusy(`Routing ${legCount} leg${legCount > 1 ? "s" : ""} × ${PROFILES.length} profiles…`);
+
+  // Fire one multi-leg routing pipeline per profile in parallel.
+  // Per-profile failures (e.g. a degenerate route under one profile)
+  // are caught locally so the rest still render.
+  const results = await Promise.all(PROFILES.map(async (profile) => {
+    try {
+      const legs = await Promise.all(
+        Array.from({ length: legCount }, (_, i) =>
+          api("/trunk/route", {
+            from: valid[i].coord.join(","),
+            to:   valid[i + 1].coord.join(","),
+            profile,
+          })
+        )
+      );
+      const route = mergeLegs(legs.map(r => r.route));
+      route.properties = route.properties || {};
+      route.properties.profile = profile;
+      return { profile, route };
+    } catch (e) {
+      return { profile, error: e.message };
+    }
+  }));
+  if (myReqId !== state.routeReqId) return;   // superseded
+
+  state.routesByProfile = {};
+  for (const r of results) {
+    if (r.route) state.routesByProfile[r.profile] = r.route;
   }
+  renderRoutes(results);
 }
 
 function mergeLegs(legs) {
@@ -352,25 +389,44 @@ function mergeLegs(legs) {
   };
 }
 
-function renderRoutes() {
-  const active = state.routes[state.activeIdx];
-  map.getSource("route-active").setData({
+function renderRoutes(results) {
+  // results: [{profile, route?, error?}, …] in PROFILES order.
+  const features = PROFILES
+    .map(p => state.routesByProfile[p])
+    .filter(Boolean);
+  map.getSource("routes-multi").setData({
     type: "FeatureCollection",
-    features: active ? [active] : [],
+    features,
   });
 
-  if (active) {
-    const bbox = lineBbox(active.geometry.coordinates);
-    map.fitBounds(bbox, { padding: 60, maxZoom: 13 });
+  // Fit to the union bbox of every successful profile's geometry.
+  if (features.length > 0) {
+    let n = -90, s = 90, e = -180, w = 180;
+    for (const f of features) {
+      for (const c of f.geometry.coordinates) {
+        if (c[0] < w) w = c[0]; if (c[0] > e) e = c[0];
+        if (c[1] < s) s = c[1]; if (c[1] > n) n = c[1];
+      }
+    }
+    map.fitBounds([[w, s], [e, n]], { padding: 60, maxZoom: 13 });
   }
 
-  const html = state.routes.map((r) => {
-    const p = r.properties || {};
+  // One result card per profile. Border color = profile color so the
+  // sidebar reads like a legend of the map lines.
+  const html = (results || []).map((r) => {
+    const color = PROFILE_COLORS[r.profile] || "#888";
+    if (r.error) {
+      return `<div class="route-card" style="border-left:4px solid ${color}">` +
+        `<div class="name" style="color:${color}">${r.profile}</div>` +
+        `<div class="stat" style="color:#a52"><span>error</span><span>${r.error}</span></div>` +
+        `</div>`;
+    }
+    const p = r.route.properties || {};
     const km = fmtKm(+p.gross_length_m || 0);
     const cities = (p.chain_names || []).join(" → ");
     const nBridges = (p.bridges || []).length;
-    return `<div class="route-card active">
-      <div class="name">trunk route</div>
+    return `<div class="route-card" style="border-left:4px solid ${color}">
+      <div class="name" style="color:${color}">${r.profile}</div>
       <div class="stat"><span>distance</span><span>${km}</span></div>
       <div class="stat"><span>nodes</span><span>${(+p.vertex_count || 0).toLocaleString()}</span></div>
       ${nBridges ? `<div class="stat"><span>bridges</span><span>${nBridges}</span></div>` : ""}
@@ -440,10 +496,11 @@ document.querySelectorAll('#layers input[type=checkbox]').forEach(c => {
 // anchor's amenities (POIs grouped by category) into the sidebar.
 
 async function loadCities() {
-  // Filter to anchors that have an npz on disk for the active profile.
-  // While the chainless preprocess is mid-flight, this prevents the
-  // user from clicking anchors that aren't yet routable.
-  const profile = document.getElementById("profile").value;
+  // Filter to anchors that have an npz on disk under UI_PROFILE.
+  // spts-multi writes all 5 profile npzs in lockstep, so a vertex
+  // having one means it has all five — a single-profile check is
+  // sufficient for "is this anchor routable yet".
+  const profile = UI_PROFILE;
   try {
     const r = await api("/live/cities", { profile });
     state.cities = r.cities;
@@ -489,7 +546,7 @@ async function toggleSpt(idx, name) {
   }
   setBusy(`Loading SPT for ${name}…`);
   try {
-    const profile = document.getElementById("profile").value;
+    const profile = UI_PROFILE;
     // Default cost filter — sharp unsubsampled view of the ~15 km
     // bike-cost vicinity. At 30 km Graz produces 78 MB / 528 K edges
     // and MapLibre is laggy; 15 km is roughly a quarter of that and
@@ -651,100 +708,6 @@ document.getElementById("show-biome").addEventListener("change", async (e) => {
   }
 });
 
-// --- Land cover overlay (OSM landuse, AT/CZ/DE/DK) ---------------------
-//
-// Static GeoJSON at /data/landcover_corridor.geojson, ~26 MB / 75 K
-// polygons rolled up to 5 classes from OSM landuse + natural tags.
-// Coverage: only the four current corridor countries (Austria, Czech
-// Republic, Germany, Denmark). Adding new tour countries means
-// re-running ingest/build_landuse_overlay.py for those countries
-// and concatenating into the same file.
-
-const LANDCOVER_COLORS = {
-  forest:       "#1e6b3a",
-  agricultural: "#d4b366",
-  urban:        "#7a7a7a",
-  water:        "#3d6fa3",
-  wetland:      "#4a8a8a",
-};
-
-let landcoverLoaded = false;
-
-async function ensureLandcoverLayers() {
-  if (landcoverLoaded) return;
-  setBusy("Loading landcover (~26 MB)…");
-  try {
-    const r = await fetch("/data/landcover_corridor.geojson");
-    if (!r.ok) throw new Error(`landcover: ${r.status}`);
-    const fc = await r.json();
-    map.addSource("landcover", { type: "geojson", data: fc, tolerance: 0 });
-    map.addLayer({
-      id: "landcover-fill",
-      type: "fill",
-      source: "landcover",
-      paint: {
-        "fill-color": [
-          "match", ["get", "class"],
-          "forest",       LANDCOVER_COLORS.forest,
-          "agricultural", LANDCOVER_COLORS.agricultural,
-          "urban",        LANDCOVER_COLORS.urban,
-          "water",        LANDCOVER_COLORS.water,
-          "wetland",      LANDCOVER_COLORS.wetland,
-          "#666",
-        ],
-        "fill-opacity": 0.30,
-      },
-    }, "cell-gradient-lines");
-    // Outline layer on top of fill for ground-truth polygon alignment
-    // checks (so the scenicness raster overlays can be compared against
-    // crisp OSM polygon borders, not just a fuzzy fill).
-    map.addLayer({
-      id: "landcover-outline",
-      type: "line",
-      source: "landcover",
-      paint: {
-        "line-color": [
-          "match", ["get", "class"],
-          "forest",       LANDCOVER_COLORS.forest,
-          "agricultural", LANDCOVER_COLORS.agricultural,
-          "urban",        LANDCOVER_COLORS.urban,
-          "water",        LANDCOVER_COLORS.water,
-          "wetland",      LANDCOVER_COLORS.wetland,
-          "#999",
-        ],
-        "line-width": [
-          "interpolate", ["linear"], ["zoom"],
-          8,  0.5,
-          12, 1.0,
-          16, 2.0,
-        ],
-        "line-opacity": 0.95,
-      },
-    }, "cell-gradient-lines");
-    landcoverLoaded = true;
-    document.getElementById("results").innerHTML = "";
-  } catch (e) {
-    setError(`landcover load failed: ${e.message}`);
-    throw e;
-  }
-}
-
-document.getElementById("show-landcover").addEventListener("change", async (e) => {
-  if (e.target.checked) {
-    try {
-      await ensureLandcoverLayers();
-    } catch {
-      e.target.checked = false;
-      return;
-    }
-    map.setLayoutProperty("landcover-fill",    "visibility", "visible");
-    map.setLayoutProperty("landcover-outline", "visibility", "visible");
-  } else if (landcoverLoaded) {
-    map.setLayoutProperty("landcover-fill",    "visibility", "none");
-    map.setLayoutProperty("landcover-outline", "visibility", "none");
-  }
-});
-
 // --- Passenger rail overlays -------------------------------------------
 // Static GeoJSON at /data/rail_lines.geojson, /data/rail_stations.geojson,
 // produced by `export-rails`. Lines come from OSM track geometry,
@@ -866,66 +829,6 @@ _bindRailToggle("show-rail-lines",    ensureRailLinesLayer,    ["rail-lines-laye
 _bindRailToggle("show-rail-stations", ensureRailStationsLayer, ["rail-stations-circle", "rail-stations-label"]);
 
 
-// --- City-pair best routes (per profile) ------------------------------
-// Static GeoJSON at /data/city_routes.geojson, produced by
-// `route-city-pairs` for each of the 5 profiles. One feature per
-// (a, b, profile). Color by profile so the 5 variants per city pair
-// fan out visually; line-width thinned so overlapping segments don't
-// drown each other.
-const CITY_ROUTE_COLORS = {
-  direct:         "#888888",
-  vineyard_lover: "#7a3380",
-  forest_lover:   "#1f7a3a",
-  views:          "#d4623a",
-  water:          "#2a6dc4",
-};
-
-let cityRoutesLoaded = false;
-
-async function ensureCityRoutesLayer() {
-  if (cityRoutesLoaded) return;
-  setBusy("Loading city pair routes…");
-  try {
-    const r = await fetch("/data/city_routes.geojson?ts=" + Date.now());
-    if (!r.ok) throw new Error(`city_routes: ${r.status}`);
-    const fc = await r.json();
-    map.addSource("city-routes", { type: "geojson", data: fc, tolerance: 0 });
-    map.addLayer({
-      id: "city-routes-line",
-      type: "line",
-      source: "city-routes",
-      paint: {
-        "line-color": [
-          "match", ["get", "profile"],
-          "direct",         CITY_ROUTE_COLORS.direct,
-          "vineyard_lover", CITY_ROUTE_COLORS.vineyard_lover,
-          "forest_lover",   CITY_ROUTE_COLORS.forest_lover,
-          "views",          CITY_ROUTE_COLORS.views,
-          "water",          CITY_ROUTE_COLORS.water,
-          "#888888",
-        ],
-        "line-width": 3,
-        "line-opacity": 0.75,
-      },
-    });
-    map.on("click", "city-routes-line", (e) => {
-      const p = e.features[0].properties;
-      document.getElementById("results").innerHTML =
-        `<div class="route-card"><strong>${p.a} → ${p.b} — ${p.profile}</strong>` +
-        `<div class="stat">Length: ${Number(p.length_km).toFixed(1)} km</div>` +
-        `<div class="stat">Cost: ${Number(p.cost).toFixed(0)}</div>` +
-        `<div class="stat">Edges: ${p.n_edges}</div></div>`;
-    });
-    cityRoutesLoaded = true;
-    document.getElementById("results").innerHTML = "";
-  } catch (e) {
-    setError(`city_routes load failed: ${e.message}`);
-    throw e;
-  }
-}
-
-_bindRailToggle("show-city-routes", ensureCityRoutesLayer, ["city-routes-line"]);
-
 // --- Terrain hillshade overlay ---------------------------------------
 // Public DEM tiles from AWS Open Data, terrarium-encoded. MapLibre
 // renders shaded relief from the raster-dem source via the hillshade
@@ -957,12 +860,122 @@ function ensureHillshade() {
       "hillshade-accent-color": "#666",
     },
   });
-  // Keep route lines on top of the shading.
-  for (const id of ["graz-wien-no-canopy", "graz-wien-with-canopy"]) {
-    if (map.getLayer(id)) map.moveLayer(id);
-  }
+  // Keep the multi-profile route lines on top of the shading.
+  if (map.getLayer("routes-multi-line")) map.moveLayer("routes-multi-line");
   hillshadeLoaded = true;
 }
+
+// --- Coverage gap overlay -------------------------------------------
+// Static GeoJSON at /data/web_overlays/coverage_gap.geojson produced
+// by `dump_coverage_gap.py`. Each feature is a road edge whose both
+// endpoints sit >15 km euclidean from every anchor — i.e., outside
+// the "comfortable" zone where paired-SPT routing is accurate.
+// Filtered to length_m ≥ 100 m so urban connector noise doesn't
+// drown the corridor patterns.
+
+let coverageGapLoaded = false;
+
+async function ensureCoverageGapLayer() {
+  if (coverageGapLoaded) return;
+  setBusy("Loading coverage gap…");
+  try {
+    const r = await fetch("/data/coverage_gap.geojson?ts=" + Date.now());
+    if (!r.ok) throw new Error(`coverage_gap: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("coverage-gap", { type: "geojson", data: fc, tolerance: 0 });
+    map.addLayer({
+      id: "coverage-gap-line",
+      type: "line",
+      source: "coverage-gap",
+      paint: {
+        "line-color": "#dc2626",
+        "line-width": [
+          "interpolate", ["linear"], ["zoom"],
+          7,  0.6,
+          10, 1.2,
+          14, 2.0,
+        ],
+        "line-opacity": 0.65,
+      },
+    });
+    coverageGapLoaded = true;
+    document.getElementById("results").innerHTML = "";
+  } catch (e) {
+    setError(`coverage_gap load failed: ${e.message}`);
+    throw e;
+  }
+}
+
+document.getElementById("show-coverage-gap").addEventListener("change", async (e) => {
+  if (e.target.checked) {
+    try { await ensureCoverageGapLayer(); }
+    catch { e.target.checked = false; return; }
+    map.setLayoutProperty("coverage-gap-line", "visibility", "visible");
+  } else if (coverageGapLoaded) {
+    map.setLayoutProperty("coverage-gap-line", "visibility", "none");
+  }
+});
+
+// --- Promoted corridor villages overlay ------------------------------
+// Static GeoJSON at /data/promoted_villages_corridor.geojson produced
+// by promote_villages_corridor.py. Yellow dots = OSM place=village
+// candidates within 200 m of a primary/trunk/motorway road, 5 km
+// spaced. Visual sanity-check before committing to an INSERT + full
+// preprocess rebuild.
+
+let promotedCorridorLoaded = false;
+
+async function ensurePromotedCorridorLayer() {
+  if (promotedCorridorLoaded) return;
+  setBusy("Loading corridor village candidates…");
+  try {
+    const r = await fetch("/data/promoted_villages_corridor.geojson?ts=" + Date.now());
+    if (!r.ok) throw new Error(`promoted_villages_corridor: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("promoted-corridor", { type: "geojson", data: fc });
+    map.addLayer({
+      id: "promoted-corridor-circles",
+      type: "circle",
+      source: "promoted-corridor",
+      paint: {
+        "circle-color": "#facc15",
+        "circle-radius": [
+          "interpolate", ["linear"], ["zoom"],
+          5,  3,
+          10, 5,
+          14, 8,
+        ],
+        "circle-stroke-color": "#000",
+        "circle-stroke-width": 1.2,
+        "circle-opacity": 0.9,
+      },
+    });
+    map.on("click", "promoted-corridor-circles", (e) => {
+      const p = e.features[0].properties;
+      document.getElementById("results").innerHTML =
+        `<div class="route-card"><strong>${p.name}</strong>` +
+        `<div class="stat"><span>population</span><span>${p.population ?? "—"}</span></div>` +
+        `<div class="stat"><span>osm_id</span><span>${p.osm_id}</span></div></div>`;
+    });
+    map.on("mouseenter", "promoted-corridor-circles", () => map.getCanvas().style.cursor = "pointer");
+    map.on("mouseleave", "promoted-corridor-circles", () => map.getCanvas().style.cursor = "");
+    promotedCorridorLoaded = true;
+    document.getElementById("results").innerHTML = "";
+  } catch (e) {
+    setError(`promoted_villages_corridor load failed: ${e.message}`);
+    throw e;
+  }
+}
+
+document.getElementById("show-promoted-corridor").addEventListener("change", async (e) => {
+  if (e.target.checked) {
+    try { await ensurePromotedCorridorLayer(); }
+    catch { e.target.checked = false; return; }
+    map.setLayoutProperty("promoted-corridor-circles", "visibility", "visible");
+  } else if (promotedCorridorLoaded) {
+    map.setLayoutProperty("promoted-corridor-circles", "visibility", "none");
+  }
+});
 
 document.getElementById("show-hillshade").addEventListener("change", (e) => {
   if (e.target.checked) {
@@ -973,295 +986,360 @@ document.getElementById("show-hillshade").addEventListener("change", (e) => {
   }
 });
 
-// --- Elevation profile chart ------------------------------------------
-// Lightweight SVG line chart drawn into the #elevation div under the
-// map. Used by the Graz→Wien comparison overlay to plot both variants'
-// elevation profiles side-by-side. Colors come from COMPARE_STYLES so
-// the chart and the map line colors stay in sync.
+// --- Way-graph experiment overlays ------------------------------------
+// /data/way_city_graph.geojson + way_city_anchors.geojson produced by
+// build_way_graph.py. Chain backbone derived from highway topology
+// (trunk + primary + motorway) instead of overlapping SPTs — Voronoi
+// adjacency on the road subgraph yields "no other anchor sits between
+// these two along the corridor". Pure visualization layer for now.
 
-function renderElevationProfile(features) {
-  const root = document.getElementById("elevation");
-  root.innerHTML = "";
-  const series = features
-    .map(f => ({
-      name: f.properties.name,
-      variant: f.properties.variant,
-      points: (f.properties.profile || []).filter(p => p[1] != null),
-      color: (COMPARE_STYLES[f.properties.variant]
-        || { color: "#888" }).color,
-    }))
-    .filter(s => s.points.length > 1);
-  if (!series.length) return;
+let wayGraphEdgesLoaded = false;
+let wayGraphNodesLoaded = false;
+let wayGraphPolygonsLoaded = false;
 
-  const w = root.clientWidth || 800;
-  const h = root.clientHeight || 140;
-  const ml = 36, mr = 8, mt = 6, mb = 18;
-  const innerW = w - ml - mr;
-  const innerH = h - mt - mb;
+// SPT done-status for the polygon-bounded direct-profile build. Populated
+// by ensureWayGraphNodes (so anchor colors reflect done-ness) and refreshed
+// every 30 s while the build is running.
+let sptStatus = { done: 0, total: 0, doneSet: new Set(), refByIdx: new Map() };
+let sptStatusTimer = null;
 
-  // x: cumulative distance km. Use the max across both series.
-  const maxKm = Math.max(...series.map(s => s.points[s.points.length - 1][0]));
-  const allElevs = series.flatMap(s => s.points.map(p => p[1]));
-  const minE = Math.min(...allElevs);
-  const maxE = Math.max(...allElevs);
-  const elevRange = Math.max(maxE - minE, 1);
+const API_BASE = (location.hostname === "localhost" || location.hostname === "127.0.0.1")
+  ? "http://localhost:8001"
+  : `${location.protocol}//${location.hostname}:8001`;
 
-  const sx = (km) => ml + (km / maxKm) * innerW;
-  const sy = (e)  => mt + innerH - ((e - minE) / elevRange) * innerH;
-
-  const svgNS = "http://www.w3.org/2000/svg";
-  const svg = document.createElementNS(svgNS, "svg");
-  svg.setAttribute("width", w);
-  svg.setAttribute("height", h);
-  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-  svg.style.font = "10px system-ui, sans-serif";
-
-  // y-axis grid + labels (every 200 m)
-  const yStep = elevRange > 800 ? 200 : 100;
-  const yStart = Math.ceil(minE / yStep) * yStep;
-  for (let e = yStart; e <= maxE; e += yStep) {
-    const y = sy(e);
-    const line = document.createElementNS(svgNS, "line");
-    line.setAttribute("x1", ml); line.setAttribute("x2", w - mr);
-    line.setAttribute("y1", y);  line.setAttribute("y2", y);
-    line.setAttribute("stroke", "#eee"); line.setAttribute("stroke-width", "1");
-    svg.appendChild(line);
-    const txt = document.createElementNS(svgNS, "text");
-    txt.setAttribute("x", ml - 4); txt.setAttribute("y", y + 3);
-    txt.setAttribute("text-anchor", "end"); txt.setAttribute("fill", "#666");
-    txt.textContent = `${e}m`;
-    svg.appendChild(txt);
-  }
-  // x-axis labels (every 50 km)
-  for (let km = 0; km <= maxKm; km += 50) {
-    const x = sx(km);
-    const txt = document.createElementNS(svgNS, "text");
-    txt.setAttribute("x", x); txt.setAttribute("y", h - 4);
-    txt.setAttribute("text-anchor", "middle"); txt.setAttribute("fill", "#666");
-    txt.textContent = `${km}km`;
-    svg.appendChild(txt);
-  }
-  // Series lines
-  for (const s of series) {
-    const path = document.createElementNS(svgNS, "path");
-    let d = "";
-    for (let i = 0; i < s.points.length; i++) {
-      const [km, e] = s.points[i];
-      d += (i === 0 ? "M" : "L") + sx(km).toFixed(1) + " " + sy(e).toFixed(1);
+async function fetchSptStatus() {
+  try {
+    const r = await fetch(`${API_BASE}/way-graph/spt-status?profile=direct_polygon&_=${Date.now()}`);
+    if (!r.ok) throw new Error(`spt-status: ${r.status}`);
+    const d = await r.json();
+    sptStatus.done = d.done;
+    sptStatus.total = d.total;
+    sptStatus.doneSet = new Set(d.done_indices);
+    sptStatus.refByIdx = new Map(d.cities.map(c => [c.city_idx, c.ref]));
+    // Inverse map ref -> city_idx, so anchor features can be tagged.
+    sptStatus.idxByRef = new Map(d.cities.map(c => [c.ref, c.city_idx]));
+    const badge = document.getElementById("spt-status-badge");
+    if (badge) {
+      const pct = d.total ? (100 * d.done / d.total).toFixed(1) : "0.0";
+      badge.textContent = `${d.done.toLocaleString()} / ${d.total.toLocaleString()} (${pct}%)`;
     }
-    path.setAttribute("d", d);
-    path.setAttribute("fill", "none");
-    path.setAttribute("stroke", s.color);
-    path.setAttribute("stroke-width", "1.5");
-    path.setAttribute("stroke-opacity", "0.85");
-    svg.appendChild(path);
+    return d;
+  } catch (e) {
+    const badge = document.getElementById("spt-status-badge");
+    if (badge) badge.textContent = "(status unavailable)";
+    console.warn("spt-status fetch failed:", e);
+    return null;
   }
-  // Legend
-  const legend = document.createElementNS(svgNS, "g");
-  legend.setAttribute("transform", `translate(${ml + 8}, ${mt + 4})`);
-  for (let i = 0; i < series.length; i++) {
-    const s = series[i];
-    const y = i * 12;
-    const sw = document.createElementNS(svgNS, "line");
-    sw.setAttribute("x1", 0); sw.setAttribute("x2", 14);
-    sw.setAttribute("y1", y); sw.setAttribute("y2", y);
-    sw.setAttribute("stroke", s.color); sw.setAttribute("stroke-width", "2");
-    legend.appendChild(sw);
-    const t = document.createElementNS(svgNS, "text");
-    t.setAttribute("x", 18); t.setAttribute("y", y + 3); t.setAttribute("fill", "#333");
-    t.textContent = s.name;
-    legend.appendChild(t);
-  }
-  svg.appendChild(legend);
-
-  root.appendChild(svg);
 }
 
-// --- Graz → Wien canopy-on/off comparison overlay ---------------------
-// Static GeoJSON at /data/graz_wien_compare.geojson. Two features
-// keyed by `variant`:
-//   - "no_canopy"   gray  baseline V2 (elev + curv on, no canopy term)
-//   - "with_canopy" green V2 + 0.9× multiplier where canopy_frac > 0
-// Built by pgrouting/export_route_compare.py; rerun before/after a
-// canopy recompute to refresh either variant in place.
-
-// Per-variant rendering: color, label, draw-order. Higher z = drawn on
-// top. The 5 expected variants come from two generations of compare
-// exports — the legacy canopy A/B (no_canopy / with_canopy) plus the
-// V2 Phase A.3b profile sweep (lht / balanced / scenic).
-const COMPARE_STYLES = {
-  // Production
-  direct:   { color: "#888888", label: "direct (no scenic preference)",  z: 1 },
-  balanced: { color: "#3a8dde", label: "balanced (~20% detour budget)",  z: 2 },
-  scenic:   { color: "#d8423a", label: "scenic (~50% detour budget)",    z: 3 },
-  // Experiment 1 — grade variants
-  direct_thresh5: { color: "#f5b524", label: "direct, no uphill ≤5%",       z: 4 },
-  direct_minus3:  { color: "#e07a3a", label: "direct, uphill shift 3%",     z: 5 },
-  // Experiment 2 — scenic weight multipliers
-  direct_scenic_2x:  { color: "#b16dde", label: "direct + scenic × 2",  z: 6 },
-  direct_scenic_5x:  { color: "#7a3acb", label: "direct + scenic × 5",  z: 7 },
-  direct_scenic_10x: { color: "#4b18a3", label: "direct + scenic × 10", z: 8 },
-  // Experiment 3 — interaction-softening
-  direct_interactive:    { color: "#2c8c4e", label: "direct + interaction-softening",            z: 9 },
-  direct_interactive_vp: { color: "#0e5a2e", label: "direct + interaction-softening + viewpoints", z: 10 },
-  // Experiment 4 — per-signal multiplicative
-  direct_multi:          { color: "#c97a00", label: "direct + per-signal multiplicative scenic",    z: 11 },
-  // Experiment 5 — uphill_offset=3 + multi
-  direct_minus3_multi:   { color: "#a13c00", label: "direct + uphill_offset=3 + multi scenic",      z: 12 },
-  // V2 Phase A.3e — multi-axis profiles
-  vineyard_lover: { color: "#7a3380", label: "vineyard lover",  z: 20 },   // wine purple
-  forest_lover:   { color: "#1f7a3a", label: "forest lover",    z: 21 },   // deep green
-  views:          { color: "#d4623a", label: "viewpoints",      z: 22 },   // amber
-  water:          { color: "#2a6dc4", label: "water lover",     z: 23 },   // strong blue
-};
-
-// Track which compare-overlay files are loaded so toggling on/off
-// doesn't re-fetch. Keyed by the toggle's id.
-const _compareLoaded = {};
-
-function _featuresBbox(features) {
-  let n = -90, s = 90, e = -180, w = 180;
-  const visit = (arr) => {
-    if (typeof arr[0] === "number") {
-      if (arr[0] < w) w = arr[0]; if (arr[0] > e) e = arr[0];
-      if (arr[1] < s) s = arr[1]; if (arr[1] > n) n = arr[1];
-    } else for (const x of arr) visit(x);
-  };
-  for (const f of features) visit(f.geometry.coordinates);
-  return [[w, s], [e, n]];
+function startSptStatusPolling() {
+  if (sptStatusTimer) return;
+  fetchSptStatus().then(refreshAnchorDoneColoring);
+  sptStatusTimer = setInterval(() => {
+    fetchSptStatus().then(refreshAnchorDoneColoring);
+  }, 30000);
 }
 
-// Generic compare overlay loader. Handles any GeoJSON FeatureCollection
-// whose features have `properties.variant` matching one of COMPARE_STYLES.
-// Renders one line layer per present variant, ordered by `z` (lowest
-// underneath). Adds click/hover handlers and the elevation profile chart.
-async function ensureCompareLayers(opts) {
-  const { toggleId, file, sourceId, layerPrefix, title, fitPadding=60 } = opts;
-  if (_compareLoaded[toggleId]) return;
-  setBusy(`Loading ${title}…`);
-  const r = await fetch(`/data/${file}?ts=${Date.now()}`);
-  if (!r.ok) throw new Error(`compare: ${r.status}`);
-  const fc = await r.json();
-  map.addSource(sourceId, { type: "geojson", data: fc, tolerance: 0 });
+function refreshAnchorDoneColoring() {
+  if (!wayGraphNodesLoaded || !map.getSource("way-graph-nodes")) return;
+  // Re-stamp each anchor feature with spt_done = doneSet.has(city_idx).
+  // We don't have city_idx in the geojson, so map via ref.
+  const src = map.getSource("way-graph-nodes");
+  const data = src._data;
+  if (!data || !data.features) return;
+  for (const f of data.features) {
+    const ref = f.properties.ref;
+    const idx = sptStatus.idxByRef ? sptStatus.idxByRef.get(ref) : undefined;
+    f.properties.city_idx = idx ?? -1;
+    f.properties.spt_done = idx !== undefined && sptStatus.doneSet.has(idx);
+  }
+  src.setData(data);
+}
 
-  const variantsPresent = fc.features
-    .map(f => f.properties.variant)
-    .filter(v => COMPARE_STYLES[v]);
-  // Sort by z so layers stack correctly.
-  variantsPresent.sort(
-    (a, b) => COMPARE_STYLES[a].z - COMPARE_STYLES[b].z,
-  );
-
-  for (const variant of variantsPresent) {
-    const layerId = `${layerPrefix}-${variant}`;
+async function ensureWayGraphEdges() {
+  if (wayGraphEdgesLoaded) return;
+  setBusy("Loading way-graph edges…");
+  try {
+    const r = await fetch("/data/way_city_graph.geojson?ts=" + Date.now());
+    if (!r.ok) throw new Error(`way_city_graph: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("way-graph-edges", { type: "geojson", data: fc });
     map.addLayer({
-      id: layerId,
+      id: "way-graph-edges-line",
       type: "line",
-      source: sourceId,
-      filter: ["==", ["get", "variant"], variant],
+      source: "way-graph-edges",
       paint: {
-        "line-color": COMPARE_STYLES[variant].color,
-        "line-width": 4,
+        // Gradient by edge cost: green (short) → yellow → red (long).
+        "line-color": [
+          "interpolate", ["linear"], ["get", "cost_km"],
+          0,   "#22c55e",
+          10,  "#84cc16",
+          25,  "#facc15",
+          50,  "#f97316",
+          100, "#dc2626",
+        ],
+        "line-width": [
+          "interpolate", ["linear"], ["zoom"],
+          6,  1.0,
+          10, 2.2,
+          14, 3.0,
+        ],
         "line-opacity": 0.85,
       },
     });
-    map.on("click", layerId, (e) => {
+    map.on("click", "way-graph-edges-line", (e) => {
       const p = e.features[0].properties;
       document.getElementById("results").innerHTML =
-        `<div class="route-card"><strong>${p.name}</strong>` +
-        `<div class="stat">Edges: ${p.edges}</div>` +
-        `<div class="stat">Length: ${p.length_km} km</div>` +
-        `<div class="stat">Climb: ${p.climb_m} m</div>` +
-        `<div class="stat">Under canopy: ${p.canopy_km ?? 0} km</div></div>`;
+        `<div class="route-card"><strong>${p.a_name} ↔ ${p.b_name}</strong>` +
+        `<div class="stat"><span>cost</span><span>${p.cost_km} km</span></div>` +
+        `<div class="stat"><span>a</span><span>${p.a}</span></div>` +
+        `<div class="stat"><span>b</span><span>${p.b}</span></div></div>`;
     });
-    map.on("mouseenter", layerId, () => map.getCanvas().style.cursor = "crosshair");
-    map.on("mouseleave", layerId, () => map.getCanvas().style.cursor = "");
+    map.on("mouseenter", "way-graph-edges-line", () => map.getCanvas().style.cursor = "pointer");
+    map.on("mouseleave", "way-graph-edges-line", () => map.getCanvas().style.cursor = "");
+    wayGraphEdgesLoaded = true;
+    document.getElementById("results").innerHTML = "";
+  } catch (e) {
+    setError(`way_city_graph load failed: ${e.message}`);
+    throw e;
   }
-
-  _compareLoaded[toggleId] = true;
-  // Auto-fit bbox derived from the features.
-  map.fitBounds(_featuresBbox(fc.features),
-    { padding: fitPadding, duration: 500, maxZoom: 11 });
-  renderElevationProfile(fc.features);
-
-  const byVariant = Object.fromEntries(
-    fc.features.map(f => [f.properties.variant, f.properties])
-  );
-  const lines = variantsPresent.map(v => {
-    const p = byVariant[v];
-    return `<div class="stat" style="color:${COMPARE_STYLES[v].color}">` +
-      `▬ ${p.name}: ${p.edges} edges, ${p.length_km} km, ` +
-      `${p.climb_m} m climb, ${p.canopy_km ?? 0} km under canopy</div>`;
-  }).join("");
-  document.getElementById("results").innerHTML =
-    `<div class="route-card"><strong>${title}</strong>` + lines + `</div>`;
-
-  // Stash so the toggle handler can toggle visibility per layer.
-  return variantsPresent.map(v => `${layerPrefix}-${v}`);
 }
 
-function _bindCompareToggle(opts) {
-  let layerIds = null;
-  document.getElementById(opts.toggleId).addEventListener("change", async (e) => {
-    if (e.target.checked) {
-      try {
-        layerIds = await ensureCompareLayers(opts) || layerIds;
-      } catch (err) {
-        setError(`compare load failed: ${err.message}`);
-        e.target.checked = false;
-        return;
+async function ensureWayGraphNodes() {
+  if (wayGraphNodesLoaded) return;
+  setBusy("Loading way-graph anchors…");
+  try {
+    const r = await fetch("/data/way_city_anchors.geojson?ts=" + Date.now());
+    if (!r.ok) throw new Error(`way_city_anchors: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("way-graph-nodes", { type: "geojson", data: fc });
+    map.addLayer({
+      id: "way-graph-nodes-circles",
+      type: "circle",
+      source: "way-graph-nodes",
+      paint: {
+        // SPT done? bright green. Else fall back to db=blue / village=orange.
+        // Faded if not in chain graph at all.
+        "circle-color": [
+          "case",
+          ["get", "spt_done"], "#16a34a",
+          ["==", ["get", "kind"], "db"], "#2563eb",
+          "#f97316",
+        ],
+        "circle-radius": [
+          "interpolate", ["linear"], ["zoom"],
+          5,  2,
+          10, 4,
+          14, 7,
+        ],
+        "circle-stroke-color": "#000",
+        "circle-stroke-width": 1.0,
+        "circle-opacity": ["case", ["get", "in_graph"], 0.9, 0.3],
+      },
+    });
+    // Kick off the SPT-status polling so anchors light up as the build
+    // progresses. Safe to call repeatedly — guarded by sptStatusTimer.
+    startSptStatusPolling();
+    map.on("click", "way-graph-nodes-circles", async (e) => {
+      const p = e.features[0].properties;
+      const ref = p.ref;
+      const cityIdx = (sptStatus.idxByRef && sptStatus.idxByRef.get(ref)) ?? -1;
+      // Highlight this anchor's SPT polygon (if polygons layer enabled).
+      await highlightPolygonForRef(ref);
+      // Load the SPT visualization if this anchor's SPT has been built.
+      if (p.spt_done) {
+        await loadSptForCityIdx(cityIdx, p.name);
+      } else {
+        // Clear any previously-loaded SPT and show the info card.
+        if (map.getSource("way-graph-spt")) {
+          map.getSource("way-graph-spt").setData({ type: "FeatureCollection", features: [] });
+        }
+        document.getElementById("results").innerHTML =
+          `<div class="route-card"><strong>${p.name}</strong>` +
+          `<div class="stat"><span>ref</span><span>${ref}</span></div>` +
+          `<div class="stat"><span>kind</span><span>${p.kind} / ${p.place}</span></div>` +
+          `<div class="stat"><span>population</span><span>${p.population ?? "—"}</span></div>` +
+          `<div class="stat"><span>in chain graph</span><span>${p.in_graph}</span></div>` +
+          `<div class="stat"><span>SPT</span><span>pending</span></div></div>`;
       }
-      for (const id of (layerIds || []))
-        map.setLayoutProperty(id, "visibility", "visible");
-    } else if (_compareLoaded[opts.toggleId]) {
-      for (const id of (layerIds || []))
-        map.setLayoutProperty(id, "visibility", "none");
-      document.getElementById("elevation").innerHTML = "";
+    });
+    map.on("mouseenter", "way-graph-nodes-circles", () => map.getCanvas().style.cursor = "pointer");
+    map.on("mouseleave", "way-graph-nodes-circles", () => map.getCanvas().style.cursor = "");
+    wayGraphNodesLoaded = true;
+    document.getElementById("results").innerHTML = "";
+  } catch (e) {
+    setError(`way_city_anchors load failed: ${e.message}`);
+    throw e;
+  }
+}
+
+async function ensureWayGraphPolygons() {
+  if (wayGraphPolygonsLoaded) return;
+  setBusy("Loading SPT polygons…");
+  try {
+    const r = await fetch("/data/way_city_spt_polygons.geojson?ts=" + Date.now());
+    if (!r.ok) throw new Error(`spt_polygons: ${r.status}`);
+    const fc = await r.json();
+    map.addSource("way-graph-polygons", { type: "geojson", data: fc });
+    map.addLayer({
+      id: "way-graph-polygons-line",
+      type: "line",
+      source: "way-graph-polygons",
+      paint: {
+        "line-color": "#1e40af",
+        "line-width": 0.8,
+        "line-opacity": 0.5,
+      },
+    });
+    // Highlighted polygon (one at a time, set via setData on click).
+    map.addSource("way-graph-polygon-highlight", {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: [] },
+    });
+    map.addLayer({
+      id: "way-graph-polygon-highlight-line",
+      type: "line",
+      source: "way-graph-polygon-highlight",
+      paint: { "line-color": "#16a34a", "line-width": 2.5 },
+    });
+    wayGraphPolygonsLoaded = true;
+    document.getElementById("results").innerHTML = "";
+  } catch (e) {
+    setError(`spt polygons load failed: ${e.message}`);
+    throw e;
+  }
+}
+
+async function highlightPolygonForRef(ref) {
+  if (!wayGraphPolygonsLoaded) return;
+  const src = map.getSource("way-graph-polygons");
+  if (!src || !src._data) return;
+  const match = src._data.features.find(f => f.properties.ref === ref);
+  const highlight = map.getSource("way-graph-polygon-highlight");
+  if (highlight) {
+    highlight.setData({
+      type: "FeatureCollection",
+      features: match ? [match] : [],
+    });
+  }
+}
+
+document.getElementById("show-way-graph-polygons").addEventListener("change", async (e) => {
+  if (e.target.checked) {
+    try { await ensureWayGraphPolygons(); }
+    catch { e.target.checked = false; return; }
+    for (const lid of ["way-graph-polygons-line", "way-graph-polygon-highlight-line"]) {
+      map.setLayoutProperty(lid, "visibility", "visible");
     }
+  } else if (wayGraphPolygonsLoaded) {
+    for (const lid of ["way-graph-polygons-line", "way-graph-polygon-highlight-line"]) {
+      map.setLayoutProperty(lid, "visibility", "none");
+    }
+  }
+});
+
+// --- SPT-on-click: fetch + render the polygon-bounded SPT for an anchor.
+// Source/layer are added lazily on first click; subsequent clicks just
+// setData() to swap which anchor's SPT is shown.
+// No client-side cost cap — the API ships every edge up to ~50k features
+// (HARD_FEATURE_CAP in api/app/main.py) and adaptive-strides if larger.
+
+async function ensureWayGraphSptLayer() {
+  if (map.getSource("way-graph-spt")) return;
+  map.addSource("way-graph-spt", {
+    type: "geojson",
+    data: { type: "FeatureCollection", features: [] },
+  });
+  map.addLayer({
+    id: "way-graph-spt-line",
+    type: "line",
+    source: "way-graph-spt",
+    paint: {
+      // Green near anchor → yellow → red far. Stops cover the typical
+      // direct-profile range (~5-100 km bike-equivalent in dense areas).
+      "line-color": [
+        "interpolate", ["linear"], ["get", "cost"],
+        0,      "#22c55e",
+        10000,  "#84cc16",
+        30000,  "#facc15",
+        60000,  "#f97316",
+        100000, "#dc2626",
+      ],
+      "line-width": [
+        "interpolate", ["linear"], ["zoom"],
+        8,  0.8,
+        12, 1.6,
+        16, 2.4,
+      ],
+      "line-opacity": 0.9,
+    },
   });
 }
 
-_bindCompareToggle({
-  toggleId:    "show-graz-wien-compare",
-  file:        "graz_wien_compare.geojson",
-  sourceId:    "graz-wien-compare",
-  layerPrefix: "graz-wien",
-  title:       "Graz→Wien route comparison",
+// Remember which anchor's SPT is currently shown so the detail slider
+// can reload the same one when the cap changes.
+let currentSptCityIdx = null;
+let currentSptLabel = null;
+
+async function loadSptForCityIdx(city_idx, label) {
+  if (city_idx === undefined || city_idx === null || city_idx < 0) {
+    return;
+  }
+  await ensureWayGraphSptLayer();
+  currentSptCityIdx = city_idx;
+  currentSptLabel = label;
+  const maxFeatures = +document.getElementById("spt-max-features").value || 300000;
+  const url = `${API_BASE}/way-graph/spt/${city_idx}?profile=direct_polygon&max_features=${maxFeatures}`;
+  setBusy(`Loading SPT for ${label} (cap ${maxFeatures.toLocaleString()})…`);
+  try {
+    const r = await fetch(url);
+    if (r.status === 404) {
+      setError(`SPT not built yet for ${label}`);
+      map.getSource("way-graph-spt").setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    if (!r.ok) throw new Error(`spt: ${r.status}`);
+    const fc = await r.json();
+    map.getSource("way-graph-spt").setData(fc);
+    document.getElementById("results").innerHTML =
+      `<div class="route-card"><strong>${label}</strong> SPT` +
+      `<div class="stat"><span>edges shown</span><span>${fc.kept_count.toLocaleString()}</span></div>` +
+      `<div class="stat"><span>total visited</span><span>${fc.total_visited.toLocaleString()}</span></div>` +
+      `<div class="stat"><span>cost range</span><span>${(fc.cost_min/1000).toFixed(1)} – ${(fc.cost_max/1000).toFixed(1)} km</span></div></div>`;
+  } catch (e) {
+    setError(`SPT load failed: ${e.message}`);
+  }
+}
+
+// Reload the currently-displayed SPT whenever the detail slider changes.
+document.getElementById("spt-max-features").addEventListener("change", () => {
+  if (currentSptCityIdx !== null) {
+    loadSptForCityIdx(currentSptCityIdx, currentSptLabel);
+  }
 });
-_bindCompareToggle({
-  toggleId:    "show-graz-hainburg-axes",
-  file:        "graz_hainburg_scenic_axes.geojson",
-  sourceId:    "graz-hainburg-axes",
-  layerPrefix: "graz-hainburg-axes",
-  title:       "Graz→Hainburg: scenic axes (vineyards / forest / views / water)",
+
+// Kick the badge update immediately on page load so the status shows up
+// before any layers are toggled on.
+fetchSptStatus();
+
+document.getElementById("show-way-graph-edges").addEventListener("change", async (e) => {
+  if (e.target.checked) {
+    try { await ensureWayGraphEdges(); }
+    catch { e.target.checked = false; return; }
+    map.setLayoutProperty("way-graph-edges-line", "visibility", "visible");
+  } else if (wayGraphEdgesLoaded) {
+    map.setLayoutProperty("way-graph-edges-line", "visibility", "none");
+  }
 });
-_bindCompareToggle({
-  toggleId:    "show-graz-hainburg-production",
-  file:        "graz_hainburg_production_candidate.geojson",
-  sourceId:    "graz-hainburg-production",
-  layerPrefix: "graz-hainburg-production",
-  title:       "Graz→Hainburg: production candidate (direct vs direct_minus3 vs direct_multi)",
-});
-_bindCompareToggle({
-  toggleId:    "show-graz-hainburg-compare",
-  file:        "graz_hainburg_compare.geojson",
-  sourceId:    "graz-hainburg-compare",
-  layerPrefix: "graz-hainburg",
-  title:       "Graz→Hainburg: ALL variants",
-});
-_bindCompareToggle({
-  toggleId:    "show-graz-hainburg-grade",
-  file:        "graz_hainburg_grade.geojson",
-  sourceId:    "graz-hainburg-grade",
-  layerPrefix: "graz-hainburg-grade",
-  title:       "Graz→Hainburg: uphill-formula experiment",
-});
-_bindCompareToggle({
-  toggleId:    "show-graz-hainburg-scenic-weights",
-  file:        "graz_hainburg_scenic_weights.geojson",
-  sourceId:    "graz-hainburg-scenic-weights",
-  layerPrefix: "graz-hainburg-scenic-weights",
-  title:       "Graz→Hainburg: scenic-weight multiplier experiment",
+
+document.getElementById("show-way-graph-nodes").addEventListener("change", async (e) => {
+  if (e.target.checked) {
+    try { await ensureWayGraphNodes(); }
+    catch { e.target.checked = false; return; }
+    map.setLayoutProperty("way-graph-nodes-circles", "visibility", "visible");
+  } else if (wayGraphNodesLoaded) {
+    map.setLayoutProperty("way-graph-nodes-circles", "visibility", "none");
+  }
 });
 
 // --- status helpers ---------------------------------------------------
@@ -1325,18 +1403,34 @@ function toggleScenicness(column, on) {
   const sourceId = `scenic-${column}-src`;
 
   if (on && !scenicnessLoaded.has(column)) {
-    const [minLon, minLat, maxLon, maxLat] = scenicnessManifest.bbox;
-    map.addSource(sourceId, {
-      type: "image",
-      url: `/data/scenicness/${sig.png}?ts=${Date.now()}`,
-      // MapLibre image source corners, clockwise from top-left.
-      coordinates: [
-        [minLon, maxLat],
-        [maxLon, maxLat],
-        [maxLon, minLat],
-        [minLon, minLat],
-      ],
-    });
+    if (sig.tiles) {
+      // Scalable path: a Web-Mercator XYZ raster tile pyramid. MapLibre
+      // lazy-loads only the {z}/{x}/{y}.png tiles in view; missing tiles
+      // (transparent areas we skipped) just 404 → rendered as empty.
+      map.addSource(sourceId, {
+        type: "raster",
+        tiles: [`/data/scenicness/${sig.tiles}`],
+        tileSize: 256,
+        minzoom: sig.minzoom ?? scenicnessManifest.minzoom ?? 0,
+        maxzoom: sig.maxzoom ?? scenicnessManifest.maxzoom ?? 12,
+        bounds: scenicnessManifest.bbox,
+      });
+    } else {
+      // Legacy path: one image overlay covering the whole bbox. Only
+      // viable for small extents (a continental single PNG is ~34 GB).
+      const [minLon, minLat, maxLon, maxLat] = scenicnessManifest.bbox;
+      map.addSource(sourceId, {
+        type: "image",
+        url: `/data/scenicness/${sig.png}?ts=${Date.now()}`,
+        // MapLibre image source corners, clockwise from top-left.
+        coordinates: [
+          [minLon, maxLat],
+          [maxLon, maxLat],
+          [maxLon, minLat],
+          [minLon, minLat],
+        ],
+      });
+    }
     // Insert just below the route/anchor layers so overlays don't
     // hide them. Pick the first layer in the active style whose id
     // starts with one of the "things we want on top" prefixes; if
@@ -1363,20 +1457,17 @@ function toggleScenicness(column, on) {
 
 map.on("load", () => {
   // Bind the start/end input rows from the DOM into state.waypoints.
+  // Inputs start empty; user enters coords (or clicks 📍 to pick from
+  // the map) and presses Enter or clicks Route. No default route runs
+  // on load.
   const startRow = document.querySelector('.waypoint-row[data-role="start"]');
   const endRow   = document.querySelector('.waypoint-row[data-role="end"]');
   state.waypoints = [
     bindWaypoint(startRow, "start"),
     bindWaypoint(endRow,   "end"),
   ];
-  // Seed defaults.
-  state.waypoints[0].coord = DEFAULT_START;
-  state.waypoints[0].input.value = DEFAULT_START.join(",");
-  state.waypoints[1].coord = DEFAULT_END;
-  state.waypoints[1].input.value = DEFAULT_END.join(",");
   refreshWaypointMarkers();
   updateRouteButton();
   loadCities();
   initScenicnessOverlays();
-  routeNow();
 });

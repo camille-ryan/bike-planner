@@ -1,17 +1,22 @@
 {
   "bbox": [
-    9.2710769,
+    5.8669637,
     46.3691647,
-    17.1785223,
-    49.0270459
+    18.8686094,
+    57.7432299
   ],
   "res_m": 20.0,
   "tile_size_deg": 1.0,
+  "tile_layout": "xyz",
+  "minzoom": 4,
+  "maxzoom": 12,
   "signals": {
     "forest_local": {
       "name": "forest_local",
       "description": "Fraction of a 200 m disc around the edge that's forest.",
-      "png": "forest_local.png",
+      "tiles": "xyz/forest_local/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "green"
       }
@@ -19,7 +24,9 @@
     "forest_wide": {
       "name": "forest_wide",
       "description": "Fraction of a 2 km disc around the edge that's forest.",
-      "png": "forest_wide.png",
+      "tiles": "xyz/forest_wide/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "green"
       }
@@ -27,7 +34,9 @@
     "local_relief": {
       "name": "local_relief",
       "description": "Std-dev of elevation in 500 m window (meters of terrain variation \u2014 high in gorges and on mountainsides).",
-      "png": "local_relief.png",
+      "tiles": "xyz/local_relief/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "intensity",
         "vmax": 120.0
@@ -36,7 +45,9 @@
     "regional_relief": {
       "name": "regional_relief",
       "description": "Std-dev of elevation in 10 km window \u2014 regional mountainous-ness, even where local terrain is flat.",
-      "png": "regional_relief.png",
+      "tiles": "xyz/regional_relief/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "intensity",
         "vmax": 250.0
@@ -45,7 +56,9 @@
     "distance_to_drama": {
       "name": "distance_to_drama",
       "description": "Meters to nearest cell with local_relief \u2265 80 m. Small = visible mountains nearby. ~0 inside dramatic terrain.",
-      "png": "distance_to_drama.png",
+      "tiles": "xyz/distance_to_drama/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "inverse_intensity",
         "vmax": 15000.0
@@ -54,7 +67,9 @@
     "view_dominance": {
       "name": "view_dominance",
       "description": "DEM elevation minus 2 km Gaussian blur \u2014 meters above local mean.",
-      "png": "view_dominance.png",
+      "tiles": "xyz/view_dominance/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "diverging",
         "vmax": 200.0
@@ -63,7 +78,9 @@
     "water_local": {
       "name": "water_local",
       "description": "Fraction of a 200 m disc around the edge that's lake / pond / wide-river polygon.",
-      "png": "water_local.png",
+      "tiles": "xyz/water_local/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "blue"
       }
@@ -71,7 +88,9 @@
     "water_wide": {
       "name": "water_wide",
       "description": "Fraction of a 2 km disc around the edge that's lake / pond / wide-river. Water-rich landscape.",
-      "png": "water_wide.png",
+      "tiles": "xyz/water_wide/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "blue"
       }
@@ -79,7 +98,9 @@
     "sea_local": {
       "name": "sea_local",
       "description": "Fraction of a 200 m disc around the edge that's ocean / sea (pre-built coastline polygons).",
-      "png": "sea_local.png",
+      "tiles": "xyz/sea_local/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "blue"
       }
@@ -87,7 +108,9 @@
     "sea_wide": {
       "name": "sea_wide",
       "description": "Fraction of a 2 km disc around the edge that's ocean / sea \u2014 coastal proximity.",
-      "png": "sea_wide.png",
+      "tiles": "xyz/sea_wide/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "blue"
       }
@@ -95,7 +118,9 @@
     "waterway_along_edge": {
       "name": "waterway_along_edge",
       "description": "Fraction of the edge centerline that runs inside a 10 m-buffered river/canal/stream polygon.",
-      "png": "waterway_along_edge.png",
+      "tiles": "xyz/waterway_along_edge/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "blue"
       }
@@ -103,7 +128,9 @@
     "waterway_local": {
       "name": "waterway_local",
       "description": "Fraction of a 200 m disc that contains buffered river/canal/stream polygons \u2014 waterway proximity.",
-      "png": "waterway_local.png",
+      "tiles": "xyz/waterway_local/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "blue"
       }
@@ -111,7 +138,9 @@
     "wetland_local": {
       "name": "wetland_local",
       "description": "Fraction of a 200 m disc that's wetland (marsh, reedbed, bog, saltmarsh, etc.).",
-      "png": "wetland_local.png",
+      "tiles": "xyz/wetland_local/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "teal"
       }
@@ -119,7 +148,9 @@
     "vineyard_local": {
       "name": "vineyard_local",
       "description": "Fraction of a 200 m disc that's vineyard (landuse=vineyard).",
-      "png": "vineyard_local.png",
+      "tiles": "xyz/vineyard_local/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "purple"
       }
@@ -127,7 +158,9 @@
     "viewpoint_local": {
       "name": "viewpoint_local",
       "description": "Viewpoint POI density in 100 m disc (binary mask \u00d7 uniform blur).",
-      "png": "viewpoint_local.png",
+      "tiles": "xyz/viewpoint_local/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "intensity",
         "vmax": 0.03
@@ -136,7 +169,9 @@
     "viewpoint_regional": {
       "name": "viewpoint_regional",
       "description": "Viewpoint POI density in 2 km disc \u2014 viewpoint-rich territory.",
-      "png": "viewpoint_regional.png",
+      "tiles": "xyz/viewpoint_regional/{z}/{x}/{y}.png",
+      "minzoom": 4,
+      "maxzoom": 12,
       "colormap": {
         "kind": "intensity",
         "vmax": 0.0008

@@ -33,14 +33,14 @@ services:
     # pgr_dijkstra can fit the 8.8M-edge Graz<->Wien corridor in
     # memory during scenic-profile route exports (the prior 6 GB
     # limit OOM-killed the backend at ~6 GB RSS).
-    mem_limit: "10g"
+    mem_limit: "4g"
     command: >
       postgres
       -c shared_buffers=1GB
-      -c work_mem=256MB
+      -c work_mem=128MB
       -c maintenance_work_mem=512MB
       -c max_wal_size=4GB
-      -c effective_cache_size=4GB
+      -c effective_cache_size=6GB
       -c synchronous_commit=off
     restart: unless-stopped
 
@@ -81,14 +81,14 @@ services:
       - ./data:/data:ro
     environment:
       - DATA_DIR=/data
-      - DEFAULT_PROFILE=lht
+      - DEFAULT_PROFILE=direct
       # /live/* endpoints query Postgres directly (anchors list, live
       # cost-gradient view of the multi-source SPT). Postgres is optional
       # — those endpoints just 503 if the DB is unreachable.
       - PGHOST=postgres
       - PGUSER=bike
       - PGPASSWORD=bike
-      - PGDATABASE=bike
+      - PGDATABASE=bike_v2_test
     depends_on:
       - postgres
     restart: unless-stopped

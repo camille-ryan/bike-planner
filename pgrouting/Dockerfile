@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libbz2-1.0 \
         zlib1g \
         postgresql-client \
+        osmium-tool \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

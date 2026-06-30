@@ -63,6 +63,7 @@ import compute_canopy_frac
 import compute_canopy_frac_raster
 from scenicness import bake as scenicness_bake
 from scenicness import signals as scenicness_signals
+from scenicness import tiles as scenicness_tiles
 import compare_canopy
 import reannotate_canopy_km
 import snap_anchors
@@ -118,7 +119,9 @@ def cmd_landcover_ingest(args) -> None:
     countries = [c.strip() for c in args.countries.split(",") if c.strip()]
     # `*-landuse.osm.pbf` lives next to `*-latest.osm.pbf` (DATA_DIR/osm)
     # is too unrelated; the landuse extracts are stored under
-    # DATA_DIR/landcover by the upstream extract pipeline.
+    # DATA_DIR/landcover by the upstream extract pipeline
+    # (extract_landuse_pbfs.sh — runs osmium tags-filter so multipolygon
+    # relation members are preserved for downstream area assembly).
     landcover_dir = config.DATA_DIR / "landcover"
     pbfs = [landcover_dir / f"{c}-landuse.osm.pbf" for c in countries]
     bbox = _parse_bbox(args.bbox)
@@ -417,6 +420,47 @@ def cmd_restitch_overlays(args) -> None:
     print("[restitch] done")
 
 
+def cmd_build_tiles(args) -> None:
+    """Build a Web-Mercator XYZ raster tile pyramid from the per-tile PNG
+    fragments — the scalable replacement for the single full-extent overlay
+    PNG (which is ~34 GB at 4-country/20 m scale). MapLibre lazy-loads
+    {z}/{x}/{y}.png per viewport. Reads bbox/res/signals from manifest.json;
+    rewrites the manifest to point each signal at its tile template."""
+    import json
+    import numpy as np
+    if not args.export_rasters:
+        raise SystemExit("build-tiles requires --export-rasters")
+    export_dir = Path(args.export_rasters)
+    manifest_path = export_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise SystemExit(f"no manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    extent = tuple(manifest["bbox"])
+    res_m = float(manifest["res_m"])
+    tile_size_deg = float(manifest.get("tile_size_deg", 1.0))
+    cos_lat = float(np.cos(np.radians((extent[1] + extent[3]) / 2.0)))
+    signals = list(manifest["signals"].keys())
+    zmin = int(args.zoom_min) if args.zoom_min else 4
+    zmax = int(args.zoom_max) if args.zoom_max else 12
+    print(f"[build-tiles] extent={extent} res_m={res_m} "
+          f"tile_size_deg={tile_size_deg} signals={len(signals)} z{zmin}-{zmax}")
+    summary = scenicness_tiles.build_pyramid(
+        export_dir, signals, extent, res_m, tile_size_deg, cos_lat,
+        zoom_min=zmin, zoom_max=zmax,
+    )
+    # Point the manifest at the tile pyramid so the web uses a raster source.
+    for col in manifest["signals"]:
+        manifest["signals"][col]["tiles"] = f"xyz/{col}/{{z}}/{{x}}/{{y}}.png"
+        manifest["signals"][col]["minzoom"] = zmin
+        manifest["signals"][col]["maxzoom"] = zmax
+    manifest["tile_layout"] = "xyz"
+    manifest["minzoom"] = zmin
+    manifest["maxzoom"] = zmax
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    print(f"[build-tiles] done: {sum(summary.values())} tiles "
+          f"across {len(summary)} signals")
+
+
 def cmd_scenicness_bake(args) -> None:
     """Compute per-edge scenicness signals in one pass.
 
@@ -581,6 +625,32 @@ def cmd_spts(args) -> None:
     print("[main] spts done")
 
 
+def cmd_spts_multi(args) -> None:
+    """Multi-profile per-anchor backward SPTs over a shared CSR.
+
+    V3 replacement for cmd_spts. Loads the global edge graph once into
+    an in-memory transposed CSR with all profile cost columns attached,
+    then dispatches (anchor × profile) dijkstras against it. See
+    compute_spts_multi.py module docstring for design notes.
+    """
+    import compute_spts_multi
+
+    profiles = (
+        tuple(s.strip() for s in args.profiles.split(","))
+        if args.profiles else compute_spts_multi.PROFILES
+    )
+    cache_path = Path(args.cache_path) if args.cache_path else None
+    compute_spts_multi.run(
+        profiles=profiles,
+        anchor_filter=args.anchor,
+        max_radius_m=float(args.max_radius_m) if args.max_radius_m else
+            compute_spts_multi.SPT_RADIUS_M_DEFAULT,
+        force=args.force,
+        cache_path=cache_path,
+        force_cache=args.force_cache,
+    )
+
+
 def cmd_paired(args) -> None:
     """Build pruned paired SPTs corridor-wide, output a trunk DB.
 
@@ -634,11 +704,13 @@ def main() -> None:
         ("canopy-compute-raster", cmd_canopy_compute_raster),
         ("scenicness-bake", cmd_scenicness_bake),
         ("restitch-overlays", cmd_restitch_overlays),
+        ("build-tiles", cmd_build_tiles),
         ("compare-canopy", cmd_compare_canopy),
         ("reannotate-canopy-km", cmd_reannotate_canopy_km),
         ("recompute-cost", cmd_recompute_cost),
         ("export-route-compare", cmd_export_route_compare),
         ("spts", cmd_spts),
+        ("spts-multi", cmd_spts_multi),
         ("paired", cmd_paired),
         ("all", cmd_all),
     ):
@@ -678,6 +750,10 @@ def main() -> None:
         sp.add_argument("--tile-size-deg", default=None,
             help="scenicness-bake: tile size in degrees (default 1.0). "
                  "Lower values reduce per-tile memory at higher tile-count cost.")
+        sp.add_argument("--zoom-min", default=None,
+            help="build-tiles: min XYZ zoom level (default 4).")
+        sp.add_argument("--zoom-max", default=None,
+            help="build-tiles: max XYZ zoom level (default 12, ~19 m/px).")
         sp.add_argument("--force", action="store_true",
             help="gtfs-download: redownload even if the local zip exists.")
         sp.add_argument("--lodging-radius-m", default=None,
@@ -690,6 +766,20 @@ def main() -> None:
         sp.add_argument("--corridor-m", default=None,
             help="route-city-pairs: half-width of the line-buffer "
                  "corridor in meters (default 30000).")
+        sp.add_argument("--anchor", default=None,
+            help="spts-multi: anchor name ILIKE substring "
+                 "(default: all anchors).")
+        sp.add_argument("--profiles", default=None,
+            help="spts-multi: comma-separated profile names "
+                 "(default: all 5 V3 profiles). NOTE: --profile (singular) "
+                 "is unused by spts-multi; use this plural form instead.")
+        sp.add_argument("--max-radius-m", default=None,
+            help="spts-multi: per-anchor SPT GEOGRAPHIC radius in meters "
+                 "(default 30000). Spatial slice via postgres ST_DWithin.")
+        sp.add_argument("--cache-path", default=None,
+            help="spts-multi: override the global graph cache path.")
+        sp.add_argument("--force-cache", action="store_true",
+            help="spts-multi: rebuild the global graph cache.")
         sp.set_defaults(func=func)
 
     args = p.parse_args()

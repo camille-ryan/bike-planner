@@ -468,6 +468,27 @@ def warp_lat_to_mercator_rows(rgba: np.ndarray,
     return rgba[R_src_int]
 
 
+def colorize_raster(raster: np.ndarray, column: str) -> np.ndarray:
+    """Apply the column's colormap to a value raster, returning RGBA uint8
+    of shape (h, w, 4). The PNG / XYZ tile writers share this dispatch."""
+    cm = COLORMAPS.get(column, {"kind": "green"})
+    if cm["kind"] == "green":
+        return _colormap_green(raster)
+    elif cm["kind"] == "blue":
+        return _colormap_blue(raster)
+    elif cm["kind"] == "teal":
+        return _colormap_teal(raster)
+    elif cm["kind"] == "purple":
+        return _colormap_purple(raster)
+    elif cm["kind"] == "diverging":
+        return _colormap_diverging(raster, vmax=cm["vmax"])
+    elif cm["kind"] == "intensity":
+        return _colormap_intensity(raster, vmax=cm["vmax"])
+    elif cm["kind"] == "inverse_intensity":
+        return _colormap_inverse_intensity(raster, vmax=cm["vmax"])
+    raise ValueError(f"unknown colormap kind: {cm['kind']}")
+
+
 def write_signal_png(raster: np.ndarray,
                      out_path: Path,
                      column: str,
@@ -482,23 +503,7 @@ def write_signal_png(raster: np.ndarray,
     interpolates the quad linearly in mercator) places each row at
     its intended geographic latitude. Omit `bbox` only for synthetic
     test rasters or non-geographic use."""
-    cm = COLORMAPS.get(column, {"kind": "green"})
-    if cm["kind"] == "green":
-        rgba = _colormap_green(raster)
-    elif cm["kind"] == "blue":
-        rgba = _colormap_blue(raster)
-    elif cm["kind"] == "teal":
-        rgba = _colormap_teal(raster)
-    elif cm["kind"] == "purple":
-        rgba = _colormap_purple(raster)
-    elif cm["kind"] == "diverging":
-        rgba = _colormap_diverging(raster, vmax=cm["vmax"])
-    elif cm["kind"] == "intensity":
-        rgba = _colormap_intensity(raster, vmax=cm["vmax"])
-    elif cm["kind"] == "inverse_intensity":
-        rgba = _colormap_inverse_intensity(raster, vmax=cm["vmax"])
-    else:
-        raise ValueError(f"unknown colormap kind: {cm['kind']}")
+    rgba = colorize_raster(raster, column)
     if bbox is not None:
         rgba = warp_lat_to_mercator_rows(rgba, bbox)
     out_path.parent.mkdir(parents=True, exist_ok=True)

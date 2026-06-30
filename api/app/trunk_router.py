@@ -88,8 +88,13 @@ class _ProfileData:
 
         # Preload all trunk blobs into a dict. `immutable=1` skips WAL/
         # SHM file creation (which the :ro mount blocks) and tells SQLite
-        # the DB won't change while we have it open — fine since we read
-        # everything upfront and never re-query at runtime.
+        # the DB won't change — fine since we read everything upfront and
+        # never re-query at runtime. CAVEAT: if a paired rebuild is
+        # writing to the SAME DB file concurrently, immutable=1's
+        # change-detection skip will surface as "database disk image is
+        # malformed". Restart the API only when no rebuild is in flight,
+        # or wait for each per-profile rebuild to finish before requesting
+        # routes for that profile.
         conn = sqlite3.connect(
             f"file:{db_path}?mode=ro&immutable=1", uri=True,
         )
@@ -136,7 +141,7 @@ class _ProfileData:
         )
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def _load_profile(profile: str) -> _ProfileData:
     return _ProfileData(profile)
 
@@ -150,10 +155,24 @@ def preload(profile: str) -> None:
 # Postgres / snap helpers
 # ---------------------------------------------------------------------
 
+_NON_BIKE_HIGHWAY = (
+    "pedestrian", "footway", "steps", "platform", "corridor",
+    "elevator", "escalator",
+)
+
+
 def _snap_to_vertex(
     conn: psycopg.Connection, lon: float, lat: float,
     search_radius_m: float = 20_000.0,
 ) -> int:
+    """Nearest ways_vertices_pgr.id that lies on the bike-routable road
+    network. We REQUIRE the snapped vertex to touch at least one edge
+    with a bike-routable `highway` tag — plain nearest-neighbor was
+    landing on pedestrian-only orphans (5 m pebblestone footpaths very
+    close to city centers) that aren't in any anchor's SPT, breaking
+    the entire route. Same exclusion list as
+    pgrouting/route_city_pairs._snap_vertex.
+    """
     expand_deg = max(0.25, search_radius_m / 50_000.0)
     with conn.cursor() as cur:
         cur.execute(
@@ -164,15 +183,20 @@ def _snap_to_vertex(
                 ST_SetSRID(ST_MakePoint(%s, %s), 4326),
                 %s
             )
+              AND EXISTS (
+                SELECT 1 FROM ways w
+                WHERE (w.source = v.id OR w.target = v.id)
+                  AND w.highway <> ALL(%s::text[])
+              )
             ORDER BY v.the_geom <-> ST_SetSRID(ST_MakePoint(%s, %s), 4326)
             LIMIT 1
             """,
-            (lon, lat, expand_deg, lon, lat),
+            (lon, lat, expand_deg, list(_NON_BIKE_HIGHWAY), lon, lat),
         )
         row = cur.fetchone()
     if not row:
         raise RuntimeError(
-            f"no road vertex within ~{search_radius_m/1000:.0f} km "
+            f"no bike-routable road vertex within ~{search_radius_m/1000:.0f} km "
             f"of ({lon}, {lat})"
         )
     return int(row[0])
@@ -261,6 +285,149 @@ def _walk(
 
 
 # ---------------------------------------------------------------------
+# Last-mile: per-anchor SPT walk to/from a specific vertex
+# ---------------------------------------------------------------------
+#
+# The trunk's `paired_(A, B)` walks from any vertex in A's catchment
+# toward A's center and terminates at the B-frontier (just inside B's
+# catchment from A's side). It never reaches the user's actual
+# destination vertex `end_vid`. For that, we run a parent-walk on the
+# destination city's per-anchor backward SPT npz:
+#
+#   * Walk parent from `end_vid` toward city center → set of vertices E.
+#   * Walk parent from the chain terminus (or start_vid for short trips)
+#     toward city center, stopping when we hit a vertex in E.
+#   * That vertex is the LCA. Stitch: terminus → … → LCA → … → end_vid
+#     (the second half is read backward from the end_vid walk).
+#
+# This isn't strictly the shortest path (worst case it overshoots to
+# city center then back to end_vid) but it's a single-traversal stitch
+# that needs only `parent_local` from the npz — no scipy dijkstra at
+# request time.
+
+@lru_cache(maxsize=32)
+def _load_anchor_spt(profile: str, city_idx: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-anchor backward SPT npz (node_global, parent_local).
+
+    Cached LRU(32) so popular destination cities stay hot. node_global
+    is upcast to int64 for clean searchsorted against int64 vids.
+    """
+    path = SPT_DIR / profile / "spt" / f"{city_idx}.npz"
+    with np.load(path) as d:
+        ng = np.asarray(d["node_global"]).astype(np.int64)
+        par = np.asarray(d["parent_local"]).astype(np.int32)
+    return ng, par
+
+
+def _fetch_vertex_coords(
+    conn: psycopg.Connection, vids: list[int],
+) -> dict[int, tuple[float, float]]:
+    """Bulk-fetch (lon, lat) for a list of global vids. Used by the
+    last-mile reconstruction to attach geometry to vertices that
+    aren't already inside a preloaded trunk."""
+    if not vids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, ST_X(the_geom), ST_Y(the_geom)
+            FROM ways_vertices_pgr
+            WHERE id = ANY(%s::bigint[])
+            """,
+            (vids,),
+        )
+        return {int(r[0]): (float(r[1]), float(r[2])) for r in cur.fetchall()}
+
+
+def _last_mile(
+    profile: str, city_idx: int, entry_vid: int, end_vid: int,
+    conn: psycopg.Connection,
+) -> list[list[float]] | None:
+    """Stitch parent walks within one anchor's SPT to produce coords
+    from `entry_vid` to `end_vid`. Returns [[lon, lat], …] or None if
+    either endpoint isn't in this SPT or the walks don't converge.
+
+    Algorithm: walk `parent_local` from end_vid → seed (collect set E),
+    then walk from entry_vid until we hit a vertex in E. Concatenate
+    the entry walk up-to-LCA with the reversed end walk LCA-to-end.
+    """
+    try:
+        ng, par = _load_anchor_spt(profile, city_idx)
+    except FileNotFoundError:
+        return None
+    if len(ng) == 0:
+        return None
+
+    def pos_of(vid: int) -> int:
+        p = int(np.searchsorted(ng, vid))
+        if p >= len(ng) or int(ng[p]) != vid:
+            return -1
+        return p
+
+    end_pos = pos_of(end_vid)
+    if end_pos < 0:
+        return None
+    entry_pos = pos_of(entry_vid)
+    if entry_pos < 0:
+        return None
+
+    # Walk end_vid → seed, building path indices and a position→list-idx
+    # map for cheap LCA lookup.
+    end_walk: list[int] = []
+    end_walk_pos: dict[int, int] = {}
+    i = end_pos
+    steps = 0
+    while i >= 0 and steps < _MAX_WALK_STEPS:
+        if i in end_walk_pos:
+            break  # cycle protection (shouldn't happen in a tree)
+        end_walk_pos[i] = len(end_walk)
+        end_walk.append(i)
+        i = int(par[i])
+        steps += 1
+
+    # Walk entry_vid → seed until we hit a vertex that's also on the end walk.
+    entry_walk: list[int] = []
+    i = entry_pos
+    steps = 0
+    lca_in_end: int | None = None
+    while i >= 0 and steps < _MAX_WALK_STEPS:
+        if i in end_walk_pos:
+            lca_in_end = end_walk_pos[i]
+            entry_walk.append(i)
+            break
+        entry_walk.append(i)
+        i = int(par[i])
+        steps += 1
+
+    if lca_in_end is None:
+        # No shared index. Most common cause: the SPT is multi-source
+        # (Wien's seeds = 1 km bbox + snap_vertex_id), and the two walks
+        # converged on DIFFERENT seeds. Each seed is a separate parent-
+        # tree root (parent_local = -1) with no edge to the others, so
+        # the walks can't meet by index. Fall back: glue entry_walk's
+        # last vertex directly to end_walk's last vertex. The seeds are
+        # all within 1 km of the city center, so the visual jump is
+        # small. (Pathologically, if either walk hit max steps early,
+        # the glue might be larger — acceptable.)
+        full_idx_path = entry_walk + list(reversed(end_walk))
+    else:
+        # LCA found cleanly. Drop the duplicate join vertex so coords
+        # don't repeat.
+        full_idx_path = entry_walk + list(reversed(end_walk[:lca_in_end]))
+
+    # Fetch lon/lat for every vid in the path. One postgres roundtrip.
+    vids = [int(ng[p]) for p in full_idx_path]
+    coords_by_vid = _fetch_vertex_coords(conn, vids)
+    coords: list[list[float]] = []
+    for v in vids:
+        c = coords_by_vid.get(v)
+        if c is None:
+            continue  # missing coord — skip rather than break the route
+        coords.append([c[0], c[1]])
+    return coords
+
+
+# ---------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------
 
@@ -319,28 +486,66 @@ def route(
         )
 
     # Walk each chain edge's trunk.
+    #
+    # Two important asymmetries vs the naive "walk every chain edge":
+    #   1. SKIP-UNTIL-F_ONLY at the start. The paired_(chain[k], chain[k+1])
+    #      tree only contains f_only ∪ b_frontier; start_vid drops in
+    #      cleanly only if it's in f_only(chain[k], chain[k+1]) — i.e.,
+    #      inside chain[k]'s catchment but OUTSIDE chain[k+1]'s. With
+    #      clustered anchors near the user's start (Innsbruck → Hall →
+    #      Wattens are within 25 km of each other), start_vid is in many
+    #      adjacent catchments, so we need to skip forward through the
+    #      chain until we find a paired whose f_only contains start_vid.
+    #   2. The chain ends at b_frontier(end_city in second-to-last city),
+    #      not at end_vid. After the chain walk, run _last_mile on the
+    #      end_city's per-anchor SPT to stitch from the chain terminus
+    #      to the user's actual destination.
+    # For short chains (len < 3) the chain walk is skipped entirely and
+    # the whole route is one _last_mile call in end_city's SPT.
     t2 = time.time()
     coords: list[list[float]] = []
     bridges: list[dict] = []
-    entry_vid = (
-        prof.snap_vid_by_city.get(start_city)
-        if start_city != end_city else start_vid
-    ) or start_vid
+    chain_terminus_vid = start_vid
     cur_lat = start[1]; cur_lon = start[0]
 
-    for i in range(len(chain) - 1):
+    # Find the smallest k where start_vid is in f_only(chain[k], chain[k+1])
+    # — i.e., in chain[k].SPT but NOT in chain[k+1].SPT. Cheap SPT lookups
+    # via LRU-cached _load_anchor_spt.
+    chain_start = 1   # default skip-first-leg fallback
+    for k in range(0, len(chain) - 1):
+        try:
+            ng_a, _ = _load_anchor_spt(profile, chain[k])
+        except FileNotFoundError:
+            break
+        pos_a = int(np.searchsorted(ng_a, start_vid))
+        in_a = pos_a < len(ng_a) and int(ng_a[pos_a]) == start_vid
+        if not in_a:
+            continue
+        try:
+            ng_b, _ = _load_anchor_spt(profile, chain[k + 1])
+        except FileNotFoundError:
+            break
+        pos_b = int(np.searchsorted(ng_b, start_vid))
+        in_b = pos_b < len(ng_b) and int(ng_b[pos_b]) == start_vid
+        if not in_b:
+            chain_start = k
+            break
+
+    # Chain walk: legs i = chain_start … len(chain)-2 → paired_(chain[i], chain[i+1])
+    # If len(chain) is 1 or 2 or chain_start ≥ len(chain)-1, this loop
+    # runs zero times and last-mile handles everything.
+    for i in range(chain_start, len(chain) - 1):
         a, b = chain[i], chain[i + 1]
         trunk = prof.trunks.get((a, b))
         if trunk is None:
-            # Should not happen because chain_adj is filtered to
-            # buildable pairs, but be defensive.
             raise RuntimeError(f"missing trunk for ({a}, {b})")
         arr, next_idx = trunk
-        walk = _walk(arr, next_idx, entry_vid, bridge_target=(cur_lat, cur_lon))
+        walk = _walk(arr, next_idx, chain_terminus_vid,
+                     bridge_target=(cur_lat, cur_lon))
         if walk is None:
             raise RuntimeError(
                 f"trunk walk failed at leg {i} (city {a} → {b}), "
-                f"entry_vid={entry_vid}"
+                f"entry_vid={chain_terminus_vid}"
             )
         idxs, bridge_m = walk
         if bridge_m > 0:
@@ -351,10 +556,28 @@ def route(
             })
         for k in idxs:
             coords.append([float(arr["lon"][k]), float(arr["lat"][k])])
-        entry_vid = int(arr["vid"][idxs[-1]])
+        chain_terminus_vid = int(arr["vid"][idxs[-1]])
         cur_lat = float(arr["lat"][idxs[-1]])
         cur_lon = float(arr["lon"][idxs[-1]])
     t_walk = time.time() - t2
+
+    # Last-mile: stitch from chain terminus (or start_vid if no chain
+    # was walked) to the user's actual end_vid using end_city's
+    # per-anchor backward SPT.
+    t3 = time.time()
+    with db_mod.connect() as conn:
+        last_mile = _last_mile(
+            profile, end_city, chain_terminus_vid, end_vid, conn,
+        )
+    if last_mile:
+        # Drop the duplicate join vertex if it matches the last chain coord.
+        if coords and last_mile and \
+           coords[-1][0] == last_mile[0][0] and \
+           coords[-1][1] == last_mile[0][1]:
+            coords.extend(last_mile[1:])
+        else:
+            coords.extend(last_mile)
+    t_last_mile = time.time() - t3
 
     # Cheap gross-length stat for the response (over the full polyline,
     # before simplification — that's the geometrically correct length).
@@ -396,6 +619,7 @@ def route(
                 "snap":          round(t_snap * 1000, 1),
                 "chain":         round(t_chain * 1000, 1),
                 "walk":          round(t_walk * 1000, 1),
+                "last_mile":     round(t_last_mile * 1000, 1),
                 "total":         round((time.time() - t0) * 1000, 1),
             },
         },

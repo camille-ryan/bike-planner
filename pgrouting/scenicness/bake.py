@@ -140,13 +140,18 @@ def _crop_to(raster, transform, target_bbox):
 
 
 def _tile_edge_count(conn, tile_bbox) -> int:
+    # We only need a yes/no ("does this tile contain any vertices?"), so use
+    # EXISTS to short-circuit and the GIST index on the_geom (via &&) instead
+    # of a COUNT(*) on the unindexed lon/lat columns (a 123M-row seq scan,
+    # ~34s/tile). With the index this is sub-ms; the whole 561-tile filter
+    # drops from ~5h to ~30s. Returns 1/0 so the `> 0` caller is unchanged.
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT COUNT(*) FROM ways_vertices_pgr "
-            "WHERE lon BETWEEN %s AND %s AND lat BETWEEN %s AND %s",
-            (tile_bbox[0], tile_bbox[2], tile_bbox[1], tile_bbox[3]),
+            "SELECT EXISTS(SELECT 1 FROM ways_vertices_pgr "
+            "WHERE the_geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326))",
+            (tile_bbox[0], tile_bbox[1], tile_bbox[2], tile_bbox[3]),
         )
-        return int(cur.fetchone()[0])
+        return 1 if cur.fetchone()[0] else 0
 
 
 # ---------------------------------------------------------------------
@@ -324,39 +329,95 @@ def _sample_tile_edges(conn, sigs, signal_rasters, tile_bbox, col_list,
 
 
 def _write_tile_pngs(sigs, cropped_for_png, tile_bbox, ti, tiles_dir):
-    """Write one PNG per signal for this tile to {tiles_dir}/{column}_{ti}.png.
-    NO mercator warp — that's applied once on the stitched global PNG."""
+    """Legacy: write one 4326 fragment PNG per signal for this bake tile.
+    Superseded by `_write_tile_xyz`, which goes straight to z12 XYZ tiles
+    and skips the fragment intermediate. Kept for backward compatibility
+    with `build-tiles`/`restitch-overlays` migrating older bake output."""
     tiles_dir.mkdir(parents=True, exist_ok=True)
     out = []
     for sig, (raster, _xform) in zip(sigs, cropped_for_png):
         png_path = tiles_dir / f"{sig.column}_t{ti:03d}.png"
-        # Pass bbox=None so write_signal_png skips the mercator warp.
         rasters.write_signal_png(raster, png_path, sig.column, bbox=None)
         out.append((sig.column, png_path, raster.shape, tile_bbox))
     return out
+
+
+def _write_tile_xyz(sigs, cropped_for_png, tile_bbox, xyz_root, zoom_max):
+    """Apply each signal's colormap and write the z<zoom_max> XYZ tiles for
+    this bake fragment directly — no 4326 fragment PNG intermediate. The
+    reproject+slice cost (one per fragment) is amortized into the bake's
+    per-tile loop, so end-of-bake only has to build overviews from the
+    already-on-disk z<zoom_max> children.
+
+    Returns the set of signal columns that wrote at least one tile for this
+    fragment; the union across tiles drives the manifest's signal list."""
+    from . import tiles as scenicness_tiles
+    seen: set[str] = set()
+    for sig, (raster, _xform) in zip(sigs, cropped_for_png):
+        rgba = rasters.colorize_raster(raster, sig.column)
+        if int(rgba[..., 3].max()) == 0:
+            continue
+        n = scenicness_tiles.write_tile_xyz(
+            rgba, tile_bbox, xyz_root, sig.column, zoom_max,
+        )
+        if n > 0:
+            seen.add(sig.column)
+    return seen
+
+
+_PYRAMID_ZOOM_MIN = 4
+_PYRAMID_ZOOM_MAX = 12
 
 
 # ---------------------------------------------------------------------
 # Stitching
 # ---------------------------------------------------------------------
 
+def _maxpool_rgba(a, f):
+    """Max-pool an (h, w, 4) uint8 array by factor f (per f×f block, take
+    the brightest pixel — keeps thin 1px features visible). Returns None if
+    the array is smaller than one block in either dim."""
+    if f <= 1:
+        return a
+    h0 = (a.shape[0] // f) * f
+    w0 = (a.shape[1] // f) * f
+    if h0 == 0 or w0 == 0:
+        return None
+    return a[:h0, :w0].reshape(h0 // f, f, w0 // f, f, a.shape[2]).max(axis=(1, 3))
+
+
 def _stitch_signal(column, tile_entries, extent, res_m, out_path, cos_lat):
     """Read every per-tile PNG for this signal, paste it into a global
     uint8 RGBA buffer at the tile's pixel location, mercator-warp once,
     save as a single PNG.
 
-    Memory peak: one global buffer (H*W*4 bytes). For Austria at 20 m
-    that's ~1.75 GB; safe on a 32 GB box.
+    The full-resolution canvas for a continental extent (4 countries at
+    20 m ≈ 104k×87k px ≈ 34 GB) does not fit in RAM, and a texture that
+    large can't be uploaded to the browser anyway. So we downsample
+    *during* assembly: pick a global max-pool factor up front so the
+    canvas fits `max_dim`, allocate the reduced canvas, and max-pool each
+    tile as it is pasted. Memory peak is the reduced canvas (a few tens of
+    MB) plus one full-res tile — safe even on a 15 GB box. Max-pool (not
+    stride) keeps thin features like 10 m waterways visible. The per-edge
+    values in `ways` sample the native raster directly, so this is purely
+    a visual concern.
     """
+    max_dim = 4096
     width, height, transform = rasters.grid_dims(extent, res_m, cos_lat=cos_lat)
-    canvas = np.zeros((height, width, 4), dtype=np.uint8)
+    factor = max(1, int(np.ceil(max(width, height) / max_dim)))
+    cw = width // factor
+    ch = height // factor
+    canvas = np.zeros((ch, cw, 4), dtype=np.uint8)
+    if factor > 1:
+        print(f"[scenicness]   max-pool {factor}x during assembly: "
+              f"{width}x{height} -> {cw}x{ch}", flush=True)
 
     for entry in tile_entries:
         _col, png_path, _shape, tile_bbox = entry
         tx_min, _ty_min, _tx_max, ty_max = tile_bbox
-        col_off = int(round((tx_min - transform.c) / transform.a))
+        col_off = int(round((tx_min - transform.c) / transform.a)) // factor
         # transform.e < 0, top row = transform.f (= ymax of canvas).
-        row_off = int(round((ty_max - transform.f) / transform.e))
+        row_off = int(round((ty_max - transform.f) / transform.e)) // factor
         # Read all 4 bands; rasterio gave us a (bands, h, w) array.
         with rasterio.open(png_path) as ds:
             tile_arr = ds.read()
@@ -365,46 +426,23 @@ def _stitch_signal(column, tile_entries, extent, res_m, out_path, cos_lat):
             # opaque RGB → add full-alpha channel
             alpha = np.full(arr.shape[:2] + (1,), 255, dtype=np.uint8)
             arr = np.concatenate([arr, alpha], axis=2)
+        arr = _maxpool_rgba(arr, factor)
+        if arr is None:
+            continue
         ah, aw = arr.shape[:2]
         c0 = max(0, col_off); r0 = max(0, row_off)
-        c1 = min(width, col_off + aw); r1 = min(height, row_off + ah)
+        c1 = min(cw, col_off + aw); r1 = min(ch, row_off + ah)
         if c1 <= c0 or r1 <= r0:
             continue
         src_c0 = c0 - col_off; src_r0 = r0 - row_off
         src_c1 = src_c0 + (c1 - c0); src_r1 = src_r0 + (r1 - r0)
-        canvas[r0:r1, c0:c1, :] = arr[src_r0:src_r1, src_c0:src_c1, :]
+        # max-combine (not assign): downsampled tile offsets can overlap by
+        # ~1px at seams; max avoids dark seam lines and keeps any data pixel.
+        dst = canvas[r0:r1, c0:c1, :]
+        np.maximum(dst, arr[src_r0:src_r1, src_c0:src_c1, :], out=dst)
 
-    # Mercator row warp on the assembled image (one-shot, full extent).
+    # Mercator row warp on the assembled (already downsampled) image.
     canvas = rasters.warp_lat_to_mercator_rows(canvas, extent)
-
-    # Downsample for browser display. WebGL textures cap at 4096-16384
-    # px on typical hardware; the full-res canvas (≈30k×15k for Austria)
-    # exceeds that and MapLibre would fail to upload it.
-    #
-    # Max-pool (per factor×factor block, take the brightest pixel)
-    # rather than nearest-neighbor stride: thin features like 10m-wide
-    # waterway polygons are 1 source pixel wide, and stride sampling
-    # would drop most of them, leaving "dotted line" artifacts. Max
-    # over the block keeps any non-zero pixel visible in the output.
-    # The per-edge values in `ways` columns sample the native-resolution
-    # raster directly (not the PNG), so this is purely a visual fix.
-    max_dim = 4096
-    fh, fw = canvas.shape[:2]
-    if max(fh, fw) > max_dim:
-        factor = int(np.ceil(max(fh, fw) / max_dim))
-        new_h = fh // factor
-        new_w = fw // factor
-        # Crop to a clean multiple of factor before reshape.
-        canvas_crop = canvas[:new_h * factor, :new_w * factor]
-        # Reshape (H, W, 4) -> (new_h, factor, new_w, factor, 4) is a
-        # view (no copy). max over axes 1 and 3 reduces each block.
-        canvas = canvas_crop.reshape(
-            new_h, factor, new_w, factor, 4,
-        ).max(axis=(1, 3))
-        del canvas_crop
-        print(f"[scenicness]   max-pool {factor}x downsample: "
-              f"{fw}x{fh} -> {canvas.shape[1]}x{canvas.shape[0]}",
-              flush=True)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(
@@ -464,15 +502,45 @@ def bake(conn: psycopg.Connection,
     if not nonempty:
         raise SystemExit("no ways vertices in any tile — nothing to bake")
 
-    # Temp table
+    # Per-tile staging table + per-tile completion tracking. The bake
+    # now applies each tile's data to `ways` immediately after sampling
+    # (instead of one giant UPDATE at the end). This makes restarts
+    # resumable to within one tile, and the giant-UPDATE-fail catastrophe
+    # is impossible. `_scenicness` is UNLOGGED because it only holds
+    # one tile's data at a time; `_scenicness_tiles_done` is LOGGED
+    # (small, crash-safe) so we know which tiles are durably applied.
     cols_def = ", ".join(f"{s.column} real" for s in sigs)
     col_list = "gid, " + ", ".join(s.column for s in sigs)
+    set_clause = ", ".join(f"{s.column} = r.{s.column}" for s in sigs)
     with conn.cursor() as cur:
         cur.execute("SET max_parallel_workers_per_gather = 0")
         cur.execute("SET work_mem = '512MB'")
+        # Defensive: ensure every signal's destination column exists on
+        # `ways`. Without this, a 20-hour bake can die on a UPDATE
+        # because one column was renamed/missing.
+        for s in sigs:
+            cur.execute(
+                f"ALTER TABLE ways ADD COLUMN IF NOT EXISTS {s.column} "
+                f"real NOT NULL DEFAULT 0.0"
+            )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS _scenicness_tiles_done ("
+            " tile_idx int PRIMARY KEY, completed_at timestamptz DEFAULT now())"
+        )
+        # _scenicness holds ONE tile's data; cleared after each tile's
+        # UPDATE → _scenicness_tiles_done insert → commit cycle.
         cur.execute("DROP TABLE IF EXISTS _scenicness")
-        cur.execute(f"CREATE TEMP TABLE _scenicness "
+        cur.execute(f"CREATE UNLOGGED TABLE _scenicness "
                     f"(gid bigint PRIMARY KEY, {cols_def})")
+    conn.commit()
+
+    # Load completed-tile set so we can skip them on restart.
+    with conn.cursor() as cur:
+        cur.execute("SELECT tile_idx FROM _scenicness_tiles_done")
+        done_tiles = {int(r[0]) for r in cur.fetchall()}
+    if done_tiles:
+        print(f"[scenicness] resume: {len(done_tiles)} tiles already applied to ways",
+              flush=True)
 
     # Use a single cos(mid_lat) for every tile so pixel sizes stay
     # consistent and tile slices paste together without drift.
@@ -481,81 +549,122 @@ def bake(conn: psycopg.Connection,
     print(f"[scenicness] global mid_lat={global_mid_lat:.3f} "
           f"cos_lat={cos_lat:.4f}", flush=True)
 
-    tiles_dir = None
+    xyz_root = None
     if export_rasters_dir is not None:
-        tiles_dir = export_rasters_dir / "tiles"
-        tiles_dir.mkdir(parents=True, exist_ok=True)
+        xyz_root = export_rasters_dir / "xyz"
+        xyz_root.mkdir(parents=True, exist_ok=True)
 
     # Per-tile loop
-    all_tile_entries: dict[str, list] = {s.column: [] for s in sigs}
+    signals_seen: set[str] = set()
     sample_stats = {"edges": 0, "sec": 0.0}
     t_total = time.time()
+    n_skipped_resume = 0
     for idx, (ti, tile_bbox, n_verts) in enumerate(nonempty):
+        if ti in done_tiles:
+            n_skipped_resume += 1
+            continue
         print(f"\n[scenicness] === tile {idx+1}/{len(nonempty)} "
               f"(index {ti}) {tile_bbox} verts={n_verts:,} ===", flush=True)
         t_tile = time.time()
         signal_rasters, cropped_for_png = _build_tile_rasters(
             conn, sigs, tile_bbox, res_m, dem_dir, cos_lat,
         )
+        # Make sure the staging table starts empty for this tile (in case
+        # a prior crash left partial data we haven't checkpointed).
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE _scenicness")
         _sample_tile_edges(conn, sigs, signal_rasters, tile_bbox, col_list,
                            sample_stats)
-        if tiles_dir is not None:
-            entries = _write_tile_pngs(sigs, cropped_for_png, tile_bbox, ti,
-                                       tiles_dir)
-            for col, png_path, shape, tb in entries:
-                all_tile_entries[col].append((col, png_path, shape, tb))
-        # Free per-tile rasters before next tile
+        if xyz_root is not None:
+            seen = _write_tile_xyz(sigs, cropped_for_png, tile_bbox,
+                                   xyz_root, _PYRAMID_ZOOM_MAX)
+            signals_seen.update(seen)
         del signal_rasters, cropped_for_png
+
+        # Apply this tile's data to ways immediately + checkpoint
+        # completion. Per-tile commits make the run resumable.
+        t_apply = time.time()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE ways w SET {set_clause} "
+                f"FROM _scenicness r WHERE w.gid = r.gid"
+            )
+            applied = cur.rowcount
+            cur.execute(
+                "INSERT INTO _scenicness_tiles_done (tile_idx) VALUES (%s) "
+                "ON CONFLICT DO NOTHING", (ti,),
+            )
+        conn.commit()
         print(f"[scenicness]   tile done in {time.time()-t_tile:.1f}s "
-              f"(total sampled: {sample_stats['edges']:,})", flush=True)
+              f"(apply {time.time()-t_apply:.1f}s; +{applied:,} rows updated; "
+              f"total sampled: {sample_stats['edges']:,})", flush=True)
+
+    if n_skipped_resume:
+        print(f"\n[scenicness] resume skipped {n_skipped_resume} tiles "
+              f"already applied", flush=True)
 
     print(f"\n[scenicness] all tiles done: {sample_stats['edges']:,} edges in "
           f"{(time.time()-t_total)/60:.1f} min", flush=True)
 
-    # Stitch PNGs (one signal at a time, ~1.75 GB peak per signal)
+    # If every tile was resume-skipped, signals_seen never got populated by
+    # _write_tile_xyz. Scan xyz_root to find which signals already have
+    # tiles on disk so the manifest + build_overviews below pick them up.
+    if not signals_seen and xyz_root is not None and xyz_root.exists():
+        for sig in sigs:
+            sig_dir = xyz_root / sig.column
+            if sig_dir.exists() and any(sig_dir.iterdir()):
+                signals_seen.add(sig.column)
+        print(f"[scenicness] resume: signals_seen populated from xyz_root: "
+              f"{sorted(signals_seen)}", flush=True)
+
+    # Emit the manifest + finish the XYZ raster tile pyramid. The z<MAX>
+    # base tiles were already written in the per-tile loop directly from
+    # the in-memory rasters (no 4326 fragment intermediate), so all that
+    # remains is to build overviews z<MIN>..z<MAX-1> by max-pooling 2×2
+    # children. The pyramid lazy-loads in MapLibre per viewport — no
+    # single-PNG step, which would be ~34 GB at 4-country/20 m anyway.
     if export_rasters_dir is not None:
         export_rasters_dir.mkdir(parents=True, exist_ok=True)
+        signals_dict: dict[str, dict] = {}
+        for sig in sigs:
+            if sig.column not in signals_seen:
+                continue
+            signals_dict[sig.column] = {
+                "name": sig.name,
+                "description": sig.description,
+                "tiles": f"xyz/{sig.column}/{{z}}/{{x}}/{{y}}.png",
+                "minzoom": _PYRAMID_ZOOM_MIN,
+                "maxzoom": _PYRAMID_ZOOM_MAX,
+                "colormap": rasters.COLORMAPS.get(sig.column, {"kind": "green"}),
+            }
         manifest = {
             "bbox": list(extent),
             "res_m": res_m,
             "tile_size_deg": tile_size_deg,
-            "signals": {},
+            "tile_layout": "xyz",
+            "minzoom": _PYRAMID_ZOOM_MIN,
+            "maxzoom": _PYRAMID_ZOOM_MAX,
+            "signals": signals_dict,
         }
-        for sig in sigs:
-            entries = all_tile_entries[sig.column]
-            if not entries:
-                continue
-            out_path = export_rasters_dir / f"{sig.column}.png"
-            print(f"\n[scenicness] stitching {sig.column} "
-                  f"from {len(entries)} tiles → {out_path}", flush=True)
-            _stitch_signal(sig.column, entries, extent, res_m, out_path, cos_lat)
-            manifest["signals"][sig.column] = {
-                "name": sig.name,
-                "description": sig.description,
-                "png": out_path.name,
-                "colormap": rasters.COLORMAPS.get(sig.column, {"kind": "green"}),
-            }
         manifest_path = export_rasters_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2))
         print(f"[scenicness] wrote manifest {manifest_path} "
-              f"({len(manifest['signals'])} signals)", flush=True)
-
-    # Final UPDATE
-    print(f"\n[scenicness] applying to ways: {[s.column for s in sigs]}...",
-          flush=True)
-    t_update = time.time()
-    set_clause = ", ".join(f"{s.column} = r.{s.column}" for s in sigs)
-    with conn.cursor() as cur:
-        cur.execute("SET max_parallel_workers_per_gather = 0")
-        cur.execute(
-            f"UPDATE ways w SET {set_clause} "
-            "FROM _scenicness r WHERE w.gid = r.gid"
+              f"({len(signals_dict)} signals)", flush=True)
+        from . import tiles as scenicness_tiles
+        summary = scenicness_tiles.build_overviews(
+            xyz_root, list(signals_dict.keys()),
+            zoom_min=_PYRAMID_ZOOM_MIN, zoom_max=_PYRAMID_ZOOM_MAX,
         )
-        updated = cur.rowcount
+        print(f"[scenicness] tile pyramid: {sum(summary.values())} tiles "
+              f"across {len(summary)} signals", flush=True)
+
+    # Per-tile applies happened inside the loop above, so no final
+    # giant UPDATE is needed. Drop the staging table now that we're done.
+    with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS _scenicness")
     conn.commit()
-    print(f"[scenicness] applied to {updated:,} edges in "
-          f"{time.time()-t_update:.1f}s", flush=True)
+    print(f"[scenicness] all tile applies committed; staging dropped",
+          flush=True)
 
     # Summary
     with conn.cursor() as cur:
