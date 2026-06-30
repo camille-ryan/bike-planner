@@ -311,11 +311,29 @@ def _load_anchor_spt(profile: str, city_idx: int) -> tuple[np.ndarray, np.ndarra
 
     Cached LRU(32) so popular destination cities stay hot. node_global
     is upcast to int64 for clean searchsorted against int64 vids.
+
+    Accepts either NPZ schema:
+      - compute_spts_multi: keys node_global + parent_local
+      - compute_spts_polygon: keys node_global + parent
     """
     path = SPT_DIR / profile / "spt" / f"{city_idx}.npz"
     with np.load(path) as d:
         ng = np.asarray(d["node_global"]).astype(np.int64)
-        par = np.asarray(d["parent_local"]).astype(np.int32)
+        par_key = "parent_local" if "parent_local" in d.files else "parent"
+        par = np.asarray(d[par_key]).astype(np.int32)
+    # If parent indices are sorted in the NPZ's original (Dijkstra-output)
+    # order but node_global was later sorted ASC for searchsorted, the
+    # parent[] indices are stale. Polygon NPZs save node_global in
+    # Dijkstra-output order; if it's not strictly ascending, sort + reindex.
+    if len(ng) > 1 and ng[1] < ng[0]:
+        order = np.argsort(ng, kind="stable")
+        inv = np.empty_like(order)
+        inv[order] = np.arange(len(order))
+        valid = (par >= 0) & (par < len(par))
+        new_par = par.copy()
+        new_par[valid] = inv[par[valid]]
+        ng = ng[order]
+        par = new_par[order].astype(np.int32)
     return ng, par
 
 
@@ -485,63 +503,48 @@ def route(
             f"no city_graph path from city {start_city} to city {end_city}"
         )
 
-    # Walk each chain edge's trunk.
-    #
-    # Two important asymmetries vs the naive "walk every chain edge":
-    #   1. SKIP-UNTIL-F_ONLY at the start. The paired_(chain[k], chain[k+1])
-    #      tree only contains f_only ∪ b_frontier; start_vid drops in
-    #      cleanly only if it's in f_only(chain[k], chain[k+1]) — i.e.,
-    #      inside chain[k]'s catchment but OUTSIDE chain[k+1]'s. With
-    #      clustered anchors near the user's start (Innsbruck → Hall →
-    #      Wattens are within 25 km of each other), start_vid is in many
-    #      adjacent catchments, so we need to skip forward through the
-    #      chain until we find a paired whose f_only contains start_vid.
-    #   2. The chain ends at b_frontier(end_city in second-to-last city),
-    #      not at end_vid. After the chain walk, run _last_mile on the
-    #      end_city's per-anchor SPT to stitch from the chain terminus
-    #      to the user's actual destination.
-    # For short chains (len < 3) the chain walk is skipped entirely and
-    # the whole route is one _last_mile call in end_city's SPT.
+    # NEW (polygon-SPT era): trunks are bracketed with synthetic
+    # anchor-center vids (-2-ci for city ci). Every (A, B) trunk
+    # starts with SYNTH_A and ends with SYNTH_B, so chain joins are
+    # deterministic — no SPT-membership skip-ahead, no haversine
+    # fallback. The first leg's entry vid is SYNTH_(start_city) and
+    # the last leg ends at SYNTH_(end_city). User-supplied start/end
+    # lonlat become first-mile / last-mile straight segments to the
+    # anchor centers (the polygon SPT's region semantics already
+    # absorb up to ~1 km of slack around each anchor).
+    SYNTH = lambda ci: -2 - int(ci)
+
     t2 = time.time()
     coords: list[list[float]] = []
     bridges: list[dict] = []
-    chain_terminus_vid = start_vid
-    cur_lat = start[1]; cur_lon = start[0]
 
-    # Find the smallest k where start_vid is in f_only(chain[k], chain[k+1])
-    # — i.e., in chain[k].SPT but NOT in chain[k+1].SPT. Cheap SPT lookups
-    # via LRU-cached _load_anchor_spt.
-    chain_start = 1   # default skip-first-leg fallback
-    for k in range(0, len(chain) - 1):
-        try:
-            ng_a, _ = _load_anchor_spt(profile, chain[k])
-        except FileNotFoundError:
-            break
-        pos_a = int(np.searchsorted(ng_a, start_vid))
-        in_a = pos_a < len(ng_a) and int(ng_a[pos_a]) == start_vid
-        if not in_a:
-            continue
-        try:
-            ng_b, _ = _load_anchor_spt(profile, chain[k + 1])
-        except FileNotFoundError:
-            break
-        pos_b = int(np.searchsorted(ng_b, start_vid))
-        in_b = pos_b < len(ng_b) and int(ng_b[pos_b]) == start_vid
-        if not in_b:
-            chain_start = k
-            break
+    # First-mile: user start → start_city center (straight segment).
+    sc_info = next((c for c in prof.cities
+                    if int(c["city_idx"]) == int(start_city)), None)
+    if sc_info is None:
+        raise RuntimeError(f"start_city {start_city} not in cities.json")
+    coords.append([float(start[0]), float(start[1])])
+    coords.append([float(sc_info["lon"]), float(sc_info["lat"])])
+    first_mile_m = _haversine_m(
+        float(start[0]), float(start[1]),
+        float(sc_info["lon"]), float(sc_info["lat"]),
+    )
+    if first_mile_m > 0:
+        bridges.append({"leg": "first_mile", "from_city": None,
+                        "to_city": int(start_city),
+                        "distance_m": round(first_mile_m, 1)})
 
-    # Chain walk: legs i = chain_start … len(chain)-2 → paired_(chain[i], chain[i+1])
-    # If len(chain) is 1 or 2 or chain_start ≥ len(chain)-1, this loop
-    # runs zero times and last-mile handles everything.
-    for i in range(chain_start, len(chain) - 1):
+    # Chain walk: every leg's trunk is entered via SYNTH_(from_city)
+    # and ends at SYNTH_(to_city) — searchsorted-clean joins.
+    chain_terminus_vid = SYNTH(start_city)
+    for i in range(0, len(chain) - 1):
         a, b = chain[i], chain[i + 1]
         trunk = prof.trunks.get((a, b))
         if trunk is None:
             raise RuntimeError(f"missing trunk for ({a}, {b})")
         arr, next_idx = trunk
         walk = _walk(arr, next_idx, chain_terminus_vid,
-                     bridge_target=(cur_lat, cur_lon))
+                     bridge_target=None)
         if walk is None:
             raise RuntimeError(
                 f"trunk walk failed at leg {i} (city {a} → {b}), "
@@ -550,34 +553,29 @@ def route(
         idxs, bridge_m = walk
         if bridge_m > 0:
             bridges.append({
-                "leg": i,
-                "from_city": a, "to_city": b,
+                "leg": i, "from_city": int(a), "to_city": int(b),
                 "distance_m": round(bridge_m, 1),
             })
         for k in idxs:
             coords.append([float(arr["lon"][k]), float(arr["lat"][k])])
         chain_terminus_vid = int(arr["vid"][idxs[-1]])
-        cur_lat = float(arr["lat"][idxs[-1]])
-        cur_lon = float(arr["lon"][idxs[-1]])
     t_walk = time.time() - t2
 
-    # Last-mile: stitch from chain terminus (or start_vid if no chain
-    # was walked) to the user's actual end_vid using end_city's
-    # per-anchor backward SPT.
-    t3 = time.time()
-    with db_mod.connect() as conn:
-        last_mile = _last_mile(
-            profile, end_city, chain_terminus_vid, end_vid, conn,
-        )
-    if last_mile:
-        # Drop the duplicate join vertex if it matches the last chain coord.
-        if coords and last_mile and \
-           coords[-1][0] == last_mile[0][0] and \
-           coords[-1][1] == last_mile[0][1]:
-            coords.extend(last_mile[1:])
-        else:
-            coords.extend(last_mile)
-    t_last_mile = time.time() - t3
+    # Last-mile: end_city center → user end (straight segment).
+    ec_info = next((c for c in prof.cities
+                    if int(c["city_idx"]) == int(end_city)), None)
+    if ec_info is None:
+        raise RuntimeError(f"end_city {end_city} not in cities.json")
+    last_mile_m = _haversine_m(
+        float(ec_info["lon"]), float(ec_info["lat"]),
+        float(end[0]), float(end[1]),
+    )
+    coords.append([float(end[0]), float(end[1])])
+    if last_mile_m > 0:
+        bridges.append({"leg": "last_mile", "from_city": int(end_city),
+                        "to_city": None,
+                        "distance_m": round(last_mile_m, 1)})
+    t3 = time.time(); t_last_mile = time.time() - t3
 
     # Cheap gross-length stat for the response (over the full polyline,
     # before simplification — that's the geometrically correct length).

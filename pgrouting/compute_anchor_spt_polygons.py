@@ -43,7 +43,14 @@ ANCHORS_IN         = Path("/data/way_city_anchors.geojson")
 POLYGONS_OUT       = Path("/data/way_city_spt_polygons.json")
 POLYGONS_OUT_GEOJSON = Path("/data/way_city_spt_polygons.geojson")
 
-FLOOR_RADIUS_M = 5_000.0  # minimum disc each polygon must contain
+FLOOR_RADIUS_M    = 5_000.0   # disc around the anchor itself
+NEIGHBOR_DISC_M   = 5_000.0   # 2026-06-30: ALSO add a 5 km disc
+# around each chain neighbor's center. With just the polylines,
+# chain neighbors landed at hull corners and got clipped by
+# shapely.contains_xy (e.g. Skagen on Ålbæk's polygon). The 5 km
+# disc per-neighbor makes each neighbor interior with a 5 km
+# cushion. Coastal cities also get coverage seaward through their
+# neighbors' discs.
 CIRCLE_VERTICES = 32      # polygon vertices used to approximate the disc
 
 R_EARTH_M = 6_371_000.0
@@ -136,10 +143,20 @@ def _build_polygon(anchor: dict,
     points.extend(_circle_points(anchor["lon"], anchor["lat"],
                                  FLOOR_RADIUS_M, CIRCLE_VERTICES))
 
-    # 1-hop: full A→B geometry for every adjacent B.
+    # 1-hop: full A→B geometry for every adjacent B + 5 km disc around B.
     a_edges = chain_by_ref.get(a_ref, [])
     for b_ref, geom_ab in a_edges:
         points.extend((float(x), float(y)) for x, y in geom_ab)
+
+        # 2026-06-30: 5 km disc around B's center (= last polyline
+        # point). Makes B interior (not boundary corner), guarantees
+        # the SPT extends 5 km past every chain neighbor — picks up
+        # coastal coverage and stops shapely.contains_xy clipping
+        # neighbors out.
+        if geom_ab:
+            b_lon, b_lat = float(geom_ab[-1][0]), float(geom_ab[-1][1])
+            points.extend(_circle_points(b_lon, b_lat,
+                                         NEIGHBOR_DISC_M, CIRCLE_VERTICES))
 
         # 0.5-hop further: from B, walk each onward B→C up to path-midpoint.
         for c_ref, geom_bc in chain_by_ref.get(b_ref, []):
@@ -153,7 +170,6 @@ def _build_polygon(anchor: dict,
     arr = np.array(points, dtype=np.float64)
     hull = ConvexHull(arr)
     ring = [tuple(arr[i]) for i in hull.vertices]
-    # Close the ring (first point == last point) so consumers don't need to.
     ring.append(ring[0])
     return ring
 

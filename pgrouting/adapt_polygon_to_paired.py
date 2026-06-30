@@ -49,6 +49,11 @@ except Exception:
 
 PROFILE = os.environ.get("SPT_PROFILE", "views")
 MIN_FERRY_LENGTH_M = float(os.environ.get("MIN_FERRY_LENGTH_M", "100"))
+# User policy 2026-06-30: penalize ferries with a fixed 20km cost
+# regardless of physical length. Short ferries (river crossings, ~100m)
+# stop being false shortcuts; long Baltic crossings (~60km) become
+# cheaper than the multi-day detour around.
+FERRY_FIXED_COST = float(os.environ.get("FERRY_FIXED_COST_M", "20000"))
 if not re.fullmatch(r"[a-z_][a-z0-9_]*", PROFILE):
     raise SystemExit(f"unsafe profile name: {PROFILE!r}")
 
@@ -86,31 +91,40 @@ def _load_anchors() -> list[dict]:
     return anchors
 
 
-def _annotate_with_snap_vertex(anchors: list[dict]) -> None:
-    """For each anchor, find its snap vertex by argmin(cost) over its
-    polygon NPZ. The seed had cost=0 (or near-0 — multi-seed averages)."""
-    print(f"[adapt] reading {len(anchors):,} polygon NPZs for snap ids ...",
+def _annotate_with_seeds(anchors: list[dict]) -> None:
+    """For each anchor, store the FULL set of cost=0 seed vids from its
+    polygon NPZ (the 1km bbox multi-seed Dijkstra had many roots).
+    Also store snap_vertex_id = first seed (for legacy compatibility)."""
+    print(f"[adapt] reading {len(anchors):,} polygon NPZs for seed sets ...",
           flush=True)
     t0 = time.time()
     missing = 0
+    total_seeds = 0
     for a in anchors:
         ci = a["city_idx"]
         path = POLY_SPT_IN / f"{ci}.npz"
         if not path.exists():
             a["snap_vertex_id"] = None
+            a["snap_vids"] = []
             missing += 1
             continue
         with np.load(path) as z:
-            cost = z["cost"]
-            ng = z["node_global"]
+            cost = np.asarray(z["cost"])
+            ng = np.asarray(z["node_global"])
             if len(cost) == 0:
                 a["snap_vertex_id"] = None
+                a["snap_vids"] = []
                 missing += 1
                 continue
-            min_idx = int(np.argmin(cost))
-            a["snap_vertex_id"] = int(ng[min_idx])
-    print(f"[adapt]   done in {time.time()-t0:.1f}s "
-          f"({missing:,} anchors missing NPZ)", flush=True)
+            zero_idxs = np.where(cost == 0)[0]
+            seeds = ng[zero_idxs].astype(np.int64).tolist()
+            a["snap_vids"] = sorted(seeds)
+            a["snap_vertex_id"] = int(a["snap_vids"][0]) if a["snap_vids"] else None
+            total_seeds += len(seeds)
+    print(f"[adapt]   done in {time.time()-t0:.1f}s ({total_seeds:,} total "
+          f"seed vids across {len(anchors):,} anchors, "
+          f"avg {total_seeds/max(1,len(anchors)):.1f}/anchor; "
+          f"{missing:,} missing NPZ)", flush=True)
 
 
 def _write_cities(anchors: list[dict]) -> None:
@@ -126,6 +140,7 @@ def _write_cities(anchors: list[dict]) -> None:
         "lon":            a["lon"],
         "lat":            a["lat"],
         "snap_vertex_id": a["snap_vertex_id"],
+        "snap_vids":      a.get("snap_vids", []),
         "has_polygon":    True,
     } for a in anchors]
     path = PAIRED_OUT / "cities.json"
@@ -211,22 +226,25 @@ def _find_ferry_owners(
             last_log = time.time()
     print(f"[ferry] SPT-claim done: {len(owners):,}/{len(endpoints):,} "
           f"endpoints owned in {time.time()-t0:.0f}s", flush=True)
-
-    # Fallback: for endpoints not claimed by any SPT, assign nearest
-    # anchor by lat/lon. Needed because ferry terminals often sit
-    # beyond the 1.5-hop hull of the nearest coastal anchor.
+    # Nearest-anchor fallback for endpoints not claimed by any polygon
+    # SPT — needed to keep legit Baltic ferries (Rostock harbor etc.
+    # is beyond any coastal anchor's 1.5-hop hull). To avoid the bogus
+    # river-ferry shortcuts from earlier, the city-graph cost will be
+    # FIXED_FERRY + haversine(A_center, B_center) — putting realistic
+    # last-mile distance back in the edge weight (see _find_ferry_owners
+    # caller below for the cost computation).
     unclaimed = [vid for vid in endpoints if vid not in owners]
     if unclaimed:
-        print(f"[ferry] {len(unclaimed):,} endpoints unclaimed — assigning "
-              f"by nearest anchor (lat/lon)", flush=True)
-        # Need vertex coords. Fetch from postgres in one shot.
+        print(f"[ferry] {len(unclaimed):,} endpoints unclaimed — "
+              f"assigning by nearest anchor (lat/lon) ...", flush=True)
         with psycopg.connect(_cfg.PG_DSN) as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT id, ST_X(the_geom), ST_Y(the_geom) "
                 "FROM ways_vertices_pgr WHERE id = ANY(%s)",
                 (unclaimed,),
             )
-            ep_coords = {int(r[0]): (float(r[1]), float(r[2])) for r in cur.fetchall()}
+            ep_coords = {int(r[0]): (float(r[1]), float(r[2]))
+                         for r in cur.fetchall()}
         anchor_lonlat = np.array([(a["lon"], a["lat"]) for a in anchors],
                                  dtype=np.float64)
         anchor_ci = [a["city_idx"] for a in anchors]
@@ -234,33 +252,50 @@ def _find_ferry_owners(
             if vid not in ep_coords:
                 continue
             elon, elat = ep_coords[vid]
-            # Squared euclidean (degrees) — fine for nearest selection at
-            # this scale; coastal anchors are < 50 km from their ferry
-            # slips so the lat-cos approximation isn't critical.
-            d2 = (anchor_lonlat[:, 0] - elon)**2 + (anchor_lonlat[:, 1] - elat)**2
+            d2 = ((anchor_lonlat[:, 0] - elon) ** 2
+                  + (anchor_lonlat[:, 1] - elat) ** 2)
             nearest_pos = int(np.argmin(d2))
             owners[vid] = (anchor_ci[nearest_pos], 0.0)
-        print(f"[ferry] post-fallback: {len(owners):,}/{len(endpoints):,} "
+        print(f"[ferry]   post-fallback: {len(owners):,}/{len(endpoints):,} "
               f"endpoints owned", flush=True)
 
+    # City-graph ferry edge cost = FERRY_FIXED_COST + haversine(A_center,
+    # B_center). The haversine reinstates the last-mile cost we'd have
+    # paid going A→ferry_terminal and ferry_terminal→B (otherwise short
+    # river ferries become cheap shortcuts when the city centers are
+    # actually 25 km apart). Long Baltic ferries (~150 km centers) stay
+    # cheaper than the multi-day land detour.
+    R_M = 6_371_000.0
+    def _hav_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+        from math import radians, sin, cos, asin, sqrt
+        phi1, phi2 = radians(lat1), radians(lat2)
+        dphi = radians(lat2 - lat1); dlam = radians(lon2 - lon1)
+        a = sin(dphi/2)**2 + cos(phi1)*cos(phi2)*sin(dlam/2)**2
+        return 2 * R_M * asin(sqrt(a))
+    centers = {a["city_idx"]: (a["lon"], a["lat"]) for a in anchors}
+
     out: list[tuple[int, int, float]] = []
-    n_dropped_neg = 0
+    n_oneway_skipped = 0
     for s, t, c_st, c_ts, _ln in ferries:
         a = owners.get(s, (None,))[0]
         b = owners.get(t, (None,))[0]
         if a is None or b is None or a == b:
             continue
-        # Filter both sentinel-large AND negative (one-way sentinel).
+        lon_a, lat_a = centers[a]
+        lon_b, lat_b = centers[b]
+        cost = FERRY_FIXED_COST + _hav_m(lon_a, lat_a, lon_b, lat_b)
         if 0 <= c_st < 1e14:
-            out.append((a, b, c_st))
+            out.append((a, b, cost))
         else:
-            n_dropped_neg += 1
+            n_oneway_skipped += 1
         if 0 <= c_ts < 1e14:
-            out.append((b, a, c_ts))
+            out.append((b, a, cost))
         else:
-            n_dropped_neg += 1
+            n_oneway_skipped += 1
     print(f"[ferry] emitted {len(out):,} ferry chain edges "
-          f"({n_dropped_neg:,} dropped as one-way/sentinel)", flush=True)
+          f"(cost = {FERRY_FIXED_COST:.0f} + haversine(A,B); "
+          f"{n_oneway_skipped:,} directions dropped as one-way/sentinel)",
+          flush=True)
     return out
 
 
@@ -274,16 +309,26 @@ def _build_city_graph(anchors: list[dict]) -> None:
 
     Then add ferry chain edges from postgres.
     """
-    print(f"[adapt] deriving city_graph via SPT overlap ...", flush=True)
+    print(f"[adapt] deriving city_graph via multi-seed SPT overlap ...",
+          flush=True)
     t0 = time.time()
 
-    snap_by_ci = {a["city_idx"]: a["snap_vertex_id"] for a in anchors
-                  if a["snap_vertex_id"] is not None}
-    ci_list = sorted(snap_by_ci.keys())
-    # Pre-build an array of snap vertices in ci order (for vectorized lookup)
-    snap_arr = np.array([snap_by_ci[ci] for ci in ci_list], dtype=np.int64)
-    print(f"[adapt]   {len(ci_list):,} anchors with valid snap vertices",
-          flush=True)
+    # MULTI-SEED: each anchor has a SET of zero-cost vids (the entire 1km
+    # bbox of seed vertices). An (a → b) edge exists if ANY of a's seeds
+    # appears in b's NPZ; cost = min cost over the matched seeds.
+    valid_anchors = [a for a in anchors if a.get("snap_vids")]
+    ci_list = [a["city_idx"] for a in valid_anchors]
+    # Concatenate all seeds; remember which seed belongs to which ci.
+    seed_concat: list[int] = []
+    seed_owner_ci: list[int] = []
+    for a in valid_anchors:
+        for v in a["snap_vids"]:
+            seed_concat.append(int(v))
+            seed_owner_ci.append(int(a["city_idx"]))
+    seed_arr = np.array(seed_concat, dtype=np.int64)
+    owner_arr = np.array(seed_owner_ci, dtype=np.int32)
+    print(f"[adapt]   {len(valid_anchors):,} anchors / {len(seed_arr):,} "
+          f"total seed vids to probe in each NPZ", flush=True)
 
     from_city: list[int] = []
     to_city:   list[int] = []
@@ -297,26 +342,38 @@ def _build_city_graph(anchors: list[dict]) -> None:
         with np.load(path) as z:
             to_ng = np.asarray(z["node_global"], dtype=np.int64)
             to_cost = np.asarray(z["cost"], dtype=np.float32)
-        # node_global is sorted ASC (from Dijkstra slice semantics)?
-        # Polygon NPZ may not be sorted — sort if needed.
         if len(to_ng) > 1 and to_ng[1] < to_ng[0]:
             order = np.argsort(to_ng, kind="stable")
             to_ng = to_ng[order]
             to_cost = to_cost[order]
 
-        # Vectorized: searchsorted all snap_arr at once.
-        idx = np.searchsorted(to_ng, snap_arr)
+        # Vectorized: searchsorted all seeds against this NPZ.
+        idx = np.searchsorted(to_ng, seed_arr)
         in_range = idx < len(to_ng)
-        matched = np.zeros_like(in_range)
-        matched[in_range] = to_ng[idx[in_range]] == snap_arr[in_range]
-        # Don't emit self-edges
-        self_pos = ci_list.index(ci_to) if ci_to in ci_list else -1
-        if self_pos >= 0:
-            matched[self_pos] = False
-        for pos in np.flatnonzero(matched):
-            from_city.append(ci_list[pos])
+        matched_mask = np.zeros_like(in_range)
+        matched_mask[in_range] = to_ng[idx[in_range]] == seed_arr[in_range]
+        # For each owner_ci that has at least one matched seed in this
+        # NPZ, take min cost over its matched seeds.
+        matched_owners = owner_arr[matched_mask]
+        matched_costs = to_cost[idx[matched_mask]]
+        if len(matched_owners) == 0:
+            continue
+        # group-by min via sort
+        order = np.argsort(matched_owners, kind="stable")
+        mo_s = matched_owners[order]
+        mc_s = matched_costs[order]
+        # Find group boundaries
+        change = np.concatenate([[True], mo_s[1:] != mo_s[:-1]])
+        starts = np.flatnonzero(change)
+        ends = np.concatenate([starts[1:], [len(mo_s)]])
+        for s, e in zip(starts, ends):
+            owner = int(mo_s[s])
+            if owner == ci_to:
+                continue   # no self-loop
+            cost = float(mc_s[s:e].min())
+            from_city.append(owner)
             to_city.append(ci_to)
-            weight.append(float(to_cost[idx[pos]]))
+            weight.append(cost)
 
         if time.time() - last_log >= 10:
             pct = 100.0 * n_done / len(ci_list)
@@ -366,7 +423,7 @@ def main() -> None:
     print(f"[adapt]   polygon SPT input: {POLY_SPT_IN}", flush=True)
     print(f"[adapt]   paired-format out: {PAIRED_OUT}", flush=True)
     anchors = _load_anchors()
-    _annotate_with_snap_vertex(anchors)
+    _annotate_with_seeds(anchors)
     _write_cities(anchors)
     _build_city_graph(anchors)
     _ensure_spt_symlink()
