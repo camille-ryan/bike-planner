@@ -81,7 +81,7 @@ services:
       - ./data:/data:ro
     environment:
       - DATA_DIR=/data
-      - DEFAULT_PROFILE=direct
+      - DEFAULT_PROFILE=views
       # /live/* endpoints query Postgres directly (anchors list, live
       # cost-gradient view of the multi-source SPT). Postgres is optional
       # — those endpoints just 503 if the DB is unreachable.

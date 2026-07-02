@@ -503,48 +503,38 @@ def route(
             f"no city_graph path from city {start_city} to city {end_city}"
         )
 
-    # NEW (polygon-SPT era): trunks are bracketed with synthetic
-    # anchor-center vids (-2-ci for city ci). Every (A, B) trunk
-    # starts with SYNTH_A and ends with SYNTH_B, so chain joins are
-    # deterministic — no SPT-membership skip-ahead, no haversine
-    # fallback. The first leg's entry vid is SYNTH_(start_city) and
-    # the last leg ends at SYNTH_(end_city). User-supplied start/end
-    # lonlat become first-mile / last-mile straight segments to the
-    # anchor centers (the polygon SPT's region semantics already
-    # absorb up to ~1 km of slack around each anchor).
-    SYNTH = lambda ci: -2 - int(ci)
+    # V1-style paired-SPT walk (post-2026-07 rebuild): each (A, B)
+    # trunk is a pruned slice of A.SPT covering the corridor into B.
+    # `succ` points to A.SPT.parent (toward A-seed) with NULL_SENTINEL
+    # wherever the parent falls outside kept — which happens exactly
+    # at B-frontier vertices. Walking succ from any kept vertex thus
+    # gradient-descends toward A-seed and terminates naturally at the
+    # first B-frontier encountered. That terminating vid is in A∩B,
+    # so it's also in B.SPT, and (typically) F-only for the next pair
+    # (B, C) — chain joins are deterministic at real vids, no SYNTH.
+    #
+    # SKIP FIRST PAIR: user_snap is deep inside chain[0]'s territory
+    # (probably even at chain[0]'s seed). Walking chain[0].parent
+    # would either terminate immediately or drag us to chain[0]-seed
+    # away from B. The first pair we USE is (chain[1], chain[2]);
+    # user_snap sits in chain[1]'s F-only region and the walk carries
+    # us toward chain[2]-frontier. For chains of length ≤2 the loop
+    # is empty and the route is just the first/last mile straight.
 
     t2 = time.time()
-    coords: list[list[float]] = []
+    coords: list[list[float]] = [[float(start[0]), float(start[1])]]
     bridges: list[dict] = []
 
-    # First-mile: user start → start_city center (straight segment).
-    sc_info = next((c for c in prof.cities
-                    if int(c["city_idx"]) == int(start_city)), None)
-    if sc_info is None:
-        raise RuntimeError(f"start_city {start_city} not in cities.json")
-    coords.append([float(start[0]), float(start[1])])
-    coords.append([float(sc_info["lon"]), float(sc_info["lat"])])
-    first_mile_m = _haversine_m(
-        float(start[0]), float(start[1]),
-        float(sc_info["lon"]), float(sc_info["lat"]),
-    )
-    if first_mile_m > 0:
-        bridges.append({"leg": "first_mile", "from_city": None,
-                        "to_city": int(start_city),
-                        "distance_m": round(first_mile_m, 1)})
-
-    # Chain walk: every leg's trunk is entered via SYNTH_(from_city)
-    # and ends at SYNTH_(to_city) — searchsorted-clean joins.
-    chain_terminus_vid = SYNTH(start_city)
-    for i in range(0, len(chain) - 1):
+    chain_terminus_vid = start_vid
+    chain_terminus_coord = (float(start[1]), float(start[0]))  # (lat, lon) for _walk
+    for i in range(1, len(chain) - 1):
         a, b = chain[i], chain[i + 1]
         trunk = prof.trunks.get((a, b))
         if trunk is None:
             raise RuntimeError(f"missing trunk for ({a}, {b})")
         arr, next_idx = trunk
         walk = _walk(arr, next_idx, chain_terminus_vid,
-                     bridge_target=None)
+                     bridge_target=chain_terminus_coord)
         if walk is None:
             raise RuntimeError(
                 f"trunk walk failed at leg {i} (city {a} → {b}), "
@@ -559,15 +549,26 @@ def route(
         for k in idxs:
             coords.append([float(arr["lon"][k]), float(arr["lat"][k])])
         chain_terminus_vid = int(arr["vid"][idxs[-1]])
+        chain_terminus_coord = (
+            float(arr["lat"][idxs[-1]]), float(arr["lon"][idxs[-1]]),
+        )
     t_walk = time.time() - t2
 
-    # Last-mile: end_city center → user end (straight segment).
-    ec_info = next((c for c in prof.cities
-                    if int(c["city_idx"]) == int(end_city)), None)
-    if ec_info is None:
-        raise RuntimeError(f"end_city {end_city} not in cities.json")
+    # First-mile: user start → first walked coord (straight bridge).
+    if len(coords) > 1:
+        first_mile_m = _haversine_m(
+            float(start[0]), float(start[1]),
+            coords[1][0], coords[1][1],
+        )
+        if first_mile_m > 0:
+            bridges.insert(0, {"leg": "first_mile", "from_city": None,
+                               "to_city": int(start_city),
+                               "distance_m": round(first_mile_m, 1)})
+
+    # Last-mile: last walked coord → user end (straight bridge).
+    last_walked = coords[-1]
     last_mile_m = _haversine_m(
-        float(ec_info["lon"]), float(ec_info["lat"]),
+        float(last_walked[0]), float(last_walked[1]),
         float(end[0]), float(end[1]),
     )
     coords.append([float(end[0]), float(end[1])])
@@ -602,6 +603,7 @@ def route(
         "properties": {
             "profile":            profile,
             "chain_length":       len(chain),
+            "chain_city_idx":     [int(ci) for ci in chain],
             "chain_names":        chain_names,
             "leg_count":          len(chain) - 1,
             "vertex_count":       len(coords),

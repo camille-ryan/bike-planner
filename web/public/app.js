@@ -3,10 +3,9 @@
 
 const API = "/api";
 
-const PROFILES = ["direct", "views"];
+const PROFILES = ["views"];
 const PROFILE_COLORS = {
-  direct: "#888888",
-  views:  "#d4623a",
+  views: "#d4623a",
 };
 
 // --- map setup ---------------------------------------------------------
@@ -79,12 +78,31 @@ map.on("load", () => {
     paint: {
       "line-color": [
         "match", ["get", "profile"],
-        "direct", PROFILE_COLORS.direct,
         "views",  PROFILE_COLORS.views,
         "#aaa",
       ],
       "line-width": 4,
       "line-opacity": 0.85,
+    },
+  });
+
+  // Bridges: any consecutive-coord segment > BRIDGE_MIN_M is drawn as
+  // a dashed cyan line on top of the route so gaps in trunk coverage
+  // are visually obvious. Detected client-side by scanning the
+  // returned polyline (server-side `bridges` gives distances but not
+  // coords).
+  map.addSource("route-bridges", {
+    type: "geojson", data: emptyFC(), tolerance: 0,
+  });
+  map.addLayer({
+    id: "route-bridges-line",
+    type: "line",
+    source: "route-bridges",
+    paint: {
+      "line-color": "#22d3ee",
+      "line-width": 4,
+      "line-opacity": 0.95,
+      "line-dasharray": [1.5, 1.5],
     },
   });
 });
@@ -312,11 +330,12 @@ async function routeNow() {
 function mergeLegs(legs) {
   // Concatenate coordinates; drop the first point of each leg after the
   // first to avoid a duplicated vertex at the join. Sum gross_length_m
-  // and vertex_count; concat chain_names with dedup.
+  // and vertex_count; concat chain_names + chain_city_idx with dedup.
   const coords = [];
   let totalLen = 0;
   let totalNodes = 0;
   const cities = [];
+  const chainIdx = [];
   const bridges = [];
   for (const leg of legs) {
     const lc = leg.geometry.coordinates;
@@ -326,8 +345,13 @@ function mergeLegs(legs) {
     totalLen += +lp.gross_length_m || 0;
     totalNodes += +lp.vertex_count || 0;
     const lcities = lp.chain_names || [];
-    for (const c of lcities) {
-      if (cities[cities.length - 1] !== c) cities.push(c);
+    const lidx    = lp.chain_city_idx || [];
+    for (let i = 0; i < lcities.length; i++) {
+      const c = lcities[i], ci = lidx[i];
+      if (cities[cities.length - 1] !== c) {
+        cities.push(c);
+        if (ci !== undefined) chainIdx.push(ci);
+      }
     }
     for (const b of (lp.bridges || [])) bridges.push(b);
   }
@@ -337,12 +361,52 @@ function mergeLegs(legs) {
     properties: {
       creator: "trunk-router",
       chain_names: cities,
+      chain_city_idx: chainIdx,
       gross_length_m: totalLen,
       vertex_count: totalNodes,
       leg_count: legs.length,
       bridges,
     },
   };
+}
+
+// Minimum segment length (m) to classify a consecutive-coord jump
+// as a bridge. Trunk SPT vertex spacing varies wildly — dense-urban
+// stretches are ~10-30 m apart but long straight rural segments can
+// be 500-1000 m. Real corridor bridges (chain-pair joins, ferries,
+// first/last mile) are >2 km. 2000 m is above road jitter.
+const BRIDGE_MIN_M = 2000;
+
+function _hav(a, b) {
+  const R = 6_371_000;
+  const p1 = a[1] * Math.PI / 180, p2 = b[1] * Math.PI / 180;
+  const dp = (b[1] - a[1]) * Math.PI / 180;
+  const dl = (b[0] - a[0]) * Math.PI / 180;
+  const s = Math.sin(dp/2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl/2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function extractBridges(features) {
+  // For every merged route feature, walk consecutive coord pairs and
+  // emit any segment > BRIDGE_MIN_M as its own LineString feature.
+  const out = [];
+  for (const f of features) {
+    const coords = f.geometry.coordinates || [];
+    for (let i = 1; i < coords.length; i++) {
+      const d = _hav(coords[i-1], coords[i]);
+      if (d > BRIDGE_MIN_M) {
+        out.push({
+          type: "Feature",
+          geometry: {
+            type: "LineString",
+            coordinates: [coords[i-1], coords[i]],
+          },
+          properties: { distance_m: d, profile: f.properties?.profile },
+        });
+      }
+    }
+  }
+  return out;
 }
 
 function renderRoutes(results) {
@@ -353,6 +417,10 @@ function renderRoutes(results) {
   map.getSource("routes-multi").setData({
     type: "FeatureCollection",
     features,
+  });
+  map.getSource("route-bridges").setData({
+    type: "FeatureCollection",
+    features: extractBridges(features),
   });
 
   // Fit to the union bbox of every successful profile's geometry.
@@ -709,7 +777,7 @@ const API_BASE = (location.hostname === "localhost" || location.hostname === "12
 
 async function fetchSptStatus() {
   try {
-    const r = await fetch(`${API_BASE}/way-graph/spt-status?profile=direct_polygon&_=${Date.now()}`);
+    const r = await fetch(`${API_BASE}/way-graph/spt-status?profile=views_polygon&_=${Date.now()}`);
     if (!r.ok) throw new Error(`spt-status: ${r.status}`);
     const d = await r.json();
     sptStatus.done = d.done;
@@ -989,7 +1057,7 @@ async function loadSptForCityIdx(city_idx, label) {
   currentSptCityIdx = city_idx;
   currentSptLabel = label;
   const maxFeatures = +document.getElementById("spt-max-features").value || 300000;
-  const url = `${API_BASE}/way-graph/spt/${city_idx}?profile=direct_polygon&max_features=${maxFeatures}`;
+  const url = `${API_BASE}/way-graph/spt/${city_idx}?profile=views_polygon&max_features=${maxFeatures}`;
   setBusy(`Loading SPT for ${label} (cap ${maxFeatures.toLocaleString()})…`);
   try {
     const r = await fetch(url);
@@ -1029,6 +1097,159 @@ document.getElementById("show-way-graph-edges").addEventListener("change", async
     map.setLayoutProperty("way-graph-edges-line", "visibility", "visible");
   } else if (wayGraphEdgesLoaded) {
     map.setLayoutProperty("way-graph-edges-line", "visibility", "none");
+  }
+});
+
+// --- Per-anchor SPT overlay for the planned route -----------------------
+//
+// For each chain anchor in the last route, fetch its polygon-bounded
+// SPT and render them all into one combined layer (red→green cost
+// ramp). Also outline each anchor's polygon in white so the boundary
+// between adjacent paired SPTs reads cleanly. Purpose: README
+// screenshots that explain the paired-SPT methodology.
+
+const ROUTE_SPTS_MAX_PER_ANCHOR = 8000;   // cap edges per anchor
+const ROUTE_SPTS_CONCURRENCY    = 6;      // simultaneous fetches
+
+let routeSptsLayerReady = false;
+let routeSptsAllPolygons = null;          // cached way_city_spt_polygons.geojson
+
+function ensureRouteSptsLayer() {
+  if (routeSptsLayerReady) return;
+  map.addSource("route-spts", {
+    type: "geojson",
+    data: { type: "FeatureCollection", features: [] },
+  });
+  map.addLayer({
+    id: "route-spts-line",
+    type: "line",
+    source: "route-spts",
+    paint: {
+      "line-color": [
+        "interpolate", ["linear"], ["get", "cost"],
+        0,      "#22c55e",
+        10000,  "#84cc16",
+        30000,  "#facc15",
+        60000,  "#f97316",
+        100000, "#dc2626",
+      ],
+      "line-width": [
+        "interpolate", ["linear"], ["zoom"],
+        8,  0.7,
+        12, 1.4,
+        16, 2.2,
+      ],
+      "line-opacity": 0.85,
+    },
+  }, "routes-multi-line");
+
+  map.addSource("route-spt-polygons", {
+    type: "geojson",
+    data: { type: "FeatureCollection", features: [] },
+  });
+  map.addLayer({
+    id: "route-spt-polygons-line",
+    type: "line",
+    source: "route-spt-polygons",
+    paint: {
+      "line-color": "#ffffff",
+      "line-width": 1.4,
+      "line-opacity": 0.9,
+    },
+  });
+  routeSptsLayerReady = true;
+}
+
+async function fetchAllPolygonsOnce() {
+  if (routeSptsAllPolygons) return routeSptsAllPolygons;
+  const r = await fetch("/data/way_city_spt_polygons.geojson?ts=" + Date.now());
+  if (!r.ok) throw new Error(`spt_polygons: ${r.status}`);
+  routeSptsAllPolygons = await r.json();
+  return routeSptsAllPolygons;
+}
+
+async function loadRouteSpts() {
+  ensureRouteSptsLayer();
+  const route = state.routesByProfile["views"]
+             || Object.values(state.routesByProfile)[0];
+  const chainIdx = route?.properties?.chain_city_idx;
+  const badge = document.getElementById("route-spts-status");
+  if (!chainIdx || chainIdx.length === 0) {
+    badge.textContent = "(plan a route first)";
+    map.getSource("route-spts").setData({ type: "FeatureCollection", features: [] });
+    map.getSource("route-spt-polygons").setData({ type: "FeatureCollection", features: [] });
+    return;
+  }
+  badge.textContent = `loading 0 / ${chainIdx.length}…`;
+
+  // Outline polygons up front — these are cheap (one static GeoJSON).
+  try {
+    const allPolys = await fetchAllPolygonsOnce();
+    const wanted = new Set(chainIdx);
+    // Polygons are keyed by ref; need ref → city_idx via sptStatus.
+    const refForIdx = new Map();
+    if (sptStatus.refByIdx) {
+      for (const ci of chainIdx) {
+        const ref = sptStatus.refByIdx.get(ci);
+        if (ref) refForIdx.set(ref, ci);
+      }
+    }
+    const polyFeats = (allPolys.features || []).filter(f => refForIdx.has(f.properties?.ref));
+    map.getSource("route-spt-polygons").setData({
+      type: "FeatureCollection", features: polyFeats,
+    });
+  } catch (e) {
+    console.warn("route-spt polygon outline load failed:", e.message);
+  }
+
+  // Fetch SPTs with bounded concurrency. Stream features into the
+  // source as each batch arrives so the user sees progress.
+  const all = [];
+  let done = 0;
+  const queue = [...chainIdx];
+  async function worker() {
+    while (queue.length) {
+      const ci = queue.shift();
+      try {
+        const url = `${API_BASE}/way-graph/spt/${ci}?profile=views_polygon&max_features=${ROUTE_SPTS_MAX_PER_ANCHOR}`;
+        const r = await fetch(url);
+        if (r.ok) {
+          const fc = await r.json();
+          for (const f of fc.features || []) {
+            f.properties = f.properties || {};
+            f.properties.anchor_idx = ci;
+            all.push(f);
+          }
+        }
+      } catch (e) {
+        // silently skip failures — overlay is best-effort
+      }
+      done++;
+      badge.textContent = `loading ${done} / ${chainIdx.length}…`;
+      if (done % 5 === 0 || done === chainIdx.length) {
+        map.getSource("route-spts").setData({
+          type: "FeatureCollection", features: all,
+        });
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: ROUTE_SPTS_CONCURRENCY }, worker));
+  map.getSource("route-spts").setData({
+    type: "FeatureCollection", features: all,
+  });
+  badge.textContent = `${chainIdx.length} anchors · ${all.length.toLocaleString()} edges`;
+}
+
+document.getElementById("show-route-spts").addEventListener("change", async (e) => {
+  ensureRouteSptsLayer();
+  if (e.target.checked) {
+    map.setLayoutProperty("route-spts-line", "visibility", "visible");
+    map.setLayoutProperty("route-spt-polygons-line", "visibility", "visible");
+    try { await loadRouteSpts(); }
+    catch (err) { setError(`route SPTs: ${err.message}`); }
+  } else {
+    map.setLayoutProperty("route-spts-line", "visibility", "none");
+    map.setLayoutProperty("route-spt-polygons-line", "visibility", "none");
   }
 });
 

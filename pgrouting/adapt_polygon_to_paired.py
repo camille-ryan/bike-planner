@@ -385,14 +385,16 @@ def _build_city_graph(anchors: list[dict]) -> None:
     print(f"[adapt]   {len(from_city):,} directed edges from SPT overlap in "
           f"{time.time()-t0:.0f}s", flush=True)
 
-    # Add ferry chain edges so disconnected island clusters (e.g. Cph
-    # on Sealand) bridge into the mainland network via ferries.
-    ferries = _fetch_ferry_edges(PROFILE)
-    ferry_edges = _find_ferry_owners(ferries, anchors)
-    for a, b, w in ferry_edges:
-        from_city.append(a); to_city.append(b); weight.append(w)
+    # NOTE (2026-07-01): synthetic ferry chain edges (cost = 20 km +
+    # haversine between anchor centers) removed. Ferry connectivity is
+    # now handled by the polygon compute step, which emits a disjoint
+    # 5 km disc around each ferry-neighbor anchor. Since ferry `ways`
+    # are already bike-routable edges in the cell graph, the polygon
+    # SPT walks across the ferry naturally and chain edges emerge from
+    # real SPT overlap in the loop above.
     print(f"[adapt]   total {len(from_city):,} directed edges "
-          f"(overlap + ferry)", flush=True)
+          f"(overlap-only; ferries handled via polygon SPT)",
+          flush=True)
 
     cg = {"from_city": from_city, "to_city": to_city, "weight": weight}
     path = PAIRED_OUT / "city_graph.json"

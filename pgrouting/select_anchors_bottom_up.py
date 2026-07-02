@@ -53,6 +53,12 @@ VILLAGE_FILES  = [
     Path("/data/osm/germany-villages.geojsonseq"),
     Path("/data/osm/denmark-villages.geojsonseq"),
 ]
+# Ferry piers are promoted to first-class anchors so the chain graph
+# connects ferry-linked coasts via real ferry polylines rather than
+# synthetic straight-line edges between anchor centers. Piers are
+# `_protected=True` — they survive the greedy dropout regardless of
+# whether a bigger settlement lies within MIN_SPACING_M.
+FERRY_PIERS_FILE = Path("/data/ferry_piers.geojsonseq")
 
 
 def _load_all_places(conn: psycopg.Connection) -> list[dict]:
@@ -94,12 +100,47 @@ def _load_all_places(conn: psycopg.Connection) -> list[dict]:
             })
         print(f"[bottom-up]   loaded {len(villages)-n0:,} villages from "
               f"{path.name}", flush=True)
-    return db_anchors + villages
+
+    ferry_piers: list[dict] = []
+    if FERRY_PIERS_FILE.exists():
+        for line in open(FERRY_PIERS_FILE):
+            line = line.strip().lstrip("\x1e").strip()
+            if not line:
+                continue
+            f = json.loads(line)
+            lon, lat = f["geometry"]["coordinates"]
+            props = f.get("properties", {})
+            vid = int(props.get("vid") or 0)
+            ferry_piers.append({
+                "kind":        "ferry_pier",
+                "ref":         f"ferry:{vid}",
+                "name":        props.get("name") or f"Ferry pier {vid}",
+                "place":       "ferry_pier",
+                "population":  None,
+                "country":     None,
+                "lon":         float(lon),
+                "lat":         float(lat),
+                "pop":         0,
+                "_protected": True,   # never dropped by _greedy_dropout
+                "vid":         vid,
+            })
+        print(f"[bottom-up]   loaded {len(ferry_piers):,} ferry piers from "
+              f"{FERRY_PIERS_FILE.name}", flush=True)
+    else:
+        print(f"[bottom-up] missing ferry piers file: {FERRY_PIERS_FILE}",
+              flush=True)
+
+    return db_anchors + villages + ferry_piers
 
 
 def _greedy_dropout(places: list[dict], min_spacing_m: float) -> list[dict]:
     """Iterate places in ascending-pop order. Drop a place if any OTHER
-    place still kept lies within min_spacing_m. Returns the survivors."""
+    place still kept lies within min_spacing_m. Returns the survivors.
+
+    Entries with `_protected=True` are never dropped (they still count
+    as nearby neighbors for others, so a village within 10 km of a
+    protected ferry pier still gets dropped).
+    """
     n = len(places)
     xyz = _lonlat_to_xyz(
         np.array([p["lon"] for p in places]),
@@ -109,12 +150,15 @@ def _greedy_dropout(places: list[dict], min_spacing_m: float) -> list[dict]:
     chord = _chord_for_arc(min_spacing_m)
 
     keep = np.ones(n, dtype=bool)
+    protected = np.array([p.get("_protected", False) for p in places], dtype=bool)
     # Iterate by pop ASC; ties broken by ref for determinism.
     order = sorted(range(n), key=lambda i: (places[i]["pop"], places[i]["ref"]))
-    n_dropped_by_bucket = {"city": 0, "town": 0, "village": 0}
+    n_dropped_by_bucket = {"city": 0, "town": 0, "village": 0, "ferry_pier": 0}
     for i in order:
         if not keep[i]:
             continue
+        if protected[i]:
+            continue          # never drop protected entries
         nearby = tree.query_ball_point(xyz[i], r=chord)
         # Drop if any *other* still-kept place lies within chord.
         has_neighbor = any(j != i and keep[j] for j in nearby)
@@ -127,7 +171,8 @@ def _greedy_dropout(places: list[dict], min_spacing_m: float) -> list[dict]:
     print(f"[bottom-up] dropped {n - len(survivors):,} of {n:,}  "
           f"(cities -{n_dropped_by_bucket['city']}, "
           f"towns -{n_dropped_by_bucket['town']}, "
-          f"villages -{n_dropped_by_bucket['village']})",
+          f"villages -{n_dropped_by_bucket['village']}, "
+          f"ferry piers -{n_dropped_by_bucket['ferry_pier']})",
           flush=True)
     return survivors
 
@@ -170,7 +215,8 @@ def main() -> None:
         places = _load_all_places(conn)
     print(f"[bottom-up] {len(places):,} candidate places "
           f"({sum(1 for p in places if p['kind']=='db'):,} db + "
-          f"{sum(1 for p in places if p['kind']=='village'):,} villages)",
+          f"{sum(1 for p in places if p['kind']=='village'):,} villages + "
+          f"{sum(1 for p in places if p['kind']=='ferry_pier'):,} ferry piers)",
           flush=True)
 
     print("[bottom-up] running greedy dropout…", flush=True)

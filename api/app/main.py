@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 import json
 from pathlib import Path
@@ -83,7 +84,7 @@ async def trunk_route(
 @app.get("/way-graph/spt/{city_idx}")
 def way_graph_spt(
     city_idx: int,
-    profile: str = "direct_polygon",
+    profile: str = "views_polygon",
     max_cost: float | None = Query(None, description="Filter to edges with cost-from-anchor < this"),
     max_features: int = Query(300_000, ge=1_000, le=2_000_000,
                               description="Cap on returned edges; keeps the cheapest N if total exceeds it"),
@@ -119,9 +120,6 @@ def way_graph_spt(
             "cost_min": 0.0, "cost_max": 0.0,
         }
 
-    # Subsample if huge. Keep the cheapest `max_features` edges by
-    # cost-from-anchor so the visible SPT is the core reach (densest
-    # near the anchor) rather than a sparse scatter. argpartition is O(n).
     if n_valid > max_features and max_cost is None:
         valid_costs = cost[valid_idx]
         cheapest = np.argpartition(valid_costs, max_features)[:max_features]
@@ -157,8 +155,95 @@ def way_graph_spt(
     }
 
 
+@app.get("/way-graph/paired-spt/{a}/{b}")
+def way_graph_paired_spt(
+    a: int,
+    b: int,
+    profile: str = "views_polygon",
+) -> dict:
+    """Paired-SPT corridor visualization for a chain pair (A, B).
+
+    A "paired SPT" is the corridor of vertices visited by BOTH A's
+    polygon SPT and B's polygon SPT — i.e., the area where A's reach
+    overlaps B's frontier when routing from A to B. Each returned edge
+    is (vertex -> A.parent[vertex]) for vertices in the intersection,
+    colored by cost from A (so green near A, red near B).
+
+    Returns FeatureCollection of LineStrings with `cost`, `cost_a`,
+    `cost_b` properties. The lens/crescent shape between the two
+    anchors is the methodology screenshot.
+    """
+    import numpy as np
+    a_path = SPT_DIR / profile / f"{a}.npz"
+    b_path = SPT_DIR / profile / f"{b}.npz"
+    if not a_path.exists() or not b_path.exists():
+        raise HTTPException(404, f"SPT not built for one of city_idx {a}, {b} (profile '{profile}')")
+    with np.load(a_path) as fa:
+        a_vids = np.asarray(fa["node_global"])
+        a_parent = np.asarray(fa["parent"])
+        a_cost = np.asarray(fa["cost"])
+        a_coords = np.asarray(fa["coords_lonlat"])
+    with np.load(b_path) as fb:
+        b_vids = np.asarray(fb["node_global"])
+        b_cost = np.asarray(fb["cost"])
+
+    # Map B's vid -> B's local cost, then look up cost_b for each A vertex.
+    b_order = np.argsort(b_vids, kind="stable")
+    b_vids_sorted = b_vids[b_order]
+    b_cost_sorted = b_cost[b_order]
+    pos = np.searchsorted(b_vids_sorted, a_vids)
+    pos = np.clip(pos, 0, len(b_vids_sorted) - 1)
+    in_b = b_vids_sorted[pos] == a_vids
+    cost_b_for_a = np.where(in_b, b_cost_sorted[pos], np.inf)
+
+    # Paired-SPT corridor: vertices in BOTH A and B, with a valid parent
+    # in A (so we have an edge to draw).
+    keep_mask = in_b & (a_parent >= 0)
+    valid_idx = np.where(keep_mask)[0]
+    n_valid = int(len(valid_idx))
+    if n_valid == 0:
+        return {
+            "type": "FeatureCollection", "features": [],
+            "a": a, "b": b, "kept_count": 0,
+            "a_visited": int(len(a_vids)), "b_visited": int(len(b_vids)),
+            "intersection_size": int(in_b.sum()),
+        }
+
+    child_lonlat  = a_coords[valid_idx]
+    parent_lonlat = a_coords[a_parent[valid_idx]]
+    ca = a_cost[valid_idx].astype("float32")
+    cb = cost_b_for_a[valid_idx].astype("float32")
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [
+                    [float(child_lonlat[i, 0]), float(child_lonlat[i, 1])],
+                    [float(parent_lonlat[i, 0]), float(parent_lonlat[i, 1])],
+                ],
+            },
+            "properties": {
+                "cost":   float(ca[i]),    # cost from A — primary color
+                "cost_b": float(cb[i]),    # cost from B — alt color
+            },
+        }
+        for i in range(n_valid)
+    ]
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "a": a, "b": b,
+        "kept_count": n_valid,
+        "a_visited": int(len(a_vids)),
+        "b_visited": int(len(b_vids)),
+        "intersection_size": int(in_b.sum()),
+        "cost_min": float(ca.min()), "cost_max": float(ca.max()),
+    }
+
+
 @app.get("/way-graph/spt-status")
-def way_graph_spt_status(profile: str = "direct_polygon") -> dict:
+def way_graph_spt_status(profile: str = "views_polygon") -> dict:
     """Which polygon-bounded SPTs have been written so far. Lets the
     web UI light up anchors green as the (slow) overnight build
     progresses, and grey-out the ones still pending.

@@ -319,12 +319,22 @@ def _spt_one_anchor_inner(city_idx, anchor, polygon_ring):
     keep_global = _TILE["gid_of_local"][keep_tile_local].astype(np.int64)
     coords_kept = verts[keep_tile_local].astype(np.float32)
 
+    # is_frontier: vertex has at least one out-edge in the full cell
+    # graph that lands OUTSIDE the polygon. Interior dead-end spurs
+    # (cul-de-sacs, hilltop finger roads) will have sub_out_degree ==
+    # full_out_degree and thus is_frontier=False, letting the paired-
+    # SPT builder drop them during ancestor-of-frontier-leaves pruning.
+    full_deg = csr.indptr[keep_tile_local + 1] - csr.indptr[keep_tile_local]
+    sub_deg  = sub_csr.indptr[keep + 1] - sub_csr.indptr[keep]
+    is_frontier_kept = (full_deg > sub_deg).astype(np.uint8)
+
     np.savez_compressed(
         out_path,
         node_global=keep_global,
         parent=parent_kept,
         cost=cost_kept,
         coords_lonlat=coords_kept,
+        is_frontier=is_frontier_kept,
     )
     return (city_idx, "ok")
 

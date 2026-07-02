@@ -123,7 +123,8 @@ def _load_subgraph(conn: psycopg.Connection):
         SELECT w.source, w.target, w.length_m, w.osm_way_id, w.highway,
                COALESCE(t.name, '') AS name, COALESCE(t.ref, '') AS ref,
                vs.id, ST_X(vs.the_geom), ST_Y(vs.the_geom),
-               vt.id, ST_X(vt.the_geom), ST_Y(vt.the_geom)
+               vt.id, ST_X(vt.the_geom), ST_Y(vt.the_geom),
+               w.is_ferry
         FROM ways w
         JOIN ways_vertices_pgr vs ON vs.id = w.source
         JOIN ways_vertices_pgr vt ON vt.id = w.target
@@ -131,6 +132,7 @@ def _load_subgraph(conn: psycopg.Connection):
         WHERE w.length_m > 0.0
           AND (
               w.highway IN ({seed_ph})
+              OR w.is_ferry
               OR (
                   w.highway IN ({promote_ph})
                   AND (COALESCE(t.name, '') <> '' OR COALESCE(t.ref, '') <> '')
@@ -157,9 +159,9 @@ def _load_subgraph(conn: psycopg.Connection):
 
     n_seed_rows = 0
     for i, r in enumerate(rows):
-        (sv, tv, lm, oid, hw, name, ref, sg, sx, sy, tg, tx, ty) = r
+        (sv, tv, lm, oid, hw, name, ref, sg, sx, sy, tg, tx, ty, is_ferry) = r
         oid = int(oid)
-        is_seed = hw in SEED_HIGHWAYS
+        is_seed = (hw in SEED_HIGHWAYS) or bool(is_ferry)
         if is_seed:
             n_seed_rows += 1
             seed_set.add(oid)
@@ -773,7 +775,32 @@ def _write_outputs(anchors: list[dict], result: dict) -> None:
           f"({len(orphan_idx):,} anchors > buffer)", flush=True)
 
 
+def _load_anchors_geojson(path: Path) -> list[dict]:
+    """Load anchors from a way_city_anchors.geojson written by an
+    earlier selection step (e.g., select_anchors_bottom_up.py). Used
+    when we want compute_chain_graph to run against a pre-selected
+    anchor set (including protected ferry piers) rather than
+    re-selecting from postgres."""
+    fc = json.loads(path.read_text())
+    out: list[dict] = []
+    for f in fc["features"]:
+        p = f["properties"]
+        lon, lat = f["geometry"]["coordinates"]
+        out.append({
+            "kind":       p.get("kind"),
+            "ref":        p["ref"],
+            "name":       p["name"],
+            "place":      p.get("place"),
+            "population": p.get("population"),
+            "country":    p.get("country"),
+            "lon":        float(lon),
+            "lat":        float(lat),
+        })
+    return out
+
+
 def main() -> None:
+    import os
     t0 = time.time()
     print(f"[way-graph] seed highways: {SEED_HIGHWAYS}", flush=True)
     print(f"[way-graph] promotable:    {PROMOTABLE_HIGHWAYS}", flush=True)
@@ -784,10 +811,17 @@ def main() -> None:
 
     with psycopg.connect(config.PG_DSN) as conn:
         src, dst, edge_len, verts, _l2g = _load_subgraph(conn)
-        db_anchors = _load_db_anchors(conn)
-    anchors = db_anchors
-    print(f"[way-graph] anchors: {len(db_anchors):,} db (villages disabled)",
-          flush=True)
+        # Prefer a pre-written anchors file (e.g., from
+        # select_anchors_bottom_up.py, which includes ferry piers)
+        # over re-selecting from the anchors table.
+        if OUT_NODES_GEOJSON.exists() and os.environ.get("WAY_GRAPH_USE_PRESELECTED_ANCHORS", "1") == "1":
+            anchors = _load_anchors_geojson(OUT_NODES_GEOJSON)
+            print(f"[way-graph] anchors: {len(anchors):,} loaded from "
+                  f"{OUT_NODES_GEOJSON.name} (pre-selected)", flush=True)
+        else:
+            anchors = _load_db_anchors(conn)
+            print(f"[way-graph] anchors: {len(anchors):,} db (villages disabled)",
+                  flush=True)
 
     components = _compute_components(src, dst, len(verts))
     result = compute_chain_graph(anchors, src, dst, edge_len, verts,
