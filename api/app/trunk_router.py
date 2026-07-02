@@ -570,6 +570,64 @@ def route(
 
     chain_terminus_vid = start_vid
     chain_terminus_coord = (float(start[1]), float(start[0]))  # (lat, lon) for _walk
+
+    # First-mile (task #37): route start_vid → nearest trunk vertex T
+    # inside chain[1]'s polygon SPT via parent-walk stitch, instead of
+    # letting `_walk`'s straight-line haversine bridge kick in. Chain[1]'s
+    # polygon includes chain[0]'s 5 km disc, so start_vid is (almost
+    # always) present in chain[1]'s polygon SPT — same rationale as the
+    # last-mile stitch, mirrored to the front. Falls back to the straight
+    # bridge if the SPT NPZ is unavailable or the walks don't converge.
+    if len(chain) >= 3:
+        a1, b1 = chain[1], chain[2]
+        trunk_ab = prof.trunks.get((a1, b1))
+        if trunk_ab is not None:
+            arr_ab, _ = trunk_ab
+            R = 6_371_000.0
+            lat_a = math.radians(start[1])
+            lat_v = np.radians(arr_ab["lat"].astype(np.float64))
+            lon_diff = np.radians(arr_ab["lon"].astype(np.float64) - start[0])
+            hav = (np.sin((lat_v - lat_a) / 2) ** 2
+                   + math.cos(lat_a) * np.cos(lat_v)
+                   * np.sin(lon_diff / 2) ** 2)
+            hav_dist = 2 * R * np.arcsin(np.sqrt(hav))
+            pos_T = int(np.argmin(hav_dist))
+            T_vid = int(arr_ab["vid"][pos_T])
+            if T_vid != start_vid:
+                fm_coords = None
+                # Try chain[1]'s polygon SPT first — that's the "second
+                # pair" the router will actually walk into. Postgres
+                # snapped start_vid to the nearest bike-routable road
+                # vertex; chain[1]'s SPT is a polygon-bounded reachable
+                # set from chain[1]-seed, so start_vid may or may not
+                # be in there. Fall back to chain[0]'s SPT (which
+                # always covers its own snap area + the near side of
+                # chain[1]).
+                for stitch_city in (int(a1), int(chain[0])):
+                    try:
+                        with db_mod.connect() as conn:
+                            fm_coords = _last_mile(
+                                profile, stitch_city,
+                                int(start_vid), T_vid, conn,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[trunk_router] _first_mile stitch failed for "
+                              f"city {stitch_city}: {exc}", flush=True)
+                        fm_coords = None
+                    if fm_coords:
+                        break
+                if fm_coords:
+                    # Drop the final stitched coord (== T_vid's road pos);
+                    # the trunk walk below will emit T_vid as its first
+                    # vertex, so we'd otherwise duplicate that point.
+                    for c in fm_coords[:-1]:
+                        coords.append([float(c[0]), float(c[1])])
+                    chain_terminus_vid = T_vid
+                    chain_terminus_coord = (
+                        float(arr_ab["lat"][pos_T]),
+                        float(arr_ab["lon"][pos_T]),
+                    )
+
     for i in range(1, len(chain) - 1):
         a, b = chain[i], chain[i + 1]
         trunk = prof.trunks.get((a, b))

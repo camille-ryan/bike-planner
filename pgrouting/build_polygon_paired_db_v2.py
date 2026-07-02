@@ -168,14 +168,13 @@ def _build_pair(a: dict, b_ng: np.ndarray
 
     Returns (kept_idx_in_A, succ_global_vids) or None if kept is empty.
 
-    Also stitches in a synthetic FORWARD chain from A-seed(s) to the
-    cheapest B-frontier vertex (task #37). This gives the trunk a
-    canonical anchor-side entry point: the router / viewer can walk
-    from A's anchor vertex to a B-side terminus without an artificial
-    bridge. Path vertices get succ pointers set FORWARD along the
-    A → v_dest chain, overriding the default parent-direction succ.
+    A-seed(s) are intentionally NOT in kept. The router routes into
+    a trunk via inside-polygon Dijkstra (task #37) rather than a
+    synthetic A-seed-in-trunk pointer chain. (An earlier experiment
+    added such a chain; it turned the router's "check the second pair,
+    then the first pair" fallback into a no-op.)
     """
-    a_ng = a["ng"]; a_par = a["par"]; a_isf = a["isf"]; a_cost = a["cost"]
+    a_ng = a["ng"]; a_par = a["par"]; a_isf = a["isf"]
     n = len(a_ng)
 
     # in_b[i] = A vertex i is also in B.SPT
@@ -217,34 +216,6 @@ def _build_pair(a: dict, b_ng: np.ndarray
     kept_mask = f_only & in_ancestors
     kept_mask[b_frontier] = True
 
-    # ---- A-seed forward-chain stitch ----------------------------------
-    #
-    # Find the cheapest B-frontier vertex `v_dest` (from A's SPT cost
-    # perspective) and trace A.parent from v_dest back to whatever SPT
-    # root it terminates at. Add every hop on the path to kept, then
-    # override their succ pointers to point *forward* along the chain
-    # (A-seed → next → next → … → v_dest → NULL).
-    #
-    # This makes the trunk contain a real, walkable route from A's
-    # anchor vertex(es) to a B-side terminus. Without it, entering the
-    # trunk at A-seed produces a single-vertex walk because A-seed is
-    # excluded from the standard F-only-ancestors ∪ B-frontier set.
-    forward_path: list[int] = []   # indices in A, ORDERED A-seed → v_dest
-    if len(b_frontier) > 0:
-        v_dest = int(b_frontier[int(np.argmin(a_cost[b_frontier]))])
-        chain = [v_dest]
-        cur = int(a_par[v_dest])
-        max_walk = min(n + 8, 200_000)  # safety cap; SPT tree is finite
-        for _ in range(max_walk):
-            if cur < 0:
-                break
-            chain.append(cur)
-            cur = int(a_par[cur])
-        # `chain` is [v_dest, …, root]. Reverse to [root, …, v_dest].
-        forward_path = list(reversed(chain))
-        for idx in forward_path:
-            kept_mask[idx] = True
-
     kept_idx = np.flatnonzero(kept_mask)
     if len(kept_idx) == 0:
         return None
@@ -260,22 +231,6 @@ def _build_pair(a: dict, b_ng: np.ndarray
     succ_global = np.full(len(kept_idx), NULL_SENTINEL, dtype=np.int64)
     valid_succ = parent_kept_local >= 0
     succ_global[valid_succ] = a_ng[kept_idx[parent_kept_local[valid_succ]]]
-
-    # Override succ for A-seed → v_dest chain to forward direction.
-    # `forward_path` is [root, p1, p2, …, v_dest]. Each vertex's succ
-    # points to the NEXT one along the path. v_dest is the terminus
-    # (succ = NULL) — walking terminates cleanly at the B-side.
-    for i in range(len(forward_path) - 1):
-        cur_local  = forward_path[i]
-        next_local = forward_path[i + 1]
-        pos_cur = int(remap[cur_local])
-        if pos_cur >= 0:
-            succ_global[pos_cur] = int(a_ng[next_local])
-    if forward_path:
-        v_dest_local = forward_path[-1]
-        pos_dest = int(remap[v_dest_local])
-        if pos_dest >= 0:
-            succ_global[pos_dest] = NULL_SENTINEL
 
     return kept_idx, succ_global
 
