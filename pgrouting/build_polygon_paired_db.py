@@ -54,7 +54,7 @@ if not re.fullmatch(r"[a-z_][a-z0-9_]*", PROFILE):
 DATA_DIR    = Path(os.environ.get("DATA_DIR", "/data"))
 POLY_SPT_IN = DATA_DIR / "spt" / f"{PROFILE}_polygon"
 PAIRED_DIR  = DATA_DIR / "spt" / PROFILE
-DB_PATH     = PAIRED_DIR / "paired_trunks.db"
+DB_PATH     = PAIRED_DIR / os.environ.get("PAIRED_DB_NAME", "paired_trunks.db")
 
 TRUNK_DTYPE = np.dtype([
     ("vid",  "<i8"),
