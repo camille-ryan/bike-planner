@@ -833,13 +833,27 @@ function refreshAnchorDoneColoring() {
   const src = map.getSource("way-graph-nodes");
   const data = src._data;
   if (!data || !data.features) return;
-  for (const f of data.features) {
-    const ref = f.properties.ref;
-    const idx = sptStatus.idxByRef ? sptStatus.idxByRef.get(ref) : undefined;
-    f.properties.city_idx = idx ?? -1;
-    f.properties.spt_done = idx !== undefined && sptStatus.doneSet.has(idx);
-  }
-  src.setData(data);
+  // Build a shallow-cloned FeatureCollection so MapLibre re-processes
+  // it — passing back the same reference is a no-op in some versions,
+  // which leaves anchors visually stuck at their pre-poll color even
+  // though the underlying spt_done value is correct.
+  const cloned = {
+    type: "FeatureCollection",
+    features: data.features.map(f => {
+      const ref = f.properties.ref;
+      const idx = sptStatus.idxByRef ? sptStatus.idxByRef.get(ref) : undefined;
+      return {
+        type: "Feature",
+        geometry: f.geometry,
+        properties: {
+          ...f.properties,
+          city_idx: idx ?? -1,
+          spt_done: idx !== undefined && sptStatus.doneSet.has(idx),
+        },
+      };
+    }),
+  };
+  src.setData(cloned);
 }
 
 async function ensureWayGraphEdges() {
