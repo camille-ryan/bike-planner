@@ -608,18 +608,53 @@ def route(
                                "to_city": int(start_city),
                                "distance_m": round(first_mile_m, 1)})
 
-    # Last-mile: last walked coord → user end (straight bridge).
+    # Last-mile (task #36 option-a: parent-walk concat).
+    # `_last_mile` stitches parent-chains inside end_city's polygon
+    # SPT to route from `chain_terminus_vid` to `end_vid`. Falls
+    # back to a straight bridge if that anchor's SPT is unavailable
+    # or the two walks don't converge on a shared vertex.
+    t3 = time.time()
     last_walked = coords[-1]
-    last_mile_m = _haversine_m(
-        float(last_walked[0]), float(last_walked[1]),
-        float(end[0]), float(end[1]),
-    )
-    coords.append([float(end[0]), float(end[1])])
-    if last_mile_m > 0:
-        bridges.append({"leg": "last_mile", "from_city": int(end_city),
-                        "to_city": None,
-                        "distance_m": round(last_mile_m, 1)})
-    t3 = time.time(); t_last_mile = time.time() - t3
+    lm_coords: list[list[float]] | None = None
+    if chain_terminus_vid != end_vid:
+        try:
+            with db_mod.connect() as conn:
+                lm_coords = _last_mile(
+                    profile, int(end_city), int(chain_terminus_vid),
+                    int(end_vid), conn,
+                )
+        except Exception as exc:  # noqa: BLE001 — never let last-mile kill the route
+            print(f"[trunk_router] _last_mile failed for city {end_city}: {exc}",
+                  flush=True)
+            lm_coords = None
+    if lm_coords:
+        # Drop the first coord if it duplicates last_walked (LCA at
+        # chain_terminus_vid) — _last_mile emits from entry to end
+        # inclusive, and chain_terminus is already in `coords`.
+        skip_first = (
+            abs(lm_coords[0][0] - last_walked[0]) < 1e-7
+            and abs(lm_coords[0][1] - last_walked[1]) < 1e-7
+        )
+        for c in lm_coords[1 if skip_first else 0:]:
+            coords.append([float(c[0]), float(c[1])])
+        # Also append the anchor coord itself if the last routed
+        # vertex isn't already there (rare — anchor snap_vertex is
+        # usually the last stitch vertex).
+        if (abs(coords[-1][0] - end[0]) > 1e-7
+                or abs(coords[-1][1] - end[1]) > 1e-7):
+            coords.append([float(end[0]), float(end[1])])
+    else:
+        # Straight bridge fallback (pre-#36 behaviour).
+        last_mile_m = _haversine_m(
+            float(last_walked[0]), float(last_walked[1]),
+            float(end[0]), float(end[1]),
+        )
+        coords.append([float(end[0]), float(end[1])])
+        if last_mile_m > 0:
+            bridges.append({"leg": "last_mile", "from_city": int(end_city),
+                            "to_city": None,
+                            "distance_m": round(last_mile_m, 1)})
+    t_last_mile = time.time() - t3
 
     # Cheap gross-length stat for the response (over the full polyline,
     # before simplification — that's the geometrically correct length).
