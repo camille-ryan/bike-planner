@@ -135,11 +135,14 @@ def _load_all_places(conn: psycopg.Connection) -> list[dict]:
 
 def _greedy_dropout(places: list[dict], min_spacing_m: float) -> list[dict]:
     """Iterate places in ascending-pop order. Drop a place if any OTHER
-    place still kept lies within min_spacing_m. Returns the survivors.
+    still-kept, NON-protected place lies within min_spacing_m. Returns
+    the survivors.
 
-    Entries with `_protected=True` are never dropped (they still count
-    as nearby neighbors for others, so a village within 10 km of a
-    protected ferry pier still gets dropped).
+    Entries with `_protected=True` (ferry piers) are never dropped, and
+    ALSO don't displace other places. Without that second half of the
+    rule, coastal/riverside cities like Wien (Danube), Hamburg (Elbe),
+    Praha (Vltava), København (Øresund) were being dropped in favor of
+    a ferry pier within 10 km — silently deleting them from routing.
     """
     n = len(places)
     xyz = _lonlat_to_xyz(
@@ -160,8 +163,12 @@ def _greedy_dropout(places: list[dict], min_spacing_m: float) -> list[dict]:
         if protected[i]:
             continue          # never drop protected entries
         nearby = tree.query_ball_point(xyz[i], r=chord)
-        # Drop if any *other* still-kept place lies within chord.
-        has_neighbor = any(j != i and keep[j] for j in nearby)
+        # Drop if any OTHER still-kept NON-protected place lies within
+        # chord. Protected entries (ferry piers) don't count as
+        # displacers — they can coexist with real anchors.
+        has_neighbor = any(
+            j != i and keep[j] and not protected[j] for j in nearby
+        )
         if has_neighbor:
             keep[i] = False
             kind = places[i]["place"] if places[i]["place"] in n_dropped_by_bucket else "village"
