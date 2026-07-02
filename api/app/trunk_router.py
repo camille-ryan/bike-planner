@@ -85,6 +85,15 @@ class _ProfileData:
             for c in self.cities
             if c.get("snap_vertex_id") is not None
         }
+        # ref (e.g. "db:2", "ferry:34988792") -> city_idx. Enables
+        # /trunk/route to accept an anchor by ref, skipping the
+        # postgres snap + kd-tree nearest-anchor step entirely (used
+        # for city-name tour planning, see task #38).
+        self.city_idx_by_ref: dict[str, int] = {
+            c["ref"]: int(c["city_idx"])
+            for c in self.cities
+            if c.get("ref")
+        }
 
         # Preload all trunk blobs into a dict. `immutable=1` skips WAL/
         # SHM file creation (which the :ro mount blocks) and tells SQLite
@@ -474,11 +483,21 @@ def _decimate_polyline(
 
 
 def route(
-    start: tuple[float, float], end: tuple[float, float], profile: str,
+    start: tuple[float, float] | None, end: tuple[float, float] | None,
+    profile: str,
     simplify_m: float = 100.0,
+    start_ref: str | None = None,
+    end_ref: str | None = None,
 ) -> dict:
     """Plan a Graz→Cph-style route and return a GeoJSON Feature with
     a LineString geometry + diagnostic properties.
+
+    Endpoints can be given either as a `(lon, lat)` tuple OR as an
+    anchor `ref` string (e.g. "db:2", "ferry:34988792"). Passing a
+    ref skips the postgres snap + nearest-anchor search entirely and
+    routes directly from/to that anchor's snap vertex — the intended
+    mode for city-name tour planning where there's no first- or
+    last-mile bridge (task #38).
 
     `simplify_m`: drop polyline points closer together than this many
     meters before returning (default 100 m — visually equivalent to
@@ -486,14 +505,38 @@ def route(
     """
     prof = _load_profile(profile)
 
+    # Resolve endpoints. Ref mode short-circuits both snap and nearest;
+    # lat/lon mode does postgres snap + kd-tree nearest as before. Each
+    # end is resolved independently, so mixing (from_ref + to as lat/lon
+    # or vice versa) is supported for partial tour planning.
     t0 = time.time()
-    with db_mod.connect() as conn:
-        start_vid = _snap_to_vertex(conn, start[0], start[1])
-        end_vid   = _snap_to_vertex(conn, end[0],   end[1])
+    if start_ref is not None:
+        start_city = prof.city_idx_by_ref.get(start_ref)
+        if start_city is None:
+            raise RuntimeError(f"unknown start ref '{start_ref}'")
+        _sc = prof.cities[start_city]
+        start = (float(_sc["lon"]), float(_sc["lat"]))
+        start_vid = int(prof.snap_vid_by_city[start_city])
+    if end_ref is not None:
+        end_city = prof.city_idx_by_ref.get(end_ref)
+        if end_city is None:
+            raise RuntimeError(f"unknown end ref '{end_ref}'")
+        _ec = prof.cities[end_city]
+        end = (float(_ec["lon"]), float(_ec["lat"]))
+        end_vid = int(prof.snap_vid_by_city[end_city])
+
+    if (start_ref is None or end_ref is None):
+        with db_mod.connect() as conn:
+            if start_ref is None:
+                start_vid = _snap_to_vertex(conn, start[0], start[1])
+            if end_ref is None:
+                end_vid   = _snap_to_vertex(conn, end[0],   end[1])
     t_snap = time.time() - t0
 
-    start_city = _nearest_city(prof, start[0], start[1])
-    end_city   = _nearest_city(prof, end[0],   end[1])
+    if start_ref is None:
+        start_city = _nearest_city(prof, start[0], start[1])
+    if end_ref is None:
+        end_city   = _nearest_city(prof, end[0],   end[1])
 
     t1 = time.time()
     chain = _city_graph_dijkstra(prof.chain_adj, start_city, end_city)

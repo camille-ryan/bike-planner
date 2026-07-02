@@ -56,8 +56,15 @@ def health() -> dict:
 
 @app.get("/trunk/route")
 async def trunk_route(
-    from_: str = Query(..., alias="from", description="lon,lat"),
-    to: str = Query(..., description="lon,lat"),
+    from_: str | None = Query(None, alias="from", description="lon,lat"),
+    to: str | None = Query(None, description="lon,lat"),
+    from_ref: str | None = Query(
+        None,
+        description="Anchor ref (e.g. 'db:2', 'ferry:12345'). Alternative "
+                    "to `from` for city-name tour planning — skips postgres "
+                    "snap and starts routing from the anchor itself.",
+    ),
+    to_ref: str | None = Query(None, description="Anchor ref alternative to `to`"),
     profile: str = DEFAULT_PROFILE,
     simplify_m: float = Query(
         100.0,
@@ -69,11 +76,24 @@ async def trunk_route(
     """Paired-trunk routing: snap endpoints, run city_graph Dijkstra,
     then walk in-memory trunk arrays leg by leg. Trunks are preloaded
     at server startup; steady-state latency is dominated by snap +
-    Dijkstra (~10-30 ms total for a Graz→Cph-scale chain)."""
-    a = _parse_lonlat(from_, "from")
-    b = _parse_lonlat(to, "to")
+    Dijkstra (~10-30 ms total for a Graz→Cph-scale chain).
+
+    Each endpoint accepts EITHER `from`/`to` (lon,lat string) OR
+    `from_ref`/`to_ref` (anchor ref string). Mixing is fine — e.g.
+    from an anchor to a lat/lon destination.
+    """
+    if from_ is None and from_ref is None:
+        raise HTTPException(400, "must provide `from` or `from_ref`")
+    if to is None and to_ref is None:
+        raise HTTPException(400, "must provide `to` or `to_ref`")
+    a = _parse_lonlat(from_, "from") if from_ is not None else None
+    b = _parse_lonlat(to,    "to")   if to    is not None else None
     try:
-        feat = trunk_router.route(a, b, profile, simplify_m=simplify_m)
+        feat = trunk_router.route(
+            a, b, profile,
+            simplify_m=simplify_m,
+            start_ref=from_ref, end_ref=to_ref,
+        )
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))
     except RuntimeError as exc:

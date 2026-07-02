@@ -140,11 +140,19 @@ function bindWaypoint(row, role) {
   const wp = {
     role,
     coord: null,
+    // If set, this waypoint uses an anchor by ref instead of a raw
+    // lat/lon snap. Assigned by clicking an anchor while pick mode is
+    // armed; cleared as soon as the user types a coord into the input.
+    ref: null,
+    name: null,
     input: row.querySelector(".wp-input"),
     pickBtn: row.querySelector(".wp-pick"),
     row,
   };
   wp.input.addEventListener("input", () => {
+    // Typing a lat/lon overrides any picked-anchor ref for this slot.
+    wp.ref = null;
+    wp.name = null;
     wp.coord = parseLonLat(wp.input.value);
     refreshWaypointMarkers();
     updateRouteButton();
@@ -269,6 +277,8 @@ function clearAll() {
     } else {
       w.input.value = "";
       w.coord = null;
+      w.ref = null;
+      w.name = null;
     }
   }
   state.waypoints = state.waypoints.filter(w => w.role !== "mid");
@@ -299,16 +309,24 @@ async function routeNow() {
   // Fire one multi-leg routing pipeline per profile in parallel.
   // Per-profile failures (e.g. a degenerate route under one profile)
   // are caught locally so the rest still render.
+  //
+  // Each waypoint contributes EITHER `ref` (anchor picked from map)
+  // OR `coord` (lat/lon). The API accepts `from_ref`/`to_ref` as
+  // alternatives to `from`/`to`, so we just build the params object
+  // to match — no first-mile/last-mile bridge when both endpoints
+  // are refs (task #38).
   const results = await Promise.all(PROFILES.map(async (profile) => {
     try {
       const legs = await Promise.all(
-        Array.from({ length: legCount }, (_, i) =>
-          api("/trunk/route", {
-            from: valid[i].coord.join(","),
-            to:   valid[i + 1].coord.join(","),
-            profile,
-          })
-        )
+        Array.from({ length: legCount }, (_, i) => {
+          const w0 = valid[i], w1 = valid[i + 1];
+          const params = { profile };
+          if (w0.ref) params.from_ref = w0.ref;
+          else        params.from     = w0.coord.join(",");
+          if (w1.ref) params.to_ref   = w1.ref;
+          else        params.to       = w1.coord.join(",");
+          return api("/trunk/route", params);
+        })
       );
       const route = mergeLegs(legs.map(r => r.route));
       route.properties = route.properties || {};
@@ -911,6 +929,24 @@ async function ensureWayGraphNodes() {
     map.on("click", "way-graph-nodes-circles", async (e) => {
       const p = e.features[0].properties;
       const ref = p.ref;
+      // Anchor-as-endpoint (task #38): if a waypoint's pick button is
+      // armed, clicking this anchor assigns it to that waypoint
+      // instead of loading the SPT viz. Disarm before the map-click
+      // handler runs so the basemap fallback becomes a no-op.
+      if (state.pickArmed) {
+        const wp = state.pickArmed;
+        wp.ref = ref;
+        wp.name = p.name;
+        // Also stash coord for map marker + local distance calcs.
+        wp.coord = e.features[0].geometry
+          ? e.features[0].geometry.coordinates
+          : [e.lngLat.lng, e.lngLat.lat];
+        wp.input.value = p.name || ref;
+        disarmPick();
+        refreshWaypointMarkers();
+        updateRouteButton();
+        return;
+      }
       const cityIdx = (sptStatus.idxByRef && sptStatus.idxByRef.get(ref)) ?? -1;
       // Highlight this anchor's SPT polygon (if polygons layer enabled).
       await highlightPolygonForRef(ref);
