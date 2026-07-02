@@ -948,6 +948,20 @@ async function ensureWayGraphNodes() {
         return;
       }
       const cityIdx = (sptStatus.idxByRef && sptStatus.idxByRef.get(ref)) ?? -1;
+      // Paired-trunk compare mode: first click = A, second click = B,
+      // then fetch (A, B) from both v1 and v2 and overlay.
+      if (trunkVizState.active && cityIdx >= 0) {
+        if (trunkVizState.aIdx === null) {
+          trunkVizState.aIdx = cityIdx;
+          trunkVizState.aName = p.name;
+          document.getElementById("trunk-viz-status").textContent =
+            `A=${p.name}, click 2nd anchor for B`;
+        } else {
+          loadTrunkBlobViz(trunkVizState.aIdx, cityIdx, trunkVizState.aName, p.name);
+          trunkVizState.aIdx = null;
+        }
+        return;
+      }
       // Highlight this anchor's SPT polygon (if polygons layer enabled).
       await highlightPolygonForRef(ref);
       // Load the SPT visualization if this anchor's SPT has been built.
@@ -1119,6 +1133,150 @@ async function loadSptForCityIdx(city_idx, label) {
 document.getElementById("spt-max-features").addEventListener("change", () => {
   if (currentSptCityIdx !== null) {
     loadSptForCityIdx(currentSptCityIdx, currentSptLabel);
+  }
+});
+
+// --- Paired-trunk viz --------------------------------------------------
+// Click anchor A, then anchor B. Fetches /trunk/blob/{A}/{B}?db=... and
+// renders as edges colored red (near A) → green (far from A) by haversine
+// distance. Toggle the DB dropdown to compare v1 vs v2.
+
+const trunkVizState = {
+  active: false,
+  aIdx: null,
+  aName: null,
+  lastAB: null,   // remember for the DB-switch reload
+};
+
+function ensureTrunkVizLayer() {
+  if (map.getSource("trunk-viz")) return;
+  map.addSource("trunk-viz", {
+    type: "geojson",
+    data: { type: "FeatureCollection", features: [] },
+  });
+  map.addLayer({
+    id: "trunk-viz-line",
+    type: "line",
+    source: "trunk-viz",
+    filter: ["==", ["geometry-type"], "LineString"],
+    paint: {
+      // Red near A → green far. Ramp matches polygon-SPT viz semantics.
+      "line-color": [
+        "interpolate", ["linear"], ["get", "dist_from_a"],
+        0,     "#dc2626",   // red at A
+        5000,  "#f97316",
+        15000, "#facc15",
+        30000, "#84cc16",
+        60000, "#22c55e",   // green far
+      ],
+      "line-width": [
+        "interpolate", ["linear"], ["zoom"],
+        8,  1.0,
+        12, 1.8,
+        16, 2.6,
+      ],
+      "line-opacity": 0.9,
+    },
+  });
+  map.addLayer({
+    id: "trunk-viz-frontier",
+    type: "circle",
+    source: "trunk-viz",
+    filter: ["all", ["==", ["geometry-type"], "Point"], ["get", "is_frontier"]],
+    paint: {
+      "circle-color": "#facc15",
+      "circle-radius": 4,
+      "circle-stroke-color": "#000",
+      "circle-stroke-width": 1,
+    },
+  });
+}
+
+function haversineM(lon1, lat1, lon2, lat2) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const s = Math.sin(dLat / 2) ** 2
+          + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+async function loadTrunkBlobViz(aIdx, bIdx, aName, bName) {
+  ensureTrunkVizLayer();
+  const db = document.getElementById("trunk-viz-db").value;
+  const statusEl = document.getElementById("trunk-viz-status");
+  statusEl.textContent = `loading (${aName || aIdx} → ${bName || bIdx}) from ${db}…`;
+  try {
+    const r = await fetch(`${API_BASE}/trunk/blob/${aIdx}/${bIdx}?db=${db}&profile=views`);
+    if (r.status === 404) {
+      statusEl.textContent = `no trunk (${aIdx}, ${bIdx}) in ${db}`;
+      map.getSource("trunk-viz").setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    if (!r.ok) throw new Error(`trunk blob: ${r.status}`);
+    const fc = await r.json();
+    // Find A's coord from the anchors source. If unavailable, use the
+    // first vertex we can find in the feature collection with matching
+    // properties.vid = A's snap_vertex.
+    let anchor = null;
+    if (map.getSource("way-graph-nodes")) {
+      const src = map.getSource("way-graph-nodes")._data;
+      if (src && src.features) {
+        const a = src.features.find(f =>
+          sptStatus.idxByRef && sptStatus.idxByRef.get(f.properties.ref) === aIdx);
+        if (a) anchor = a.geometry.coordinates;
+      }
+    }
+    // Fallback: use first vertex coord (approximation).
+    if (!anchor && fc.features.length > 0) {
+      const first = fc.features.find(f => f.geometry.type === "Point");
+      if (first) anchor = first.geometry.coordinates;
+    }
+    // Attach dist_from_a to every feature.
+    for (const f of fc.features) {
+      let refLon, refLat;
+      if (f.geometry.type === "Point") {
+        [refLon, refLat] = f.geometry.coordinates;
+      } else {
+        // LineString: use midpoint for coloring.
+        const c = f.geometry.coordinates;
+        refLon = (c[0][0] + c[1][0]) / 2;
+        refLat = (c[0][1] + c[1][1]) / 2;
+      }
+      f.properties.dist_from_a = anchor
+        ? haversineM(anchor[0], anchor[1], refLon, refLat)
+        : 0;
+    }
+    map.getSource("trunk-viz").setData(fc);
+    statusEl.textContent =
+      `${aName || aIdx} → ${bName || bIdx} · ${fc.n_vertices} verts, ` +
+      `${fc.n_frontier} frontier · ${db}`;
+    trunkVizState.lastAB = { aIdx, bIdx, aName, bName };
+  } catch (e) {
+    statusEl.textContent = `trunk viz failed: ${e.message}`;
+  }
+}
+
+document.getElementById("trunk-viz-mode").addEventListener("change", (e) => {
+  trunkVizState.active = e.target.checked;
+  trunkVizState.aIdx = null;
+  const statusEl = document.getElementById("trunk-viz-status");
+  if (trunkVizState.active) {
+    statusEl.textContent = "click 1st anchor for A";
+  } else {
+    statusEl.textContent = "off";
+    if (map.getSource("trunk-viz")) {
+      map.getSource("trunk-viz").setData({ type: "FeatureCollection", features: [] });
+    }
+  }
+});
+
+// Re-render the last-shown trunk when the user swaps DBs.
+document.getElementById("trunk-viz-db").addEventListener("change", () => {
+  if (trunkVizState.lastAB) {
+    const { aIdx, bIdx, aName, bName } = trunkVizState.lastAB;
+    loadTrunkBlobViz(aIdx, bIdx, aName, bName);
   }
 });
 

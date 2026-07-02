@@ -262,6 +262,117 @@ def way_graph_paired_spt(
     }
 
 
+@app.get("/trunk/blob/{a}/{b}")
+def trunk_blob(
+    a: int,
+    b: int,
+    profile: str = "views",
+    db: str = Query(
+        "paired_trunks.db",
+        description="Which trunk DB file under /data/spt/<profile>/ to "
+                    "read. Use 'paired_trunks.db' for the currently-served "
+                    "build, or 'paired_trunks_v1.db' / 'paired_trunks_v2.db' "
+                    "for side-by-side comparison.",
+    ),
+) -> dict:
+    """Return the (A, B) trunk blob as a GeoJSON FeatureCollection.
+
+    Each row of the blob is (vid, succ, lat, lon). Emits:
+      * a Point Feature per vertex, colored by whether its succ is
+        NULL (frontier / terminus) or valid (interior);
+      * a LineString Feature per (vertex, succ_vertex) edge — the
+        arrow the router walks. Endpoints missing from the trunk are
+        represented as bare Points (no edge drawn).
+
+    Reads directly from the file — bypasses the in-memory preload —
+    so you can visualize v1 or v2 without swapping which DB the API
+    serves for routing.
+    """
+    import sqlite3
+    import numpy as np
+    if "/" in db or ".." in db:
+        raise HTTPException(400, "`db` must be a bare filename, no path")
+    db_path = SPT_DIR / profile / db
+    if not db_path.exists():
+        raise HTTPException(404, f"no trunk db at {db_path}")
+    TRUNK_DTYPE = np.dtype([
+        ("vid",  "<i8"),
+        ("succ", "<i8"),
+        ("lat",  "<f4"),
+        ("lon",  "<f4"),
+    ])
+    # `immutable=1` skips WAL/SHM sidecar creation — the RO mount blocks
+    # those, same reason trunk_router.py's preload uses this flag.
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT n_rows, blob FROM trunk_blobs "
+            "WHERE src_city = ? AND dst_city = ?",
+            (a, b),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(404, f"no trunk for ({a}, {b}) in {db}")
+    _n_rows, blob = row
+    arr = np.frombuffer(blob, dtype=TRUNK_DTYPE)
+
+    # Point features for every vertex; color hint via `is_frontier`
+    # (True when succ == -1, i.e., trunk terminates here).
+    features: list[dict] = []
+    for i in range(len(arr)):
+        vid = int(arr["vid"][i])
+        succ = int(arr["succ"][i])
+        lat = float(arr["lat"][i])
+        lon = float(arr["lon"][i])
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": {
+                "kind":  "vertex",
+                "vid":   vid,
+                "succ":  succ,
+                "is_frontier": succ == -1,
+            },
+        })
+
+    # Edge features: for each vertex, if succ is valid AND present in
+    # the trunk, draw a LineString from vertex → succ vertex.
+    vid_sorted = arr["vid"]  # v1 and v2 both sort by vid
+    for i in range(len(arr)):
+        succ = int(arr["succ"][i])
+        if succ == -1:
+            continue
+        pos = int(np.searchsorted(vid_sorted, succ))
+        if pos >= len(arr) or int(arr["vid"][pos]) != succ:
+            continue   # succ points outside trunk (e.g., v1 SYNTH edge)
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [
+                    [float(arr["lon"][i]),   float(arr["lat"][i])],
+                    [float(arr["lon"][pos]), float(arr["lat"][pos])],
+                ],
+            },
+            "properties": {
+                "kind":     "edge",
+                "from_vid": int(arr["vid"][i]),
+                "to_vid":   succ,
+            },
+        })
+
+    n_frontier = int((arr["succ"] == -1).sum())
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "a": a, "b": b,
+        "db": db,
+        "n_vertices": int(len(arr)),
+        "n_frontier": n_frontier,
+    }
+
+
 @app.get("/way-graph/spt-status")
 def way_graph_spt_status(profile: str = "views_polygon") -> dict:
     """Which polygon-bounded SPTs have been written so far. Lets the
