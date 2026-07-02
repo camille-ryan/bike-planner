@@ -52,7 +52,7 @@ if not re.fullmatch(r"[a-z_][a-z0-9_]*", PROFILE):
 DATA_DIR    = Path(os.environ.get("DATA_DIR", "/data"))
 POLY_SPT_IN = DATA_DIR / "spt" / f"{PROFILE}_polygon"
 PAIRED_DIR  = DATA_DIR / "spt" / PROFILE
-DB_PATH     = PAIRED_DIR / "paired_trunks.db"
+DB_PATH     = PAIRED_DIR / os.environ.get("PAIRED_DB_NAME", "paired_trunks.db")
 
 TRUNK_DTYPE = np.dtype([
     ("vid",  "<i8"),
@@ -82,6 +82,26 @@ def _open_db(db_path: Path) -> sqlite3.Connection:
             dst_city  INTEGER NOT NULL,
             n_rows    INTEGER NOT NULL,
             blob      BLOB    NOT NULL,
+            PRIMARY KEY (src_city, dst_city)
+        ) WITHOUT ROWID
+        """
+    )
+    # Precomputed termination-vid list per trunk. Feeds the iterative
+    # entry-point pruner (task #40): entry points of (A, B) = union of
+    # termination vids across (X, A) for chain-neighbors X, intersected
+    # with (A, B)'s kept set. Storing the list here avoids scanning the
+    # full trunk blob at pruning time.
+    #
+    # `n_termini` = number of vids where succ == NULL_SENTINEL in the
+    # trunk blob. `vids` = little-endian int64 array of those vids,
+    # sorted ascending for searchsorted-friendly membership checks.
+    db.execute(
+        """
+        CREATE TABLE trunk_termini (
+            src_city   INTEGER NOT NULL,
+            dst_city   INTEGER NOT NULL,
+            n_termini  INTEGER NOT NULL,
+            vids       BLOB    NOT NULL,
             PRIMARY KEY (src_city, dst_city)
         ) WITHOUT ROWID
         """
@@ -147,8 +167,15 @@ def _build_pair(a: dict, b_ng: np.ndarray
     """V1's _build_pair adapted to polygon NPZs with is_frontier.
 
     Returns (kept_idx_in_A, succ_global_vids) or None if kept is empty.
+
+    Also stitches in a synthetic FORWARD chain from A-seed(s) to the
+    cheapest B-frontier vertex (task #37). This gives the trunk a
+    canonical anchor-side entry point: the router / viewer can walk
+    from A's anchor vertex to a B-side terminus without an artificial
+    bridge. Path vertices get succ pointers set FORWARD along the
+    A → v_dest chain, overriding the default parent-direction succ.
     """
-    a_ng = a["ng"]; a_par = a["par"]; a_isf = a["isf"]
+    a_ng = a["ng"]; a_par = a["par"]; a_isf = a["isf"]; a_cost = a["cost"]
     n = len(a_ng)
 
     # in_b[i] = A vertex i is also in B.SPT
@@ -190,6 +217,34 @@ def _build_pair(a: dict, b_ng: np.ndarray
     kept_mask = f_only & in_ancestors
     kept_mask[b_frontier] = True
 
+    # ---- A-seed forward-chain stitch ----------------------------------
+    #
+    # Find the cheapest B-frontier vertex `v_dest` (from A's SPT cost
+    # perspective) and trace A.parent from v_dest back to whatever SPT
+    # root it terminates at. Add every hop on the path to kept, then
+    # override their succ pointers to point *forward* along the chain
+    # (A-seed → next → next → … → v_dest → NULL).
+    #
+    # This makes the trunk contain a real, walkable route from A's
+    # anchor vertex(es) to a B-side terminus. Without it, entering the
+    # trunk at A-seed produces a single-vertex walk because A-seed is
+    # excluded from the standard F-only-ancestors ∪ B-frontier set.
+    forward_path: list[int] = []   # indices in A, ORDERED A-seed → v_dest
+    if len(b_frontier) > 0:
+        v_dest = int(b_frontier[int(np.argmin(a_cost[b_frontier]))])
+        chain = [v_dest]
+        cur = int(a_par[v_dest])
+        max_walk = min(n + 8, 200_000)  # safety cap; SPT tree is finite
+        for _ in range(max_walk):
+            if cur < 0:
+                break
+            chain.append(cur)
+            cur = int(a_par[cur])
+        # `chain` is [v_dest, …, root]. Reverse to [root, …, v_dest].
+        forward_path = list(reversed(chain))
+        for idx in forward_path:
+            kept_mask[idx] = True
+
     kept_idx = np.flatnonzero(kept_mask)
     if len(kept_idx) == 0:
         return None
@@ -205,15 +260,40 @@ def _build_pair(a: dict, b_ng: np.ndarray
     succ_global = np.full(len(kept_idx), NULL_SENTINEL, dtype=np.int64)
     valid_succ = parent_kept_local >= 0
     succ_global[valid_succ] = a_ng[kept_idx[parent_kept_local[valid_succ]]]
+
+    # Override succ for A-seed → v_dest chain to forward direction.
+    # `forward_path` is [root, p1, p2, …, v_dest]. Each vertex's succ
+    # points to the NEXT one along the path. v_dest is the terminus
+    # (succ = NULL) — walking terminates cleanly at the B-side.
+    for i in range(len(forward_path) - 1):
+        cur_local  = forward_path[i]
+        next_local = forward_path[i + 1]
+        pos_cur = int(remap[cur_local])
+        if pos_cur >= 0:
+            succ_global[pos_cur] = int(a_ng[next_local])
+    if forward_path:
+        v_dest_local = forward_path[-1]
+        pos_dest = int(remap[v_dest_local])
+        if pos_dest >= 0:
+            succ_global[pos_dest] = NULL_SENTINEL
+
     return kept_idx, succ_global
 
 
 def _pack_blob(a: dict, kept_idx: np.ndarray,
-               succ_global: np.ndarray) -> tuple[int, bytes]:
+               succ_global: np.ndarray
+               ) -> tuple[int, bytes, int, bytes]:
+    """Pack (vid, succ, lat, lon) trunk blob + termini blob.
+
+    Returns (n_rows, trunk_blob, n_termini, termini_blob). The termini
+    blob is a sorted little-endian int64 array of the vids where
+    succ == NULL_SENTINEL — the vertices where a walk in this trunk
+    terminates. Feeds the entry-point pruner in task #40.
+    """
     a_ng = a["ng"]; a_coord = a["coord"]
     K = len(kept_idx)
     if K == 0:
-        return 0, b""
+        return 0, b"", 0, b""
     vids = a_ng[kept_idx]
     lons = a_coord[kept_idx, 0]
     lats = a_coord[kept_idx, 1]
@@ -223,12 +303,15 @@ def _pack_blob(a: dict, kept_idx: np.ndarray,
     arr["succ"] = succ_global[order]
     arr["lat"]  = lats[order]
     arr["lon"]  = lons[order]
-    return K, arr.tobytes()
+    termini_mask = arr["succ"] == NULL_SENTINEL
+    termini_vids = arr["vid"][termini_mask].astype(np.int64)
+    # termini_vids is already sorted (arr is sorted by vid).
+    return K, arr.tobytes(), int(len(termini_vids)), termini_vids.tobytes()
 
 
 def _degenerate_blob(a_ci: int, a_lon: float, a_lat: float,
                      b_ci: int, b_lon: float, b_lat: float
-                     ) -> tuple[int, bytes]:
+                     ) -> tuple[int, bytes, int, bytes]:
     synth_a = np.int64(_synth_vid(a_ci))
     synth_b = np.int64(_synth_vid(b_ci))
     arr = np.empty(2, dtype=TRUNK_DTYPE)
@@ -238,7 +321,10 @@ def _degenerate_blob(a_ci: int, a_lon: float, a_lat: float,
     arr["lon"]  = np.array([np.float32(a_lon), np.float32(b_lon)])
     order = np.argsort(arr["vid"], kind="stable")
     arr = arr[order]
-    return 2, arr.tobytes()
+    # Only synth_b has succ=NULL (walk terminus).
+    termini_mask = arr["succ"] == NULL_SENTINEL
+    termini_vids = arr["vid"][termini_mask].astype(np.int64)
+    return 2, arr.tobytes(), int(len(termini_vids)), termini_vids.tobytes()
 
 
 def main() -> None:
@@ -264,9 +350,11 @@ def main() -> None:
     db = _open_db(DB_PATH)
     n_packed = n_missing_npz = n_empty_pair = n_degenerate = 0
     total_vertices = 0
+    total_termini = 0
     total_a_vertices = 0
     last_log = t_start
     batch: list[tuple[int, int, int, bytes]] = []
+    termini_batch: list[tuple[int, int, int, bytes]] = []
     BATCH_FLUSH = 5_000
 
     for a_ci in sorted(edges_by_a):
@@ -286,7 +374,7 @@ def main() -> None:
                 if a_lon is None or b_lon is None:
                     n_empty_pair += 1
                     continue
-                n_rows, blob = _degenerate_blob(
+                n_rows, blob, n_term, term_blob = _degenerate_blob(
                     a_ci, a_lon, a_lat, b_ci, b_lon, b_lat,
                 )
                 n_degenerate += 1
@@ -296,28 +384,37 @@ def main() -> None:
                     if a_lon is None or b_lon is None:
                         n_empty_pair += 1
                         continue
-                    n_rows, blob = _degenerate_blob(
+                    n_rows, blob, n_term, term_blob = _degenerate_blob(
                         a_ci, a_lon, a_lat, b_ci, b_lon, b_lat,
                     )
                     n_degenerate += 1
                 else:
                     kept_idx, succ_global = pair
-                    n_rows, blob = _pack_blob(a, kept_idx, succ_global)
+                    n_rows, blob, n_term, term_blob = _pack_blob(
+                        a, kept_idx, succ_global,
+                    )
                     total_a_vertices += a_size
 
             if n_rows == 0:
                 n_empty_pair += 1
                 continue
             batch.append((a_ci, b_ci, n_rows, blob))
+            termini_batch.append((a_ci, b_ci, n_term, term_blob))
             n_packed += 1
             total_vertices += n_rows
+            total_termini += n_term
             if len(batch) >= BATCH_FLUSH:
                 db.executemany(
                     "INSERT OR IGNORE INTO trunk_blobs VALUES (?, ?, ?, ?)",
                     batch,
                 )
+                db.executemany(
+                    "INSERT OR IGNORE INTO trunk_termini VALUES (?, ?, ?, ?)",
+                    termini_batch,
+                )
                 db.commit()
                 batch.clear()
+                termini_batch.clear()
 
         if time.time() - last_log >= 30:
             pct = 100.0 * n_packed / max(1, len(edges))
@@ -330,6 +427,10 @@ def main() -> None:
         db.executemany(
             "INSERT OR IGNORE INTO trunk_blobs VALUES (?, ?, ?, ?)", batch,
         )
+        db.executemany(
+            "INSERT OR IGNORE INTO trunk_termini VALUES (?, ?, ?, ?)",
+            termini_batch,
+        )
     db.commit()
     db.execute("ANALYZE")
     db.commit()
@@ -337,12 +438,14 @@ def main() -> None:
 
     size_mb = DB_PATH.stat().st_size / 1e6
     avg = total_vertices / max(1, n_packed)
+    avg_term = total_termini / max(1, n_packed)
     retention = 100.0 * total_vertices / max(1, total_a_vertices)
     print(f"[paired-db-v2] DONE in {(time.time()-t_start)/60:.1f} min",
           flush=True)
     print(f"[paired-db-v2]   {n_packed:,} trunks packed, {total_vertices:,} "
           f"total vertices, db {size_mb:.1f} MB", flush=True)
-    print(f"[paired-db-v2]   avg vertices/trunk: {avg:.0f}", flush=True)
+    print(f"[paired-db-v2]   avg vertices/trunk: {avg:.0f}, "
+          f"avg termini/trunk: {avg_term:.1f}", flush=True)
     print(f"[paired-db-v2]   retention (kept/A summed): {retention:.1f}%",
           flush=True)
     print(f"[paired-db-v2]   skipped: {n_missing_npz} missing NPZ, "
