@@ -68,7 +68,31 @@ button#route-btn:hover:not(:disabled) { background: #2a4; }
 .waypoint-row {
   display: flex; align-items: center; gap: 0.3rem;
   margin-bottom: 0.3rem;
+  position: relative;   /* anchor for .wp-dropdown absolute positioning */
 }
+
+.wp-dropdown {
+  position: absolute;
+  top: 100%; left: 28px; right: 40px;
+  background: white;
+  border: 1px solid #bbb; border-top: none;
+  border-radius: 0 0 3px 3px;
+  max-height: 220px; overflow-y: auto;
+  z-index: 100;
+  box-shadow: 0 3px 8px rgba(0,0,0,0.15);
+  font-size: 0.78rem;
+}
+.wp-dd-item {
+  padding: 0.3rem 0.5rem;
+  cursor: pointer;
+  border-bottom: 1px solid #eee;
+  display: flex; align-items: baseline; gap: 0.5rem;
+}
+.wp-dd-item:last-child { border-bottom: none; }
+.wp-dd-item:hover, .wp-dd-item.active { background: #eef7ff; }
+.wp-dd-name { font-weight: 600; flex: 1; }
+.wp-dd-country { color: #888; font-size: 0.72rem; }
+.wp-dd-pop { color: #666; font-size: 0.72rem; font-variant-numeric: tabular-nums; }
 .wp-label {
   flex: 0 0 22px; height: 22px; border-radius: 50%;
   color: white; text-align: center; line-height: 22px;

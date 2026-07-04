@@ -65,6 +65,27 @@ async def trunk_route(
                     "snap and starts routing from the anchor itself.",
     ),
     to_ref: str | None = Query(None, description="Anchor ref alternative to `to`"),
+    via_refs: list[str] | None = Query(
+        None,
+        description="Intermediate stops as anchor refs, one query param "
+                    "per stop (repeat the param for multi-stop tours). "
+                    "e.g. `via_refs=db:2&via_refs=db:5`. Any mix of "
+                    "via_refs and via_lonlats is accepted; positional "
+                    "ordering follows the request (all via_refs first, "
+                    "then via_lonlats). For explicit ordering use the "
+                    "`stops` param.",
+    ),
+    via_lonlats: list[str] | None = Query(
+        None,
+        description="Intermediate stops as lon,lat strings, one per param.",
+    ),
+    stops: list[str] | None = Query(
+        None,
+        description="Ordered mixed list of stops. Each item is either "
+                    "a ref ('db:2', 'ferry:34988792') or a lon,lat "
+                    "string. The endpoints (from/to) are not in this "
+                    "list — only the intermediate waypoints.",
+    ),
     profile: str = DEFAULT_PROFILE,
     simplify_m: float = Query(
         100.0,
@@ -81,6 +102,13 @@ async def trunk_route(
     Each endpoint accepts EITHER `from`/`to` (lon,lat string) OR
     `from_ref`/`to_ref` (anchor ref string). Mixing is fine — e.g.
     from an anchor to a lat/lon destination.
+
+    Multi-stop tours: pass intermediate waypoints via `stops` (ordered
+    mixed list), `via_refs` (all refs), or `via_lonlats` (all coords).
+    Pairwise chain-Dijkstra runs start→stop1→stop2→…→end and the
+    concatenated chain is walked end-to-end — a single first-mile
+    stitch at start, a single last-mile stitch at end, no per-waypoint
+    bridges (task #48).
     """
     if from_ is None and from_ref is None:
         raise HTTPException(400, "must provide `from` or `from_ref`")
@@ -88,17 +116,95 @@ async def trunk_route(
         raise HTTPException(400, "must provide `to` or `to_ref`")
     a = _parse_lonlat(from_, "from") if from_ is not None else None
     b = _parse_lonlat(to,    "to")   if to    is not None else None
+
+    # Normalize the various via inputs to a single ordered list of
+    # (ref, coord) tuples. Precedence: `stops` first (explicit
+    # ordering), else via_refs + via_lonlats concatenated.
+    via: list[tuple[str | None, tuple[float, float] | None]] = []
+    if stops:
+        for s in stops:
+            if "," in s and _looks_like_lonlat(s):
+                via.append((None, _parse_lonlat(s, "stops")))
+            else:
+                via.append((s, None))
+    else:
+        for r in (via_refs or []):
+            via.append((r, None))
+        for c in (via_lonlats or []):
+            via.append((None, _parse_lonlat(c, "via_lonlats")))
     try:
         feat = trunk_router.route(
             a, b, profile,
             simplify_m=simplify_m,
             start_ref=from_ref, end_ref=to_ref,
+            via=via or None,
         )
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))
     except RuntimeError as exc:
         raise HTTPException(500, f"trunk route: {exc}")
     return {"profile": profile, "route": feat}
+
+
+def _looks_like_lonlat(s: str) -> bool:
+    parts = s.split(",")
+    if len(parts) != 2:
+        return False
+    try:
+        float(parts[0]); float(parts[1])
+        return True
+    except ValueError:
+        return False
+
+
+@app.get("/anchors/search")
+def anchors_search(
+    q: str = Query("", description="Prefix or substring to match against "
+                                    "anchor names (case-insensitive)."),
+    profile: str = DEFAULT_PROFILE,
+    limit: int = Query(20, ge=1, le=100),
+) -> dict:
+    """Fuzzy-lookup autocomplete for city / anchor names. Feeds the web
+    UI's waypoint typeahead. Returns `{results: [{ref, name, country,
+    population}]}` ordered by prefix-match-first then population desc.
+    Backed by the in-memory cities.json loaded at API startup.
+    """
+    prof = trunk_router._load_profile(profile)
+    qn = (q or "").strip().lower()
+    if not qn:
+        # Empty query → top-N by population, useful for "recent" style pickers.
+        ranked = sorted(
+            prof.cities,
+            key=lambda c: -(c.get("population") or 0),
+        )[:limit]
+    else:
+        prefix, contains = [], []
+        for c in prof.cities:
+            nm = (c.get("name") or "").lower()
+            if not nm:
+                continue
+            if nm.startswith(qn):
+                prefix.append(c)
+            elif qn in nm:
+                contains.append(c)
+        # Prefix hits first (sorted by population), then substring hits.
+        prefix.sort(key=lambda c: -(c.get("population") or 0))
+        contains.sort(key=lambda c: -(c.get("population") or 0))
+        ranked = (prefix + contains)[:limit]
+    return {
+        "results": [
+            {
+                "ref":        c.get("ref"),
+                "name":       c.get("name"),
+                "country":    c.get("country"),
+                "population": c.get("population"),
+                "lon":        c.get("lon"),
+                "lat":        c.get("lat"),
+            }
+            for c in ranked
+        ],
+        "query": q,
+    }
 
 
 @app.get("/way-graph/spt/{city_idx}")

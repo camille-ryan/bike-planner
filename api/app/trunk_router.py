@@ -528,6 +528,7 @@ def route(
     simplify_m: float = 100.0,
     start_ref: str | None = None,
     end_ref: str | None = None,
+    via: list[tuple[str | None, tuple[float, float] | None]] | None = None,
 ) -> dict:
     """Plan a Graz→Cph-style route and return a GeoJSON Feature with
     a LineString geometry + diagnostic properties.
@@ -538,6 +539,14 @@ def route(
     routes directly from/to that anchor's snap vertex — the intended
     mode for city-name tour planning where there's no first- or
     last-mile bridge (task #38).
+
+    `via`: optional list of intermediate stops as (ref, coord) tuples
+    (each element has exactly one of the two set). The route runs
+    pairwise chain-Dijkstra start→via[0]→via[1]→…→end, concatenates
+    the chains (dedup at each waypoint), and walks the merged chain
+    end-to-end. No per-waypoint first/last-mile bridges — a single
+    first-mile stitch at start, a single last-mile stitch at end
+    (task #48).
 
     `simplify_m`: drop polyline points closer together than this many
     meters before returning (default 100 m — visually equivalent to
@@ -578,13 +587,42 @@ def route(
     if end_ref is None:
         end_city   = _nearest_city(prof, end[0],   end[1])
 
+    # Resolve intermediate waypoints (task #48). Each becomes a forced
+    # chain anchor between start_city and end_city.
+    via_cities: list[int] = []
+    if via:
+        for (v_ref, v_coord) in via:
+            if v_ref is not None:
+                vc = prof.city_idx_by_ref.get(v_ref)
+                if vc is None:
+                    raise RuntimeError(f"unknown via ref '{v_ref}'")
+                via_cities.append(int(vc))
+            elif v_coord is not None:
+                via_cities.append(int(_nearest_city(prof, v_coord[0], v_coord[1])))
+            else:
+                raise RuntimeError("via stop needs either ref or coord")
+
     t1 = time.time()
-    chain = _city_graph_dijkstra(prof.chain_adj, start_city, end_city)
+    # Pairwise chain-Dijkstra through all forced stops. Concatenate
+    # chains with dedup at each waypoint boundary — the last city of
+    # one leg's chain equals the first of the next.
+    stops = [start_city] + via_cities + [end_city]
+    chain: list[int] = []
+    for k in range(len(stops) - 1):
+        sub = _city_graph_dijkstra(prof.chain_adj, stops[k], stops[k + 1])
+        if sub is None:
+            raise RuntimeError(
+                f"no city_graph path from city {stops[k]} to city {stops[k+1]}"
+            )
+        if k == 0:
+            chain.extend(sub)
+        else:
+            # Dedup the boundary city (last of previous == first of this).
+            if chain and sub and chain[-1] == sub[0]:
+                chain.extend(sub[1:])
+            else:
+                chain.extend(sub)
     t_chain = time.time() - t1
-    if chain is None:
-        raise RuntimeError(
-            f"no city_graph path from city {start_city} to city {end_city}"
-        )
 
     # V1-style paired-SPT walk (post-2026-07 rebuild): each (A, B)
     # trunk is a pruned slice of A.SPT covering the corridor into B.
@@ -611,14 +649,51 @@ def route(
     chain_terminus_vid = start_vid
     chain_terminus_coord = (float(start[1]), float(start[0]))  # (lat, lon) for _walk
 
-    # First-mile (task #37): route start_vid → nearest trunk vertex T
-    # inside chain[1]'s polygon SPT via parent-walk stitch, instead of
-    # letting `_walk`'s straight-line haversine bridge kick in. Chain[1]'s
-    # polygon includes chain[0]'s 5 km disc, so start_vid is (almost
-    # always) present in chain[1]'s polygon SPT — same rationale as the
-    # last-mile stitch, mirrored to the front. Falls back to the straight
-    # bridge if the SPT NPZ is unavailable or the walks don't converge.
+    # SKIP_MAX (also used by the in-loop skip-lookahead below).
+    SKIP_MAX = 4
+
+    # First-mile skip-lookahead (task #47). Extension of task #46: if
+    # user's start_vid is directly present in some downstream trunk
+    # (chain[k], chain[k+1]) for k in 1..SKIP_MAX, jump the walk loop
+    # past legs 1..k-1 entirely. Chain-Dijkstra often plans through
+    # short ferry-pier hops early in the chain whose polygon trunks
+    # don't cover the direct corridor from start — those legs would
+    # each bridge. If the start vid is already a valid entry to a
+    # LATER trunk, we skip the pier-detour bridges entirely.
+    walk_start_i = 1
     if len(chain) >= 3:
+        for k in range(1, SKIP_MAX + 1):
+            if k + 1 >= len(chain):
+                break
+            a_k, b_k = chain[k], chain[k + 1]
+            trunk_k = prof.trunks.get((a_k, b_k))
+            if trunk_k is None:
+                continue
+            arr_k = trunk_k[0]
+            pos = int(np.searchsorted(arr_k["vid"], start_vid))
+            if pos < len(arr_k) and int(arr_k["vid"][pos]) == start_vid:
+                walk_start_i = k
+                break
+        # Mark skipped legs (1 .. walk_start_i - 1) so the client can
+        # filter them from the paired-trunks visualization.
+        for skipped in range(1, walk_start_i):
+            bridges.append({
+                "leg": skipped, "from_city": int(chain[skipped]),
+                "to_city": int(chain[skipped + 1]),
+                "distance_m": 0.0, "skipped": True,
+            })
+
+    # First-mile (task #37): route start_vid → nearest trunk vertex T
+    # inside chain[walk_start_i]'s polygon SPT via parent-walk stitch,
+    # instead of letting `_walk`'s straight-line haversine bridge kick
+    # in. That anchor's polygon includes chain[walk_start_i-1]'s 5 km
+    # disc, so start_vid is (almost always) present in its polygon SPT
+    # — same rationale as the last-mile stitch, mirrored to the front.
+    # Falls back to the straight bridge if the SPT NPZ is unavailable
+    # or the walks don't converge.
+    # If task-#47 skip fired, walk_start_i > 1 and start_vid is directly
+    # in that trunk — no stitch needed, we walk from start_vid.
+    if len(chain) >= 3 and walk_start_i == 1:
         a1, b1 = chain[1], chain[2]
         trunk_ab = prof.trunks.get((a1, b1))
         if trunk_ab is not None:
@@ -672,18 +747,18 @@ def route(
                         float(arr_ab["lon"][pos_T]),
                     )
 
-    # Skip-lookahead (task #46): before entering trunk i, check if the
-    # incoming chain_terminus_vid is already a vertex in some LATER
-    # trunk (i+k, i+k+1) for k in 1..SKIP_MAX. If so, skip legs
-    # i..i+k-1 entirely and walk from that later trunk. This handles
-    # chain-Dijkstra plans that route through short ferry-pier hops
-    # whose polygon trunks don't cover the corridor between chain-
-    # neighbors — the terminus falls in the DOWNSTREAM trunk's kept
-    # set as an interior vertex, so bridging through intermediate
+    # In-loop skip-lookahead (task #46): before entering trunk i,
+    # check if the incoming chain_terminus_vid is already a vertex in
+    # some LATER trunk (i+k, i+k+1) for k in 1..SKIP_MAX. If so, skip
+    # legs i..i+k-1 entirely and walk from that later trunk. This
+    # handles chain-Dijkstra plans that route through short ferry-pier
+    # hops whose polygon trunks don't cover the corridor between
+    # chain-neighbors — the terminus falls in the DOWNSTREAM trunk's
+    # kept set as an interior vertex, so bridging through intermediate
     # trunks (which snap-to-terminus, walk 1 vert, snap again) is
     # dead weight.
-    SKIP_MAX = 4
-    i = 1
+    # SKIP_MAX is defined above (near the first-mile block).
+    i = walk_start_i
     while i < len(chain) - 1:
         a, b = chain[i], chain[i + 1]
         trunk = prof.trunks.get((a, b))

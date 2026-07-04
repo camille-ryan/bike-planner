@@ -148,22 +148,133 @@ function bindWaypoint(row, role) {
     input: row.querySelector(".wp-input"),
     pickBtn: row.querySelector(".wp-pick"),
     row,
+    // Autocomplete dropdown (task #48). Filled on typing.
+    dropdown: null,
+    dropdownTimer: null,
+    activeItem: -1,
   };
+  wp.input.setAttribute("placeholder", "city name or lon,lat");
+  wp.input.setAttribute("autocomplete", "off");
+
+  // Dropdown container, absolutely-positioned under the input.
+  const dd = document.createElement("div");
+  dd.className = "wp-dropdown";
+  dd.style.display = "none";
+  row.appendChild(dd);
+  wp.dropdown = dd;
+
   wp.input.addEventListener("input", () => {
     // Typing a lat/lon overrides any picked-anchor ref for this slot.
+    const val = wp.input.value.trim();
+    const parsed = parseLonLat(val);
+    if (parsed) {
+      wp.ref = null;
+      wp.name = null;
+      wp.coord = parsed;
+      hideDropdown(wp);
+      refreshWaypointMarkers();
+      updateRouteButton();
+      return;
+    }
+    // Otherwise: fuzzy-search anchors and show dropdown.
     wp.ref = null;
     wp.name = null;
-    wp.coord = parseLonLat(wp.input.value);
-    refreshWaypointMarkers();
+    wp.coord = null;
     updateRouteButton();
+    if (wp.dropdownTimer) clearTimeout(wp.dropdownTimer);
+    if (!val) { hideDropdown(wp); return; }
+    wp.dropdownTimer = setTimeout(() => fetchAndShowDropdown(wp, val), 120);
   });
   wp.input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !document.getElementById("route-btn").disabled) {
-      routeNow();
+    const items = wp.dropdown.querySelectorAll(".wp-dd-item");
+    if (e.key === "Enter") {
+      if (wp.activeItem >= 0 && items[wp.activeItem]) {
+        e.preventDefault();
+        items[wp.activeItem].click();
+        return;
+      }
+      if (!document.getElementById("route-btn").disabled) {
+        routeNow();
+      }
+    } else if (e.key === "ArrowDown" && items.length) {
+      e.preventDefault();
+      wp.activeItem = (wp.activeItem + 1) % items.length;
+      renderDropdownHighlight(wp);
+    } else if (e.key === "ArrowUp" && items.length) {
+      e.preventDefault();
+      wp.activeItem = (wp.activeItem - 1 + items.length) % items.length;
+      renderDropdownHighlight(wp);
+    } else if (e.key === "Escape") {
+      hideDropdown(wp);
     }
+  });
+  wp.input.addEventListener("blur", () => {
+    // Slight delay so a click on a dropdown item can register before hide.
+    setTimeout(() => hideDropdown(wp), 200);
   });
   wp.pickBtn.addEventListener("click", () => armPick(wp));
   return wp;
+}
+
+async function fetchAndShowDropdown(wp, q) {
+  try {
+    const r = await fetch(`${API_BASE}/anchors/search?q=${encodeURIComponent(q)}&limit=10`);
+    if (!r.ok) { hideDropdown(wp); return; }
+    const d = await r.json();
+    renderDropdown(wp, d.results || []);
+  } catch (e) {
+    hideDropdown(wp);
+  }
+}
+
+function renderDropdown(wp, results) {
+  if (!results.length) { hideDropdown(wp); return; }
+  wp.dropdown.innerHTML = "";
+  wp.activeItem = -1;
+  for (const c of results) {
+    const item = document.createElement("div");
+    item.className = "wp-dd-item";
+    const country = c.country ? ` <span class="wp-dd-country">${c.country}</span>` : "";
+    const pop = c.population ? ` <span class="wp-dd-pop">${c.population.toLocaleString()}</span>` : "";
+    item.innerHTML = `<span class="wp-dd-name">${escapeHtml(c.name || "?")}</span>${country}${pop}`;
+    item.addEventListener("mousedown", (e) => {
+      // mousedown fires before input's blur; prevents hide race.
+      e.preventDefault();
+      pickDropdownItem(wp, c);
+    });
+    wp.dropdown.appendChild(item);
+  }
+  wp.dropdown.style.display = "block";
+}
+
+function renderDropdownHighlight(wp) {
+  const items = wp.dropdown.querySelectorAll(".wp-dd-item");
+  items.forEach((el, i) => el.classList.toggle("active", i === wp.activeItem));
+  if (wp.activeItem >= 0 && items[wp.activeItem]) {
+    items[wp.activeItem].scrollIntoView({ block: "nearest" });
+  }
+}
+
+function pickDropdownItem(wp, c) {
+  wp.ref = c.ref;
+  wp.name = c.name;
+  wp.coord = [c.lon, c.lat];
+  wp.input.value = c.name;
+  hideDropdown(wp);
+  refreshWaypointMarkers();
+  updateRouteButton();
+}
+
+function hideDropdown(wp) {
+  wp.dropdown.style.display = "none";
+  wp.dropdown.innerHTML = "";
+  wp.activeItem = -1;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
 }
 
 function armPick(wp) {
@@ -297,38 +408,36 @@ function clearAll() {
 document.getElementById("route-btn").addEventListener("click", routeNow);
 
 async function routeNow() {
-  const valid = state.waypoints.filter(w => w.coord);
+  const valid = state.waypoints.filter(w => w.coord || w.ref);
   if (valid.length < 2) return;
   const legCount = valid.length - 1;
-  // Bump the request id so any in-flight earlier routeNow becomes
-  // stale and its late-arriving responses are dropped instead of
-  // overwriting this one.
   const myReqId = ++state.routeReqId;
   setBusy(`Routing ${legCount} leg${legCount > 1 ? "s" : ""} × ${PROFILES.length} profiles…`);
 
-  // Fire one multi-leg routing pipeline per profile in parallel.
-  // Per-profile failures (e.g. a degenerate route under one profile)
-  // are caught locally so the rest still render.
-  //
-  // Each waypoint contributes EITHER `ref` (anchor picked from map)
-  // OR `coord` (lat/lon). The API accepts `from_ref`/`to_ref` as
-  // alternatives to `from`/`to`, so we just build the params object
-  // to match — no first-mile/last-mile bridge when both endpoints
-  // are refs (task #38).
+  // Multi-stop routing via task #48: ONE API call per profile passes
+  // all waypoints, with intermediates as `stops[]`. Server runs
+  // pairwise chain-Dijkstra internally and walks the merged chain
+  // end-to-end — a single first-mile stitch at start, single last-mile
+  // stitch at end, no per-waypoint bridges.
+  const first = valid[0], last = valid[valid.length - 1];
+  const intermediates = valid.slice(1, -1);
   const results = await Promise.all(PROFILES.map(async (profile) => {
     try {
-      const legs = await Promise.all(
-        Array.from({ length: legCount }, (_, i) => {
-          const w0 = valid[i], w1 = valid[i + 1];
-          const params = { profile };
-          if (w0.ref) params.from_ref = w0.ref;
-          else        params.from     = w0.coord.join(",");
-          if (w1.ref) params.to_ref   = w1.ref;
-          else        params.to       = w1.coord.join(",");
-          return api("/trunk/route", params);
-        })
-      );
-      const route = mergeLegs(legs.map(r => r.route));
+      const params = new URLSearchParams();
+      params.set("profile", profile);
+      if (first.ref) params.set("from_ref", first.ref);
+      else           params.set("from",     first.coord.join(","));
+      if (last.ref)  params.set("to_ref",   last.ref);
+      else           params.set("to",       last.coord.join(","));
+      for (const w of intermediates) {
+        // `stops` is a mixed list of refs and lon,lat strings preserving
+        // order — API detects lon,lat via the comma+float heuristic.
+        params.append("stops", w.ref || w.coord.join(","));
+      }
+      const r = await fetch(`${API_BASE}/trunk/route?${params.toString()}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      const route = d.route;
       route.properties = route.properties || {};
       route.properties.profile = profile;
       return { profile, route };
@@ -336,7 +445,7 @@ async function routeNow() {
       return { profile, error: e.message };
     }
   }));
-  if (myReqId !== state.routeReqId) return;   // superseded
+  if (myReqId !== state.routeReqId) return;
 
   state.routesByProfile = {};
   for (const r of results) {
