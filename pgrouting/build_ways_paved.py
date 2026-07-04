@@ -73,7 +73,13 @@ def main() -> None:
                 );
             """)
 
-            _step(cur, "INSERT from JOIN (one-time bulk, spatially ordered)", f"""
+            # No ORDER BY. The prior ORDER BY ST_GeoHash spatial sort
+            # was the multi-hour bottleneck (~10-27 h on 4-country data).
+            # GIST bbox lookups from connect_anchors_pairs.py walk the
+            # index directly and don't care about heap-page clustering,
+            # so dropping the sort brings build to ~30-60 min with no
+            # runtime query regression.
+            _step(cur, "INSERT from JOIN (one-time bulk, unordered)", f"""
                 INSERT INTO ways_paved
                   (gid, src_id, dst_id, length_m,
                    src_lon, src_lat, dst_lon, dst_lat)
@@ -85,8 +91,7 @@ def main() -> None:
                 JOIN ways_vertices_pgr vs ON vs.id = w.source
                 JOIN ways_vertices_pgr vt ON vt.id = w.target
                 WHERE wt.highway IN ({placeholders})
-                  AND w.length_m > 0.0
-                ORDER BY ST_GeoHash(vs.the_geom, 12);
+                  AND w.length_m > 0.0;
             """, list(PAVED_HIGHWAYS))
 
             _step(cur, "add src_pt geometry column", """
