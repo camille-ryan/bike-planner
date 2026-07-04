@@ -52,11 +52,16 @@ ntfy_send() { curl -fsS -m 5 -d "$*" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null ||
 
 # is_current N — exit 0 iff stage N's output is current (skip).
 # Invoked inside the pgrouting container so psycopg + postgres:5432 work.
+# PGDATABASE override is required — docker-compose defaults pgrouting to
+# PGDATABASE=bike, but the pipeline runs against $PG_DB (bike_v2_test by
+# default). Without the override, stage 1 (build_paved) always looks
+# missing because ways_paved lives in bike_v2_test, not bike.
 is_current() {
   local n="$1"
   [[ "$RESUME" != "1" ]] && return 1
   [[ ",${FORCE_STAGES}," == *",${n},"* ]] && return 1
   docker compose --profile preprocess run --rm --no-deps \
+    -e PGDATABASE="$PG_DB" -e SPT_PROFILE="$SPT_PROFILE" \
     --entrypoint python3 pgrouting /app/pipeline_status.py \
     --stage "$n" --check-current >/dev/null 2>&1
 }
