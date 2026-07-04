@@ -735,6 +735,9 @@ def _write_outputs(anchors: list[dict], result: dict) -> None:
                     "kind":        kept_anchors[i]["kind"],
                     "place":       kept_anchors[i]["place"],
                     "population":  kept_anchors[i]["population"],
+                    "country":     kept_anchors[i].get("country"),
+                    "vid":         kept_anchors[i].get("vid"),
+                    "_protected":  kept_anchors[i].get("_protected", False),
                     "in_graph":    kept_anchors[i]["ref"] in participant_refs,
                     "snap_dist_m": round(float(best_dist[kept_idx[i]]), 1),
                     "n_snaps":     per_anchor_cnt[kept_idx[i]],
@@ -793,6 +796,8 @@ def _load_anchors_geojson(path: Path) -> list[dict]:
             "place":      p.get("place"),
             "population": p.get("population"),
             "country":    p.get("country"),
+            "vid":        p.get("vid"),
+            "_protected": p.get("_protected", False),
             "lon":        float(lon),
             "lat":        float(lat),
         })
