@@ -396,6 +396,24 @@ def _build_city_graph(anchors: list[dict]) -> None:
           f"(overlap-only; ferries handled via polygon SPT)",
           flush=True)
 
+    # Sanity cap. Polygon-SPT overlap can produce trunks between
+    # anchors that are 100s or 1000s of km apart when many chain-
+    # neighbors of a dense chain graph (crow-flies) share incidental
+    # corridors. Those "long trunks" are guaranteed not to be picked
+    # by chain-Dijkstra (there's always a cheaper multi-hop) but they
+    # bloat stage 9 (build_paired) by 5×+. Drop trunks longer than the
+    # cap here — stage 9 stays honest to real routing choices.
+    MAX_TRUNK_M = float(os.environ.get("ADAPT_MAX_TRUNK_KM", "150")) * 1000.0
+    keep = [i for i, w in enumerate(weight) if w <= MAX_TRUNK_M]
+    n_before = len(from_city)
+    if len(keep) < n_before:
+        from_city = [from_city[i] for i in keep]
+        to_city   = [to_city[i] for i in keep]
+        weight    = [weight[i]   for i in keep]
+        print(f"[adapt]   dropped {n_before - len(from_city):,} trunks "
+              f"> {MAX_TRUNK_M/1000:.0f} km — {len(from_city):,} remain",
+              flush=True)
+
     cg = {"from_city": from_city, "to_city": to_city, "weight": weight}
     path = PAIRED_OUT / "city_graph.json"
     with open(path, "w") as fh:

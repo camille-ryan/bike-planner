@@ -57,7 +57,7 @@ OUT_GRAPH_GEOJSON = DATA_DIR / "way_city_graph.geojson"
 OUT_NODES        = DATA_DIR / "way_city_anchors.geojson"  # rewritten with in_graph
 OUT_ORPHANS      = DATA_DIR / "way_city_anchors_orphans.geojson"
 
-K = int(os.environ.get("CROW_K", "6"))
+K = int(os.environ.get("CROW_K", "3"))
 MAX_EDGE_M = float(os.environ.get("CROW_MAX_EDGE_KM", "100")) * 1000.0
 R_EARTH_M = 6_371_000.0
 
