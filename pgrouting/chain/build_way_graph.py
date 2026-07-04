@@ -118,6 +118,73 @@ def _chord_for_arc(arc_m: float) -> float:
     return 2.0 * R_EARTH_M * np.sin(arc_m / (2.0 * R_EARTH_M))
 
 
+def _load_subgraph_rows_from_cells(bbox):
+    """Fast path: read raw subgraph rows from pre-exported cell files
+    (see ingest/subgraph_export.py). Returns a list of 14-tuples in the
+    same column order the postgres cursor yielded, so the flood-fill
+    code below is unchanged.
+
+    Loads every cell that intersects `bbox` expanded by 1 cell on each
+    side — enough padding to catch edges whose source is just outside
+    the query bbox but whose target is inside.
+    """
+    import os as _os
+    cells_dir = Path(_os.environ.get("SUBGRAPH_CELLS_DIR",
+                                     "/data/subgraph_cells"))
+    manifest_path = cells_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    highway_table = manifest["highway_table"]
+    lo_lon, lo_lat, hi_lon, hi_lat = bbox
+    clo_lon = int(math.floor(lo_lon)) - 1
+    clo_lat = int(math.floor(lo_lat)) - 1
+    chi_lon = int(math.ceil(hi_lon))  + 1
+    chi_lat = int(math.ceil(hi_lat))  + 1
+
+    rows: list[tuple] = []
+    n_files = 0
+    for clon in range(clo_lon, chi_lon + 1):
+        for clat in range(clo_lat, chi_lat + 1):
+            path = cells_dir / f"{clon:+04d}_{clat:+04d}.npz"
+            if not path.exists():
+                continue
+            n_files += 1
+            with np.load(path, allow_pickle=False) as data:
+                n = len(data["source"])
+                if n == 0:
+                    continue
+                source     = data["source"]
+                target     = data["target"]
+                length_m   = data["length_m"]
+                osm_way_id = data["osm_way_id"]
+                hw_idx     = data["hw_idx"]
+                is_ferry_a = data["is_ferry"]
+                src_lon    = data["src_lon"]
+                src_lat    = data["src_lat"]
+                dst_lon    = data["dst_lon"]
+                dst_lat    = data["dst_lat"]
+                name_table = data["name_table"]
+                name_idx   = data["name_idx"]
+                ref_table  = data["ref_table"]
+                ref_idx    = data["ref_idx"]
+                for k in range(n):
+                    hi = int(hw_idx[k])
+                    hw = highway_table[hi] if 0 <= hi < len(highway_table) else ""
+                    rows.append((
+                        int(source[k]), int(target[k]), float(length_m[k]),
+                        int(osm_way_id[k]), hw,
+                        str(name_table[name_idx[k]]),
+                        str(ref_table[ref_idx[k]]),
+                        int(source[k]),
+                        float(src_lon[k]), float(src_lat[k]),
+                        int(target[k]),
+                        float(dst_lon[k]), float(dst_lat[k]),
+                        bool(is_ferry_a[k]),
+                    ))
+    return rows
+
+
 def _load_subgraph(conn: psycopg.Connection,
                    bbox: tuple[float, float, float, float] | None = None):
     """Build the flood-filled subgraph.
@@ -131,15 +198,25 @@ def _load_subgraph(conn: psycopg.Connection,
     Step 3: emit the union (seed edges + promoted edges) as the local
             vertex-indexed (src, dst, length) plus the lon/lat array.
 
-    If bbox is given as (lon_min, lat_min, lon_max, lat_max), the SQL
-    is restricted to edges with EITHER endpoint inside the envelope.
-    The GIST index on `ways_vertices_pgr.the_geom` makes this cheap.
+    If a bbox is given, prefers pre-exported cell files at
+    `/data/subgraph_cells/` — a scalable flat-file mirror of the
+    postgres subgraph produced by `ingest/subgraph_export.py`. Falls
+    back to a postgres bbox query if cells aren't available.
 
     Returns the same (src, dst, length, verts, local_to_global) tuple
     as the simple version, so the downstream Dijkstra/Voronoi code is
     unchanged.
     """
     t = time.time()
+    # Fast path: exported cell files. Skip postgres entirely.
+    if bbox is not None:
+        cell_rows = _load_subgraph_rows_from_cells(bbox)
+        if cell_rows is not None:
+            print(f"[way-graph]   loaded {len(cell_rows):,} rows from "
+                  f"subgraph_cells in {time.time()-t:.1f}s", flush=True)
+            rows = cell_rows
+            return _process_rows_into_subgraph(rows, t)
+
     seed_ph    = ",".join(["%s"] * len(SEED_HIGHWAYS))
     promote_ph = ",".join(["%s"] * len(PROMOTABLE_HIGHWAYS))
     bbox_clause = ""
@@ -191,6 +268,17 @@ def _load_subgraph(conn: psycopg.Connection,
     print(f"[way-graph] pulled {len(rows):,} candidate rows "
           f"(seed + named-promotable) in {time.time()-t:.1f}s", flush=True)
 
+    return _process_rows_into_subgraph(rows, t)
+
+
+def _process_rows_into_subgraph(rows, t_start):
+    """Consumes raw rows (14-tuples in postgres column order) and does
+    the flood-fill + geographic bridging + local-vertex indexing.
+
+    Extracted so both the postgres cursor path and the cell-file path
+    hit the same downstream logic without duplication.
+    """
+    t = t_start
     seed_set: set[int] = set()    # osm_way_ids of seed-class ways
     by_way: dict[int, dict] = {}  # osm_way_id → {name, ref, vertices: set, rows: list of idx}
 

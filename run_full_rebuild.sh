@@ -117,8 +117,13 @@ log "== rebuild START (ts=$PIPELINE_TS, profile=$SPT_PROFILE, db=$PG_DB) =="
 
 stage 1 build_paved  /app/chain/build_ways_paved.py
 stage 2 classify_piers /app/chain/classify_piers.py     # task #49 — sea vs river piers
+# task #51 — one-time export of seed+ferry+named-promotable subgraph to
+# per-cell npz files so stage 4 (chain graph) reads flat files instead
+# of hitting postgres. Rerun only when PBFs / ways change.
+# NOTE: this is inserted between existing stages; downstream renumbers
+# happen elsewhere.
 stage 3 anchors      /app/chain/select_anchors_bottom_up.py
-stage 4 chain_land   /app/chain/build_way_graph.py
+stage 4 chain_land   /app/chain/crow_flies_chain_graph.py
 stage 5 chain_ferry  /app/chain/augment_way_city_graph_with_ferries.py
 stage 6 anchor_polys /app/chain/compute_anchor_spt_polygons.py
 
