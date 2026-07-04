@@ -61,11 +61,13 @@
         <label class="checkbox"><input type="checkbox" id="show-way-graph-nodes" />Way-graph anchors (cities + towns + villages on the road set)</label>
         <label class="checkbox"><input type="checkbox" id="show-way-graph-polygons" />SPT polygons (1.5-hop hull ∪ 5 km disc) <span id="spt-status-badge" class="hint" style="margin-left:0.5em;"></span></label>
         <label class="checkbox"><input type="checkbox" id="show-route-spts" />Per-anchor SPTs along route (paired-SPT visualization) <span id="route-spts-status" class="hint" style="margin-left:0.5em;"></span></label>
+        <label class="checkbox"><input type="checkbox" id="show-route-trunks" />Paired trunks along route (routing data itself) <span id="route-trunks-status" class="hint" style="margin-left:0.5em;"></span></label>
         <label class="checkbox">
           <input type="checkbox" id="trunk-viz-mode" />
           Paired-trunk viz (click 2 anchors → render trunk (A→B))
           <select id="trunk-viz-db" style="margin-left:0.4em;">
-            <option value="paired_trunks.db">current DB (v2)</option>
+            <option value="paired_trunks_v2d.db">v2d (deployed — pruned)</option>
+            <option value="paired_trunks_v2c.db">v2c (unpruned)</option>
             <option value="paired_trunks_v1.db">v1</option>
           </select>
           <span id="trunk-viz-status" class="hint" style="margin-left:0.5em;">off</span>

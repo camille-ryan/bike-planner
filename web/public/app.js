@@ -1461,6 +1461,176 @@ document.getElementById("show-route-spts").addEventListener("change", async (e) 
   }
 });
 
+// --- Paired trunks along route ---------------------------------------
+// Same idea as `show-route-spts`, but pulls the actual (A, B) paired
+// trunks the router walks — the routing data itself. Useful for spotting
+// where a walk terminates unexpectedly (chain-handoff bridge).
+//
+// Coloring is PER-TRUNK normalized: each vertex's ramp position is its
+// distance from A divided by the trunk's max distance from A. Every
+// trunk uses the full red→green range regardless of its physical size.
+let routeTrunksLayerReady = false;
+function ensureRouteTrunksLayer() {
+  if (routeTrunksLayerReady) return;
+  if (!map || typeof map.addSource !== "function") return;
+  if (!map.getSource("route-trunks")) {
+    map.addSource("route-trunks", {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: [] },
+      lineMetrics: true,   // required for line-gradient
+    });
+  }
+  if (!map.getLayer("route-trunks-line")) {
+    map.addLayer({
+      id: "route-trunks-line",
+      type: "line",
+      source: "route-trunks",
+      paint: {
+        // Each chain has coords ordered from LEAF → A-seed. Gradient
+        // paints green at the leaf end, red at the A-seed end, so
+        // "where the trunk reaches farthest" is highlighted green.
+        "line-gradient": [
+          "interpolate", ["linear"], ["line-progress"],
+          0.0, "#22c55e",   // leaf end (start of coords)
+          0.25, "#84cc16",
+          0.5,  "#facc15",
+          0.75, "#f97316",
+          1.0,  "#dc2626",  // A-seed end (end of coords)
+        ],
+        "line-width": [
+          "interpolate", ["linear"], ["zoom"],
+          8,  0.9,
+          12, 1.6,
+          16, 2.4,
+        ],
+        "line-opacity": 0.85,
+      },
+    });
+  }
+  routeTrunksLayerReady = true;
+}
+
+const ROUTE_TRUNKS_CONCURRENCY = 6;
+
+// Cache city coord lookup so we don't refetch on every DB change.
+let _cityCoordsPromise = null;
+function fetchCityCoords() {
+  if (_cityCoordsPromise) return _cityCoordsPromise;
+  _cityCoordsPromise = (async () => {
+    const r = await fetch("/data/spt/views/cities.json?ts=" + Date.now());
+    if (!r.ok) throw new Error(`cities.json: ${r.status}`);
+    const d = await r.json();
+    const m = new Map();
+    for (const c of d) m.set(c.city_idx, [c.lon, c.lat]);
+    return m;
+  })().catch(err => {
+    _cityCoordsPromise = null;
+    throw err;
+  });
+  return _cityCoordsPromise;
+}
+
+async function loadRouteTrunks() {
+  ensureRouteTrunksLayer();
+  const route = state.routesByProfile["views"]
+             || Object.values(state.routesByProfile)[0];
+  const chainIdx = route?.properties?.chain_city_idx;
+  const chainNames = route?.properties?.chain_names || [];
+  const badge = document.getElementById("route-trunks-status");
+  const src = map.getSource("route-trunks");
+  if (!chainIdx || chainIdx.length < 2) {
+    if (badge) badge.textContent = "(plan a route first)";
+    if (src) src.setData({ type: "FeatureCollection", features: [] });
+    return;
+  }
+  const db = document.getElementById("trunk-viz-db").value;
+  // The router emits {leg: i, skipped: true} for every chain-Dijkstra
+  // leg it jumped past via task-#46 skip-lookahead. Filter those out
+  // so the viz shows only trunks the router actually walked.
+  const bridges = route?.properties?.bridges || [];
+  const skippedLegs = new Set(
+    bridges.filter(b => b.skipped && typeof b.leg === "number")
+           .map(b => b.leg),
+  );
+  const pairs = [];
+  for (let i = 0; i < chainIdx.length - 1; i++) {
+    if (skippedLegs.has(i)) continue;   // router jumped past this leg
+    pairs.push({ aIdx: chainIdx[i], bIdx: chainIdx[i + 1],
+                 aName: chainNames[i], bName: chainNames[i + 1] });
+  }
+  if (badge) badge.textContent =
+    `loading 0 / ${pairs.length}… (${db}, ${skippedLegs.size} skipped)`;
+
+  const all = [];
+  let done = 0;
+  let totalChains = 0;
+  const queue = [...pairs];
+  async function worker() {
+    while (queue.length) {
+      const { aIdx, bIdx, aName, bName } = queue.shift();
+      try {
+        // Chain-mode endpoint: one LineString per succ leaf-to-root
+        // walk. Feature count = ~n_leaves per trunk (tens to
+        // hundreds), not ~2 × n_vertices.
+        const url = `${API_BASE}/trunk/chains/${aIdx}/${bIdx}?db=${db}&profile=views`;
+        const r = await fetch(url);
+        if (r.ok) {
+          const fc = await r.json();
+          totalChains += (fc.n_chains || 0);
+          for (const f of fc.features || []) {
+            f.properties = f.properties || {};
+            f.properties.trunk_a = aIdx;
+            f.properties.trunk_b = bIdx;
+            f.properties.trunk_a_name = aName || String(aIdx);
+            f.properties.trunk_b_name = bName || String(bIdx);
+            all.push(f);
+          }
+        }
+      } catch (e) {
+        // best-effort
+      }
+      done++;
+      if (badge) badge.textContent =
+        `loading ${done} / ${pairs.length}… (${db}, ${totalChains.toLocaleString()} chains)`;
+      if (done % 4 === 0 || done === pairs.length) {
+        if (src) src.setData({ type: "FeatureCollection", features: all });
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: ROUTE_TRUNKS_CONCURRENCY }, worker));
+  if (src) src.setData({ type: "FeatureCollection", features: all });
+  if (badge) badge.textContent =
+    `${pairs.length} walked trunks · ${totalChains.toLocaleString()} chains `
+    + `· ${skippedLegs.size} skipped · ${db}`;
+}
+
+document.getElementById("show-route-trunks").addEventListener("change", async (e) => {
+  try {
+    ensureRouteTrunksLayer();
+    if (e.target.checked) {
+      map.setLayoutProperty("route-trunks-line", "visibility", "visible");
+      await loadRouteTrunks();
+    } else {
+      map.setLayoutProperty("route-trunks-line", "visibility", "none");
+    }
+  } catch (err) {
+    console.error("route-trunks toggle failed:", err);
+    setError(`route trunks: ${err.message}`);
+  }
+});
+
+// Reload trunks when the DB dropdown changes so the user can compare
+// v2c vs v2d along a whole route.
+document.getElementById("trunk-viz-db").addEventListener("change", () => {
+  const cb = document.getElementById("show-route-trunks");
+  if (cb && cb.checked) {
+    loadRouteTrunks().catch(err => {
+      console.error("route-trunks db-swap reload failed:", err);
+      setError(`route trunks: ${err.message}`);
+    });
+  }
+});
+
 document.getElementById("show-way-graph-nodes").addEventListener("change", async (e) => {
   if (e.target.checked) {
     try { await ensureWayGraphNodes(); }
