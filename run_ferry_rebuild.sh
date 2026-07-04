@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# DEPRECATED — superseded by run_full_rebuild.sh.
+# Kept for reference; will be deleted once the new orchestrator has
+# been executed successfully at least once. Same gaps as
+# run_ferry_anchors_rebuild.sh.
+#
 # Rerun SPT + adapter + paired-db after adding ferry chain edges
 # to polygon inputs. Assumes NPZs already wiped.
 set -euo pipefail

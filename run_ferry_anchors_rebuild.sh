@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# DEPRECATED — superseded by run_full_rebuild.sh.
+# Kept for reference; scheduled for deletion once run_full_rebuild.sh
+# has been executed successfully end-to-end at least once.
+# Notable gaps vs the new orchestrator: no iterative-pruner step,
+# no skip-lookahead-aware verify, no per-stage logs, no ntfy.
+#
 # Ferry-terminals-as-anchors full rebuild.
 #
 # Pipeline (see /home/ryan/.claude/plans/splendid-swinging-pizza.md):
