@@ -67,6 +67,24 @@ PROMOTABLE_HIGHWAYS   = (
     "secondary_link", "tertiary_link",
 )
 ANCHOR_BUFFER_M   = 4828.0          # ~3 mi
+
+# Tiling for the subgraph load. The 4-country subgraph (seed +
+# named-promotable + ferries) is ~20-30 M rows, ~2-4 GB of Python
+# objects — too big to load at once alongside the API. We tile:
+# every core tile is TILE_CORE_DEG × TILE_CORE_DEG; each per-tile
+# load pulls edges whose endpoint lies in a buffered bbox
+# (TILE_CORE_DEG + 2 * TILE_BUFFER_DEG on a side). The buffer must
+# exceed the longest chain edge so Voronoi neighbours of any core
+# anchor are fully resolved inside the tile — 1.5° ≈ 150 km at these
+# latitudes, well above the observed ~50 km max chain edge.
+#
+# Anchors near a tile's edges are computed by both the tile that owns
+# them (their core tile) AND any tile whose buffer reaches them; we
+# emit every observed edge and dedupe canonically at merge time. This
+# keeps per-tile memory bounded (~500 MB peak) at the cost of ~2× work
+# on the buffer overlap.
+TILE_CORE_DEG   = 3.0
+TILE_BUFFER_DEG = 1.5
 # After the name/ref flood-fill, bridge endpoints of same-name-or-ref
 # in-set ways that lie within this many meters of each other but aren't
 # connected via a shared graph vertex. Handles OSM tagging gaps at town
@@ -100,7 +118,8 @@ def _chord_for_arc(arc_m: float) -> float:
     return 2.0 * R_EARTH_M * np.sin(arc_m / (2.0 * R_EARTH_M))
 
 
-def _load_subgraph(conn: psycopg.Connection):
+def _load_subgraph(conn: psycopg.Connection,
+                   bbox: tuple[float, float, float, float] | None = None):
     """Build the flood-filled subgraph.
 
     Step 1: pull seed edges (highway in SEED_HIGHWAYS) and a pool of
@@ -112,6 +131,10 @@ def _load_subgraph(conn: psycopg.Connection):
     Step 3: emit the union (seed edges + promoted edges) as the local
             vertex-indexed (src, dst, length) plus the lon/lat array.
 
+    If bbox is given as (lon_min, lat_min, lon_max, lat_max), the SQL
+    is restricted to edges with EITHER endpoint inside the envelope.
+    The GIST index on `ways_vertices_pgr.the_geom` makes this cheap.
+
     Returns the same (src, dst, length, verts, local_to_global) tuple
     as the simple version, so the downstream Dijkstra/Voronoi code is
     unchanged.
@@ -119,6 +142,16 @@ def _load_subgraph(conn: psycopg.Connection):
     t = time.time()
     seed_ph    = ",".join(["%s"] * len(SEED_HIGHWAYS))
     promote_ph = ",".join(["%s"] * len(PROMOTABLE_HIGHWAYS))
+    bbox_clause = ""
+    if bbox is not None:
+        # Filter to edges whose EITHER endpoint sits inside the envelope.
+        # `vs.the_geom && env` is the GIST-indexed bbox test. Edges that
+        # straddle the tile boundary are kept because at least one of
+        # their vertices is inside.
+        bbox_clause = (
+            "  AND (vs.the_geom && ST_MakeEnvelope(%s,%s,%s,%s,4326)"
+            "       OR vt.the_geom && ST_MakeEnvelope(%s,%s,%s,%s,4326))"
+        )
     sql = f"""
         SELECT w.source, w.target, w.length_m, w.osm_way_id, w.highway,
                COALESCE(t.name, '') AS name, COALESCE(t.ref, '') AS ref,
@@ -138,8 +171,12 @@ def _load_subgraph(conn: psycopg.Connection):
                   AND (COALESCE(t.name, '') <> '' OR COALESCE(t.ref, '') <> '')
               )
           )
+        {bbox_clause}
     """
     params = list(SEED_HIGHWAYS) + list(PROMOTABLE_HIGHWAYS)
+    if bbox is not None:
+        params.extend(bbox)   # vs envelope
+        params.extend(bbox)   # vt envelope
     rows: list[tuple] = []
     with conn.cursor(name="way_graph_subgraph") as cur:
         # Server-side cursor + itersize streams in pages so postgres
@@ -236,7 +273,7 @@ def _load_subgraph(conn: psycopg.Connection):
     # incident to it. Used by the geographic-bridge step that follows.
     vert_tags: dict[int, set[tuple[str, str]]] = {}
     for r in rows:
-        (sv, tv, lm, oid, hw, name, ref, sg, sx, sy, tg, tx, ty) = r
+        (sv, tv, lm, oid, hw, name, ref, sg, sx, sy, tg, tx, ty, _isf) = r
         if int(oid) not in in_set:
             continue
         s_loc = _intern(int(sg), float(sx), float(sy))
@@ -804,7 +841,67 @@ def _load_anchors_geojson(path: Path) -> list[dict]:
     return out
 
 
+def _tile_bboxes(anchors: list[dict]) -> list[dict]:
+    """Return a list of tile descriptors covering every anchor.
+
+    Each descriptor is {'core': bbox, 'buffer': bbox} where a bbox is
+    (lon_min, lat_min, lon_max, lat_max). Only tiles whose core
+    contains at least one anchor are emitted.
+    """
+    import math
+    if not anchors:
+        return []
+    lons = [float(a["lon"]) for a in anchors]
+    lats = [float(a["lat"]) for a in anchors]
+    lon_min, lon_max = min(lons), max(lons)
+    lat_min, lat_max = min(lats), max(lats)
+    # Snap the tile grid to whole degrees so tile edges are stable
+    # across runs even if a few anchors shift.
+    x0 = math.floor(lon_min / TILE_CORE_DEG) * TILE_CORE_DEG
+    y0 = math.floor(lat_min / TILE_CORE_DEG) * TILE_CORE_DEG
+    x1 = math.ceil(lon_max / TILE_CORE_DEG) * TILE_CORE_DEG
+    y1 = math.ceil(lat_max / TILE_CORE_DEG) * TILE_CORE_DEG
+
+    tiles: list[dict] = []
+    x = x0
+    while x < x1:
+        y = y0
+        while y < y1:
+            core = (x, y, x + TILE_CORE_DEG, y + TILE_CORE_DEG)
+            n_in_core = sum(
+                1 for a in anchors
+                if core[0] <= a["lon"] < core[2] and core[1] <= a["lat"] < core[3]
+            )
+            if n_in_core > 0:
+                buf = (
+                    core[0] - TILE_BUFFER_DEG,
+                    core[1] - TILE_BUFFER_DEG,
+                    core[2] + TILE_BUFFER_DEG,
+                    core[3] + TILE_BUFFER_DEG,
+                )
+                tiles.append({"core": core, "buffer": buf,
+                              "n_core_anchors": n_in_core})
+            y += TILE_CORE_DEG
+        x += TILE_CORE_DEG
+    return tiles
+
+
+def _anchors_in_bbox(anchors: list[dict],
+                     bbox: tuple[float, float, float, float]) -> tuple[list[dict], list[int]]:
+    """Return (anchors_in_bbox, original_indices). Half-open on max
+    edges so an anchor never falls in two tiles' cores."""
+    out: list[dict] = []
+    orig_idx: list[int] = []
+    lo_lon, lo_lat, hi_lon, hi_lat = bbox
+    for i, a in enumerate(anchors):
+        if lo_lon <= a["lon"] < hi_lon and lo_lat <= a["lat"] < hi_lat:
+            out.append(a)
+            orig_idx.append(i)
+    return out, orig_idx
+
+
 def main() -> None:
+    import gc
     import os
     t0 = time.time()
     print(f"[way-graph] seed highways: {SEED_HIGHWAYS}", flush=True)
@@ -813,25 +910,130 @@ def main() -> None:
           flush=True)
     print(f"[way-graph] anchor buffer: {ANCHOR_BUFFER_M:.0f} m "
           f"(~{ANCHOR_BUFFER_M/1609.344:.2f} mi)", flush=True)
+    print(f"[way-graph] tile: core {TILE_CORE_DEG}° + buffer {TILE_BUFFER_DEG}°",
+          flush=True)
 
-    with psycopg.connect(config.PG_DSN) as conn:
-        src, dst, edge_len, verts, _l2g = _load_subgraph(conn)
-        # Prefer a pre-written anchors file (e.g., from
-        # select_anchors_bottom_up.py, which includes ferry piers)
-        # over re-selecting from the anchors table.
-        if OUT_NODES_GEOJSON.exists() and os.environ.get("WAY_GRAPH_USE_PRESELECTED_ANCHORS", "1") == "1":
-            anchors = _load_anchors_geojson(OUT_NODES_GEOJSON)
-            print(f"[way-graph] anchors: {len(anchors):,} loaded from "
-                  f"{OUT_NODES_GEOJSON.name} (pre-selected)", flush=True)
-        else:
-            anchors = _load_db_anchors(conn)
-            print(f"[way-graph] anchors: {len(anchors):,} db (villages disabled)",
-                  flush=True)
+    # Load ALL anchors first (pure file read — cheap and needed for
+    # tile placement).
+    if OUT_NODES_GEOJSON.exists() and os.environ.get("WAY_GRAPH_USE_PRESELECTED_ANCHORS", "1") == "1":
+        anchors_all = _load_anchors_geojson(OUT_NODES_GEOJSON)
+        print(f"[way-graph] anchors: {len(anchors_all):,} loaded from "
+              f"{OUT_NODES_GEOJSON.name} (pre-selected)", flush=True)
+    else:
+        with psycopg.connect(config.PG_DSN) as conn:
+            anchors_all = _load_db_anchors(conn)
+        print(f"[way-graph] anchors: {len(anchors_all):,} db "
+              f"(villages disabled)", flush=True)
 
-    components = _compute_components(src, dst, len(verts))
-    result = compute_chain_graph(anchors, src, dst, edge_len, verts,
-                                 components=components, verbose=True)
-    _write_outputs(anchors, result)
+    tiles = _tile_bboxes(anchors_all)
+    print(f"[way-graph] {len(tiles)} non-empty tile(s) covering all anchors",
+          flush=True)
+
+    # Accumulate results across tiles. Chain edges are deduped
+    # canonically (min_ref, max_ref) → keep min cost witness. Anchor
+    # participation is a set union across tiles.
+    merged_edges: dict[tuple[str, str], dict] = {}
+    participant_refs: set[str] = set()
+    orig_orphan_refs: set[str] = set(a["ref"] for a in anchors_all)  # start pessimistic
+    best_dist_by_orig: dict[int, float] = {}
+    n_snaps_by_orig:   dict[int, int]   = {}
+    # `nearest_road` per original anchor: we keep the minimum across tiles.
+    nearest_road_by_orig: dict[int, float] = {}
+
+    for ti, td in enumerate(tiles, 1):
+        core = td["core"]; buf = td["buffer"]
+        anchors_tile, orig_idx = _anchors_in_bbox(anchors_all, buf)
+        print(f"[way-graph] tile {ti}/{len(tiles)} core="
+              f"({core[0]:g},{core[1]:g})..({core[2]:g},{core[3]:g}) "
+              f"buffered anchors={len(anchors_tile):,} "
+              f"(of which core={td['n_core_anchors']:,})",
+              flush=True)
+
+        with psycopg.connect(config.PG_DSN) as conn:
+            src, dst, edge_len, verts, _l2g = _load_subgraph(conn, bbox=buf)
+
+        if len(src) == 0:
+            print(f"[way-graph]   tile {ti}: empty subgraph — skip", flush=True)
+            del src, dst, edge_len, verts, _l2g
+            gc.collect()
+            continue
+
+        components = _compute_components(src, dst, len(verts))
+        result = compute_chain_graph(anchors_tile, src, dst, edge_len, verts,
+                                     components=components, verbose=True)
+
+        # Take from the per-tile result whatever is best across tiles.
+        for local_ki, orig_i in enumerate(orig_idx):
+            if local_ki in result["per_anchor_count"]:
+                orig_orphan_refs.discard(anchors_all[orig_i]["ref"])
+                # Keep the minimum snap distance across tiles.
+                d_here = result["best_dist"][local_ki]
+                d_cur  = best_dist_by_orig.get(orig_i)
+                if d_cur is None or d_here < d_cur:
+                    best_dist_by_orig[orig_i] = d_here
+                    n_snaps_by_orig[orig_i]   = result["per_anchor_count"][local_ki]
+
+        for local_i, nr in enumerate(result["nearest_road"]):
+            orig_i = orig_idx[local_i]
+            cur = nearest_road_by_orig.get(orig_i)
+            if cur is None or nr < cur:
+                nearest_road_by_orig[orig_i] = nr
+
+        # Emit edges. Keep the min-cost witness per canonical key.
+        for e in result["chain_edges"]:
+            key = tuple(sorted((e["a"], e["b"])))
+            keep = merged_edges.get(key)
+            if keep is None or e["cost_m"] < keep["cost_m"]:
+                # Canonicalize a/b to key order for stable output.
+                if key[0] == e["a"]:
+                    merged_edges[key] = e
+                else:
+                    merged_edges[key] = {
+                        "a": e["b"], "a_name": e["b_name"],
+                        "b": e["a"], "b_name": e["a_name"],
+                        "cost_m": e["cost_m"],
+                        "geom": list(reversed(e["geom"])),
+                    }
+
+        participant_refs |= result["participant_refs"]
+
+        print(f"[way-graph]   tile {ti}: +{len(result['chain_edges']):,} edges "
+              f"(merged total: {len(merged_edges):,})", flush=True)
+
+        del src, dst, edge_len, verts, _l2g, components, result
+        gc.collect()
+
+    # Synthesize a "result" dict compatible with _write_outputs.
+    chain_edges = list(merged_edges.values())
+    kept_idx = sorted(best_dist_by_orig.keys())
+    kept_anchors = [anchors_all[i] for i in kept_idx]
+    orphan_idx = [i for i in range(len(anchors_all))
+                  if anchors_all[i]["ref"] in orig_orphan_refs]
+    # Rebuild `per_anchor_count` / `best_dist` keyed on position-in-kept
+    # (that's what _write_outputs indexes with).
+    per_anchor_count = {i: n_snaps_by_orig.get(i, 0) for i in kept_idx}
+    best_dist = {i: best_dist_by_orig.get(i, 0.0) for i in kept_idx}
+    nearest_road = [nearest_road_by_orig.get(i, float("inf"))
+                    for i in range(len(anchors_all))]
+    # Convert dicts keyed by orig-anchor-idx into arrays keyed by
+    # position-in-kept, as _write_outputs expects (it indexes with
+    # kept_idx[i] into per_anchor_count / best_dist).
+    result = {
+        "chain_edges":       chain_edges,
+        "kept_anchors":      kept_anchors,
+        "kept_idx":          kept_idx,
+        "orphan_idx":        orphan_idx,
+        "per_anchor_count":  per_anchor_count,
+        "best_dist":         best_dist,
+        "nearest_road":      nearest_road,
+        "participant_refs":  participant_refs,
+    }
+    print(f"[way-graph] merged: {len(chain_edges):,} chain edges, "
+          f"{len(kept_anchors):,} kept anchors, "
+          f"{len(orphan_idx):,} orphans",
+          flush=True)
+
+    _write_outputs(anchors_all, result)
     print(f"[way-graph] DONE in {time.time()-t0:.1f}s", flush=True)
 
 
