@@ -166,6 +166,14 @@ ALTER TABLE ways ADD COLUMN IF NOT EXISTS viewpoint_regional  real NOT NULL DEFA
 ALTER TABLE ways DROP COLUMN IF EXISTS sinuosity;
 CREATE INDEX IF NOT EXISTS ways_source_idx ON ways(source);
 CREATE INDEX IF NOT EXISTS ways_target_idx ON ways(target);
+-- Partial index for ferry-subgraph queries (classify_piers.py,
+-- augment_way_city_graph_with_ferries.py). Ferry rows are ~0.003% of
+-- ways so this index is tiny; but without it those queries seqscan
+-- 127M rows. Existing DBs may already have `ways_is_ferry_partial_idx`
+-- (gid + WHERE is_ferry, from an earlier revision) which serves the
+-- same queries — schema stays idempotent either way.
+CREATE INDEX IF NOT EXISTS ways_is_ferry_partial_idx
+    ON ways(gid) WHERE is_ferry;
 
 -- Routing anchors: place=city|town from the POI extract, snapped to
 -- the nearest graph vertex. The snap step runs after edge ingest so

@@ -58,7 +58,19 @@ VILLAGE_FILES  = [
 # synthetic straight-line edges between anchor centers. Piers are
 # `_protected=True` — they survive the greedy dropout regardless of
 # whether a bigger settlement lies within MIN_SPACING_M.
-FERRY_PIERS_FILE = Path("/data/ferry_piers.geojsonseq")
+#
+# Task #49: we now read `sea_piers.geojsonseq` (only piers on ferry
+# systems > 20 km total length) instead of all piers. Short-hop
+# river-crossing ferries stay in `ways` as is_ferry rows the bike
+# Dijkstra can still take, but they don't get chain anchors or paired
+# SPTs — chain-Dijkstra can't zip through a 5-hop Vltava pier sequence
+# when the actual bike path should follow the riverside road.
+#
+# `classify_piers.py` (stage 2b in run_full_rebuild.sh) produces
+# sea_piers.geojsonseq. If that file doesn't exist yet, fall back to
+# the legacy `ferry_piers.geojsonseq` — same shape, all piers included.
+FERRY_PIERS_FILE = Path("/data/sea_piers.geojsonseq")
+FERRY_PIERS_FALLBACK = Path("/data/ferry_piers.geojsonseq")
 
 
 def _load_all_places(conn: psycopg.Connection) -> list[dict]:
@@ -102,8 +114,11 @@ def _load_all_places(conn: psycopg.Connection) -> list[dict]:
               f"{path.name}", flush=True)
 
     ferry_piers: list[dict] = []
-    if FERRY_PIERS_FILE.exists():
-        for line in open(FERRY_PIERS_FILE):
+    piers_path = FERRY_PIERS_FILE if FERRY_PIERS_FILE.exists() else (
+        FERRY_PIERS_FALLBACK if FERRY_PIERS_FALLBACK.exists() else None
+    )
+    if piers_path is not None:
+        for line in open(piers_path):
             line = line.strip().lstrip("\x1e").strip()
             if not line:
                 continue
@@ -125,9 +140,10 @@ def _load_all_places(conn: psycopg.Connection) -> list[dict]:
                 "vid":         vid,
             })
         print(f"[bottom-up]   loaded {len(ferry_piers):,} ferry piers from "
-              f"{FERRY_PIERS_FILE.name}", flush=True)
+              f"{piers_path.name}", flush=True)
     else:
-        print(f"[bottom-up] missing ferry piers file: {FERRY_PIERS_FILE}",
+        print(f"[bottom-up] missing ferry piers file: "
+              f"{FERRY_PIERS_FILE} (and fallback {FERRY_PIERS_FALLBACK})",
               flush=True)
 
     return db_anchors + villages + ferry_piers

@@ -148,14 +148,14 @@ def _file_stage(n: int, name: str, out_path: Path,
 
 
 def _spt_dir_stage() -> StageStatus:
-    """Stage 6 special: /data/spt/<profile>_polygon has one .npz per
+    """Stage 7 special: /data/spt/<profile>_polygon has one .npz per
     anchor. Current iff #npz matches #anchors in the source polygons
     geojson AND newest npz > polygons file."""
     npz_dir = DATA / "spt" / f"{SPT_PROFILE}_polygon"
     polys = DATA / "way_city_spt_polygons.geojson"
     if not npz_dir.exists():
         return StageStatus(
-            6, "spt_polygon", ok=False,
+            7, "spt_polygon", ok=False,
             detail=f"MISSING {npz_dir}",
             output_path=str(npz_dir),
             upstream_paths=[str(polys)],
@@ -171,7 +171,7 @@ def _spt_dir_stage() -> StageStatus:
     elif m_newest:
         detail += f", newest {_iso_short(m_newest)}"
     return StageStatus(
-        6, "spt_polygon", ok=(not partial and n_npz > 0),
+        7, "spt_polygon", ok=(not partial and n_npz > 0),
         partial=partial, detail=detail,
         output_path=str(npz_dir),
         upstream_paths=[str(polys)],
@@ -186,21 +186,21 @@ def _api_symlink_stage() -> StageStatus:
     v2d = DATA / "spt" / SPT_PROFILE / "paired_trunks_v2d.db"
     v2c = DATA / "spt" / SPT_PROFILE / "paired_trunks_v2c.db"
     if not link.is_symlink():
-        return StageStatus(10, "symlink", ok=False,
+        return StageStatus(11, "symlink", ok=False,
                            detail=f"not a symlink: {link}",
                            output_path=str(link))
     target = os.readlink(link)
     if target != "paired_trunks_v2d.db":
-        return StageStatus(10, "symlink", ok=False,
+        return StageStatus(11, "symlink", ok=False,
                            detail=f"symlink points to {target}, expected paired_trunks_v2d.db",
                            output_path=str(link))
     m_v2d = _mtime(v2d)
     m_v2c = _mtime(v2c)
     if m_v2d and m_v2c and m_v2d < m_v2c:
-        return StageStatus(10, "symlink", ok=False, partial=True,
+        return StageStatus(11, "symlink", ok=False, partial=True,
                            detail="v2d.db older than v2c.db — pruner never ran on this v2c",
                            output_path=str(link))
-    return StageStatus(10, "symlink", ok=True,
+    return StageStatus(11, "symlink", ok=True,
                        detail=f"→ {target}",
                        output_path=str(link))
 
@@ -220,59 +220,64 @@ def _api_running_stage() -> StageStatus:
     except Exception as exc:                     # noqa: BLE001 — best-effort
         ok = False
         detail = f"docker ps failed: {exc}"
-    return StageStatus(11, "api_restart", ok=ok, detail=detail)
+    return StageStatus(12, "api_restart", ok=ok, detail=detail)
 
 
 def _verify_stage() -> StageStatus:
     """Stage 12: verify. No lasting artifact — always report as
     'not current' so the orchestrator re-runs it every time."""
-    return StageStatus(12, "verify", ok=False,
+    return StageStatus(13, "verify", ok=False,
                        detail="runtime check — always re-runs")
 
 
 def _stages() -> list[Callable[[], StageStatus]]:
     profile_dir = DATA / "spt" / SPT_PROFILE
     return [
-        _ways_paved_status,
-        lambda: _file_stage(
-            2, "anchors",
-            DATA / "way_city_anchors.geojson",
-            upstream=[],
+        _ways_paved_status,                            # 1
+        lambda: _file_stage(                           # 2
+            2, "classify_piers",
+            DATA / "sea_piers.geojsonseq",
+            upstream=[DATA / "ferry_piers.geojsonseq"],
         ),
-        lambda: _file_stage(
-            3, "chain_land",
+        lambda: _file_stage(                           # 3
+            3, "anchors",
+            DATA / "way_city_anchors.geojson",
+            upstream=[DATA / "sea_piers.geojsonseq"],
+        ),
+        lambda: _file_stage(                           # 4
+            4, "chain_land",
             DATA / "way_city_graph.json",
             upstream=[DATA / "way_city_anchors.geojson"],
         ),
-        lambda: _file_stage(
-            4, "chain_ferry",
+        lambda: _file_stage(                           # 5
+            5, "chain_ferry",
             DATA / "way_city_graph.geojson",  # updated by augment
             upstream=[DATA / "way_city_graph.json"],
         ),
-        lambda: _file_stage(
-            5, "anchor_polys",
+        lambda: _file_stage(                           # 6
+            6, "anchor_polys",
             DATA / "way_city_spt_polygons.geojson",
             upstream=[DATA / "way_city_graph.json"],
         ),
-        _spt_dir_stage,
-        lambda: _file_stage(
-            7, "adapt_paired",
+        _spt_dir_stage,                                # 7
+        lambda: _file_stage(                           # 8
+            8, "adapt_paired",
             profile_dir / "city_graph.json",
             upstream=[DATA / "spt" / f"{SPT_PROFILE}_polygon"],
         ),
-        lambda: _file_stage(
-            8, "build_paired",
+        lambda: _file_stage(                           # 9
+            9, "build_paired",
             profile_dir / "paired_trunks_v2c.db",
             upstream=[profile_dir / "city_graph.json"],
         ),
-        lambda: _file_stage(
-            9, "prune",
+        lambda: _file_stage(                           # 10
+            10, "prune",
             profile_dir / "paired_trunks_v2d.db",
             upstream=[profile_dir / "paired_trunks_v2c.db"],
         ),
-        _api_symlink_stage,
-        _api_running_stage,
-        _verify_stage,
+        _api_symlink_stage,                            # 11
+        _api_running_stage,                            # 12
+        _verify_stage,                                 # 13
     ]
 
 
