@@ -39,27 +39,27 @@ from pathlib import Path
 import psycopg
 
 import config
-import ingest_pbf
-import ingest_boundaries
-import ingest_dem
-import ingest_landcover
-import ingest_coastline
-import ingest_waterways
-import ingest_railways
-import ingest_lodging
-import download_gtfs
-import route_city_pairs
-import compute_canopy_frac
-import compute_canopy_frac_raster
+from ingest import ingest_pbf
+from ingest import ingest_boundaries
+from ingest import ingest_dem
+from ingest import ingest_landcover
+from ingest import ingest_coastline
+from ingest import ingest_waterways
+from ingest import ingest_railways
+from ingest import ingest_lodging
+from ingest import download_gtfs
+from deprecated import route_city_pairs
+from cost import compute_canopy_frac
+from cost import compute_canopy_frac_raster
 from scenicness import bake as scenicness_bake
 from scenicness import signals as scenicness_signals
 from scenicness import tiles as scenicness_tiles
-import compare_canopy
-import reannotate_canopy_km
-import snap_anchors
-import download_dem
-import recompute_cost
-import export_route_compare
+from diagnostics import compare_canopy
+from diagnostics import reannotate_canopy_km
+from ingest import snap_anchors
+from ingest import download_dem
+from cost import recompute_cost
+from diagnostics import export_route_compare
 
 
 def cmd_ingest(args) -> None:

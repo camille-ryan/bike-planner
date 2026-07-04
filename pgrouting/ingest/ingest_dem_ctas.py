@@ -28,7 +28,7 @@ import numpy as np
 import psycopg
 
 import config
-from ingest_dem import _enumerate_tiles, _sample_bilinear
+from .ingest_dem import _enumerate_tiles, _sample_bilinear
 
 
 def ingest_ctas(conn: psycopg.Connection, dem_dir: Path | None = None) -> None:

@@ -37,7 +37,7 @@ import numpy as np
 import psycopg
 
 import config
-from cost import bike_edge_cost, _PROFILES
+from .cost import bike_edge_cost, _PROFILES
 
 
 _BATCH = 100_000      # rows per server-cursor fetch chunk

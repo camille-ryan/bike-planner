@@ -35,8 +35,8 @@ import numpy as np
 import psycopg
 
 import config
-from cost import _PROFILES
-from recompute_cost import (
+from .cost import _PROFILES
+from .recompute_cost import (
     _recompute_one,
     _iter_tiles,
     _bake_extent,

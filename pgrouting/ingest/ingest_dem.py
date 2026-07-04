@@ -26,7 +26,7 @@ import psycopg
 import rasterio
 
 import config
-import download_dem
+from . import download_dem
 
 
 def _enumerate_tiles(dem_dir: Path) -> dict[tuple[int, int], Path]:

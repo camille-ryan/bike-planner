@@ -7,7 +7,7 @@ the resolve logic without re-streaming.
 import psycopg
 
 import config
-from ingest_pbf import _resolve_into_final
+from .ingest_pbf import _resolve_into_final
 
 
 def main() -> None:

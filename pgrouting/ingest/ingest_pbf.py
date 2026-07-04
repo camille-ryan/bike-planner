@@ -39,7 +39,7 @@ from typing import Iterable
 import osmium
 import psycopg
 
-from cost import bike_edge_cost, EXCLUDE
+from cost.cost import bike_edge_cost, EXCLUDE
 
 
 _EARTH_R = 6_371_000.0

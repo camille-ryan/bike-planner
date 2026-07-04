@@ -24,4 +24,9 @@ ENV PGHOST=postgres
 ENV PGUSER=bike
 ENV PGPASSWORD=bike
 ENV PGDATABASE=bike
+# Make /app (== pgrouting/) importable regardless of the invocation
+# entry point — so both `python3 main.py <sub>` and
+# `python3 /app/chain/build_ways_paved.py` can resolve `import config`
+# and the intra-package `from ingest import ...` imports.
+ENV PYTHONPATH=/app
 ENTRYPOINT ["python3", "main.py"]
