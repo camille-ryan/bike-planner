@@ -34,6 +34,7 @@ set -euo pipefail
 : "${SPT_PROFILE:=views}"
 : "${NTFY_TOPIC:=SMJVoZsEr7s6TKGb}"
 : "${FORCE_STAGES:=}"
+: "${SKIP_STAGES:=}"          # comma-list of stages to always skip
 : "${DRY_RUN:=0}"
 : "${RESUME:=1}"
 
@@ -51,16 +52,17 @@ log()       { echo "=== [$(date -Iseconds)] $*" | tee -a "$AGG_LOG"; }
 ntfy_send() { curl -fsS -m 5 -d "$*" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null || true; }
 
 # is_current N — exit 0 iff stage N's output is current (skip).
-# Invoked inside the pgrouting container so psycopg + postgres:5432 work.
-# PGDATABASE override is required — docker-compose defaults pgrouting to
-# PGDATABASE=bike, but the pipeline runs against $PG_DB (bike_v2_test by
-# default). Without the override, stage 1 (build_paved) always looks
-# missing because ways_paved lives in bike_v2_test, not bike.
+# Precedence: SKIP_STAGES (always skip) > FORCE_STAGES (always run) >
+# pipeline_status --check-current (inspects data).
+# The docker-based check needs -v /app so pipeline_status.py is present
+# and -e PGDATABASE so it hits the right DB.
 is_current() {
   local n="$1"
+  [[ ",${SKIP_STAGES}," == *",${n},"* ]] && return 0
   [[ "$RESUME" != "1" ]] && return 1
   [[ ",${FORCE_STAGES}," == *",${n},"* ]] && return 1
   docker compose --profile preprocess run --rm --no-deps \
+    -v "$REPO_ROOT/pgrouting:/app" \
     -e PGDATABASE="$PG_DB" -e SPT_PROFILE="$SPT_PROFILE" \
     --entrypoint python3 pgrouting /app/pipeline_status.py \
     --stage "$n" --check-current >/dev/null 2>&1
