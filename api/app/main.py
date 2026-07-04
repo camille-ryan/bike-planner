@@ -373,6 +373,99 @@ def trunk_blob(
     }
 
 
+@app.get("/trunk/chains/{a}/{b}")
+def trunk_chains(
+    a: int,
+    b: int,
+    profile: str = "views",
+    db: str = Query(
+        "paired_trunks.db",
+        description="Which trunk DB file under /data/spt/<profile>/.",
+    ),
+) -> dict:
+    """Return the (A, B) trunk as chained polylines — one LineString
+    per succ-chain rooted at a LEAF (vertex with no incoming succ
+    pointer). Each chain walks succ parents toward A-seed until it
+    joins another already-emitted chain or hits succ=-1.
+
+    Feature count ≈ number of leaves (tens to hundreds per trunk)
+    instead of the ~2 × n_vertices returned by /trunk/blob. Used by
+    the 'paired trunks along route' UI to visualize a full route
+    without loading millions of little segments.
+    """
+    import sqlite3
+    import numpy as np
+    if "/" in db or ".." in db:
+        raise HTTPException(400, "`db` must be a bare filename, no path")
+    db_path = SPT_DIR / profile / db
+    if not db_path.exists():
+        raise HTTPException(404, f"no trunk db at {db_path}")
+    TRUNK_DTYPE = np.dtype([
+        ("vid",  "<i8"),
+        ("succ", "<i8"),
+        ("lat",  "<f4"),
+        ("lon",  "<f4"),
+    ])
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT n_rows, blob FROM trunk_blobs "
+            "WHERE src_city = ? AND dst_city = ?",
+            (a, b),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(404, f"no trunk for ({a}, {b}) in {db}")
+    _n_rows, blob = row
+    arr = np.frombuffer(blob, dtype=TRUNK_DTYPE)
+    n = len(arr)
+    if n == 0:
+        return {"type": "FeatureCollection", "features": [],
+                "a": a, "b": b, "db": db, "n_chains": 0, "n_vertices": 0}
+    vid = arr["vid"]
+    succ = arr["succ"]
+    pos = np.searchsorted(vid, succ)
+    pos_clip = np.clip(pos, 0, n - 1)
+    in_range = pos < n
+    matched = in_range & (vid[pos_clip] == succ)
+    next_pos = np.where(matched & (succ != -1), pos, -1).astype(np.int64)
+    # LEAF: no other vertex points to it via succ.
+    has_child = np.zeros(n, dtype=bool)
+    valid_next = next_pos[next_pos >= 0]
+    if len(valid_next):
+        has_child[valid_next] = True
+    leaves = np.flatnonzero(~has_child)
+
+    features: list[dict] = []
+    visited = np.zeros(n, dtype=bool)
+    lat_arr = arr["lat"]
+    lon_arr = arr["lon"]
+    for leaf_i in leaves:
+        coords: list[list[float]] = []
+        cur = int(leaf_i)
+        while cur >= 0 and not visited[cur]:
+            visited[cur] = True
+            coords.append([float(lon_arr[cur]), float(lat_arr[cur])])
+            cur = int(next_pos[cur])
+        # Touch the merge vertex so chains join visually.
+        if cur >= 0 and len(coords) >= 1:
+            coords.append([float(lon_arr[cur]), float(lat_arr[cur])])
+        if len(coords) >= 2:
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": coords},
+                "properties": {"n_hops": len(coords) - 1},
+            })
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "a": a, "b": b, "db": db,
+        "n_vertices": int(n),
+        "n_chains": len(features),
+    }
+
+
 @app.get("/way-graph/spt-status")
 def way_graph_spt_status(profile: str = "views_polygon") -> dict:
     """Which polygon-bounded SPTs have been written so far. Lets the

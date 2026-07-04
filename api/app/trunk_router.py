@@ -346,6 +346,46 @@ def _load_anchor_spt(profile: str, city_idx: int) -> tuple[np.ndarray, np.ndarra
     return ng, par
 
 
+@lru_cache(maxsize=32)
+def _load_anchor_spt_coords(profile: str, city_idx: int
+                            ) -> tuple[np.ndarray, cKDTree] | None:
+    """Load coords_lonlat from an anchor's polygon SPT + build a
+    KDTree for nearest-vertex snap. Cached LRU(32).
+
+    Used to snap raw lat/lon endpoints to a vertex that's guaranteed
+    to be in this anchor's polygon SPT — postgres's `_snap_to_vertex`
+    can pick a road vertex that isn't in the SPT (different bike-
+    routable filter than the cell-file edge set), which breaks the
+    parent-walk stitch. Snapping here restores the guarantee.
+    """
+    path = SPT_DIR / profile / "spt" / f"{city_idx}.npz"
+    if not path.exists():
+        return None
+    with np.load(path) as d:
+        ng     = np.asarray(d["node_global"]).astype(np.int64)
+        coords = np.asarray(d["coords_lonlat"]).astype(np.float64)
+    if len(ng) == 0:
+        return None
+    # Sort by ng ascending so callers can share the sorted order.
+    if len(ng) > 1 and ng[1] < ng[0]:
+        order = np.argsort(ng, kind="stable")
+        ng = ng[order]
+        coords = coords[order]
+    return ng, coords, cKDTree(coords)
+
+
+def _snap_coord_to_spt(profile: str, city_idx: int,
+                       lon: float, lat: float) -> int | None:
+    """Return the vid of the vertex in `city_idx`'s polygon SPT that's
+    closest (by lat/lon) to the given coord, or None if no NPZ."""
+    loaded = _load_anchor_spt_coords(profile, city_idx)
+    if loaded is None:
+        return None
+    ng, _coords, tree = loaded
+    _, idx = tree.query([lon, lat], k=1)
+    return int(ng[int(idx)])
+
+
 def _fetch_vertex_coords(
     conn: psycopg.Connection, vids: list[int],
 ) -> dict[int, tuple[float, float]]:
@@ -597,18 +637,22 @@ def route(
                 fm_coords = None
                 # Try chain[1]'s polygon SPT first — that's the "second
                 # pair" the router will actually walk into. Postgres
-                # snapped start_vid to the nearest bike-routable road
-                # vertex; chain[1]'s SPT is a polygon-bounded reachable
-                # set from chain[1]-seed, so start_vid may or may not
-                # be in there. Fall back to chain[0]'s SPT (which
-                # always covers its own snap area + the near side of
-                # chain[1]).
+                # may have snapped start_vid to a road vertex that isn't
+                # in chain[1]'s SPT (different bike-routable filter
+                # than the cell edge set); re-snap here to a vertex
+                # that's guaranteed present. If chain[1]'s NPZ doesn't
+                # cover the start coord, fall back to chain[0]'s SPT.
                 for stitch_city in (int(a1), int(chain[0])):
+                    fm_start_vid = _snap_coord_to_spt(
+                        profile, stitch_city, start[0], start[1],
+                    )
+                    if fm_start_vid is None:
+                        continue
                     try:
                         with db_mod.connect() as conn:
                             fm_coords = _last_mile(
                                 profile, stitch_city,
-                                int(start_vid), T_vid, conn,
+                                fm_start_vid, T_vid, conn,
                             )
                     except Exception as exc:  # noqa: BLE001
                         print(f"[trunk_router] _first_mile stitch failed for "
@@ -628,12 +672,57 @@ def route(
                         float(arr_ab["lon"][pos_T]),
                     )
 
-    for i in range(1, len(chain) - 1):
+    # Skip-lookahead (task #46): before entering trunk i, check if the
+    # incoming chain_terminus_vid is already a vertex in some LATER
+    # trunk (i+k, i+k+1) for k in 1..SKIP_MAX. If so, skip legs
+    # i..i+k-1 entirely and walk from that later trunk. This handles
+    # chain-Dijkstra plans that route through short ferry-pier hops
+    # whose polygon trunks don't cover the corridor between chain-
+    # neighbors — the terminus falls in the DOWNSTREAM trunk's kept
+    # set as an interior vertex, so bridging through intermediate
+    # trunks (which snap-to-terminus, walk 1 vert, snap again) is
+    # dead weight.
+    SKIP_MAX = 4
+    i = 1
+    while i < len(chain) - 1:
         a, b = chain[i], chain[i + 1]
         trunk = prof.trunks.get((a, b))
         if trunk is None:
             raise RuntimeError(f"missing trunk for ({a}, {b})")
         arr, next_idx = trunk
+
+        # Only worth trying to skip when we DON'T have a clean entry
+        # into the current trunk. If the current entry is already in
+        # the trunk, no bridge would result — no need to look ahead.
+        entry_pos = int(np.searchsorted(arr["vid"], chain_terminus_vid))
+        entry_present = (entry_pos < len(arr)
+                         and int(arr["vid"][entry_pos]) == chain_terminus_vid)
+        if not entry_present:
+            best_k = 0
+            for k in range(1, SKIP_MAX + 1):
+                if i + k >= len(chain) - 1:
+                    break
+                a_ahead, b_ahead = chain[i + k], chain[i + k + 1]
+                trunk_ahead = prof.trunks.get((a_ahead, b_ahead))
+                if trunk_ahead is None:
+                    break
+                arr_ahead = trunk_ahead[0]
+                pos_a = int(np.searchsorted(arr_ahead["vid"], chain_terminus_vid))
+                if (pos_a < len(arr_ahead)
+                        and int(arr_ahead["vid"][pos_a]) == chain_terminus_vid):
+                    best_k = k
+                    break   # first (nearest) hit wins — don't overshoot chain plan
+            if best_k > 0:
+                for skipped in range(best_k):
+                    j = i + skipped
+                    bridges.append({
+                        "leg": j, "from_city": int(chain[j]),
+                        "to_city": int(chain[j + 1]),
+                        "distance_m": 0.0, "skipped": True,
+                    })
+                i += best_k
+                continue   # re-loop with the new i, entry_present will now be True
+
         walk = _walk(arr, next_idx, chain_terminus_vid,
                      bridge_target=chain_terminus_coord)
         if walk is None:
@@ -642,6 +731,29 @@ def route(
                 f"entry_vid={chain_terminus_vid}"
             )
         idxs, bridge_m = walk
+
+        # Truncation fallback (pre-skip belt-and-suspenders): scan
+        # visited positions from END backwards; truncate at last
+        # vertex present in NEXT trunk so the following hop enters
+        # cleanly. If skip fired above, this only prunes tail.
+        if i + 2 < len(chain):
+            next_a, next_b = chain[i + 1], chain[i + 2]
+            next_trunk = prof.trunks.get((next_a, next_b))
+            if next_trunk is not None:
+                next_arr, _ = next_trunk
+                next_vids = next_arr["vid"]
+                visited_vids = arr["vid"][idxs]
+                pos = np.searchsorted(next_vids, visited_vids)
+                pos_c = np.clip(pos, 0, len(next_vids) - 1)
+                in_next = (
+                    (pos < len(next_vids))
+                    & (next_vids[pos_c] == visited_vids)
+                )
+                if in_next.any():
+                    last_in = int(np.flatnonzero(in_next).max())
+                    if last_in < len(idxs) - 1:
+                        idxs = idxs[: last_in + 1]
+
         if bridge_m > 0:
             bridges.append({
                 "leg": i, "from_city": int(a), "to_city": int(b),
@@ -653,6 +765,7 @@ def route(
         chain_terminus_coord = (
             float(arr["lat"][idxs[-1]]), float(arr["lon"][idxs[-1]]),
         )
+        i += 1
     t_walk = time.time() - t2
 
     # First-mile: user start → first walked coord (straight bridge).
@@ -675,16 +788,40 @@ def route(
     last_walked = coords[-1]
     lm_coords: list[list[float]] | None = None
     if chain_terminus_vid != end_vid:
-        try:
-            with db_mod.connect() as conn:
-                lm_coords = _last_mile(
-                    profile, int(end_city), int(chain_terminus_vid),
-                    int(end_vid), conn,
-                )
-        except Exception as exc:  # noqa: BLE001 — never let last-mile kill the route
-            print(f"[trunk_router] _last_mile failed for city {end_city}: {exc}",
-                  flush=True)
-            lm_coords = None
+        # Mirror the first-mile fallback pattern: chain[-1]'s polygon
+        # SPT is the natural home for last-mile stitch, but postgres
+        # can snap end to a road vertex that's inside the polygon
+        # geometrically but not reached by chain[-1]-seed's Dijkstra
+        # (small disconnected road pockets, or vertices beyond where
+        # the SPT expanded). Fall back to chain[-2] whose polygon
+        # covers its own side + reaches into chain[-1]'s area.
+        stitch_cities = [int(end_city)]
+        if len(chain) >= 2:
+            stitch_cities.append(int(chain[-2]))
+        for stitch_city in stitch_cities:
+            # Re-snap end coord to nearest vertex IN this stitch city's
+            # polygon SPT — postgres's `_snap_to_vertex` uses a
+            # different bike-routable filter than the polygon-SPT cell
+            # edge set, so `end_vid` can be off by one road vertex
+            # (a few meters geographically but a hard "not in SPT" for
+            # the parent walk).
+            lm_end_vid = _snap_coord_to_spt(
+                profile, stitch_city, end[0], end[1],
+            )
+            if lm_end_vid is None:
+                continue
+            try:
+                with db_mod.connect() as conn:
+                    lm_coords = _last_mile(
+                        profile, stitch_city, int(chain_terminus_vid),
+                        lm_end_vid, conn,
+                    )
+            except Exception as exc:  # noqa: BLE001 — never let last-mile kill the route
+                print(f"[trunk_router] _last_mile failed for city "
+                      f"{stitch_city}: {exc}", flush=True)
+                lm_coords = None
+            if lm_coords:
+                break
     if lm_coords:
         # Drop the first coord if it duplicates last_walked (LCA at
         # chain_terminus_vid) — _last_mile emits from entry to end
