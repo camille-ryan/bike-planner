@@ -9,20 +9,28 @@ Approach
 For each anchor A:
 1. Find every candidate anchor within CROW_MAX_EDGE_M via KDTree.
 2. Compute the compass bearing A→candidate.
-3. Bin candidates into N sectors of 360°/N each.
-4. Keep the CLOSEST candidate per non-empty sector.
+3. Bin candidates into overlapping sectors: CROW_N_SECTORS starts of
+   `SECTOR_WIDTH_DEG` degrees each, with `SECTOR_STRIDE_DEG` degrees
+   between starts. Default 12 starts of 60° every 30° — every
+   candidate falls into 2 sectors, giving each anchor a "second
+   chance" to be picked when a slightly closer alternative dominates
+   the closer sector.
+4. Keep the CLOSEST candidate per non-empty sector. Dedupe across
+   sectors by taking each ref's minimum distance.
 
 Sector-based selection gives directionally-balanced neighbors:
-- A central anchor with ring-of-neighbors: up to N (default 8) edges,
-  one per direction.
+- A central anchor with ring-of-neighbors: up to N sectors' worth of
+  distinct neighbors, one per direction.
 - A coastal / edge anchor: fewer edges, only in directions where
   anchors actually exist. Won't waste chain-neighbors on sea.
 
-Compared to plain K-nearest, sector-based:
-- Avoids piling K edges into one dense direction (a city cluster).
-- Guarantees coverage of the opposite direction so chain-Dijkstra
-  can plan tours in any direction.
-- Naturally caps edge count per anchor at N.
+Overlap (60°/30° stride vs the previous 45° non-overlapping) helps
+edge cases:
+- A coastal town whose closest neighbor sits right at a 45° boundary
+  now gets picked in both adjacent overlapping sectors.
+- Slightly further neighbors in a nearby direction are no longer
+  masked by an unrelated near neighbor sitting exactly at the sector
+  boundary.
 
 Emits each undirected pair (A, B) with:
 - `cost_m` = haversine distance in meters
@@ -66,7 +74,10 @@ OUT_GRAPH_GEOJSON = DATA_DIR / "way_city_graph.geojson"
 OUT_NODES        = DATA_DIR / "way_city_anchors.geojson"  # rewritten with in_graph
 OUT_ORPHANS      = DATA_DIR / "way_city_anchors_orphans.geojson"
 
-N_SECTORS = int(os.environ.get("CROW_N_SECTORS", "8"))
+SECTOR_WIDTH_DEG  = float(os.environ.get("CROW_SECTOR_WIDTH_DEG", "60"))
+SECTOR_STRIDE_DEG = float(os.environ.get("CROW_SECTOR_STRIDE_DEG", "30"))
+# Derived: number of overlapping sector starts around the compass.
+N_SECTORS = int(round(360.0 / SECTOR_STRIDE_DEG))
 MAX_EDGE_M = float(os.environ.get("CROW_MAX_EDGE_KM", "100")) * 1000.0
 R_EARTH_M = 6_371_000.0
 
@@ -116,7 +127,9 @@ def _chord_for_arc(arc_m: float) -> float:
 
 def main() -> None:
     t0 = time.time()
-    print(f"[crow-flies] N_SECTORS = {N_SECTORS}, "
+    print(f"[crow-flies] sectors: {N_SECTORS} × {SECTOR_WIDTH_DEG:.0f}° wide "
+          f"(stride {SECTOR_STRIDE_DEG:.0f}° — "
+          f"{SECTOR_WIDTH_DEG - SECTOR_STRIDE_DEG:.0f}° overlap)  "
           f"max edge = {MAX_EDGE_M/1000.0:.0f} km",
           flush=True)
 
@@ -145,12 +158,21 @@ def main() -> None:
     xyz  = _lonlat_to_xyz(lons, lats)
     tree = cKDTree(xyz)
     chord_cap = _chord_for_arc(MAX_EDGE_M)
-    sector_width = 360.0 / N_SECTORS
 
     # For each anchor: find every candidate within MAX_EDGE_M, bin by
-    # bearing sector, keep the closest per non-empty sector.
+    # bearing sector (overlapping), keep the closest per non-empty
+    # sector, dedupe by ref.
     merged: dict[tuple[str, str], dict] = {}
     per_anchor_neighbors = np.zeros(len(anchors), dtype=np.int32)
+    sector_starts = [s * SECTOR_STRIDE_DEG for s in range(N_SECTORS)]
+
+    def _in_sector(bearing, start, width):
+        end = (start + width) % 360.0
+        if start < end:
+            return start <= bearing < end
+        # wraps 360°
+        return bearing >= start or bearing < end
+
     for i in range(len(anchors)):
         cand_idxs = tree.query_ball_point(xyz[i], r=chord_cap)
         cand_idxs = [j for j in cand_idxs if j != i]
@@ -158,28 +180,39 @@ def main() -> None:
             continue
         cand_lons = lons[cand_idxs]
         cand_lats = lats[cand_idxs]
-        # Bearings from A → each candidate.
         bearings = _bearing_deg(lons[i], lats[i], cand_lons, cand_lats)
-        # Exact haversine distance to each.
         dists = np.array([
             _haversine_m(lons[i], lats[i], cand_lons[k], cand_lats[k])
             for k in range(len(cand_idxs))
         ])
-        # Bin by sector, keep closest per sector.
-        best_per_sector: dict[int, tuple[int, float]] = {}
+        # Per overlapping sector, keep the closest candidate.
+        best_per_sector: dict[float, tuple[int, float]] = {}
         for k in range(len(cand_idxs)):
             if dists[k] > MAX_EDGE_M:
                 continue
-            sector = int(bearings[k] / sector_width)
-            cur = best_per_sector.get(sector)
-            if cur is None or dists[k] < cur[1]:
-                best_per_sector[sector] = (cand_idxs[k], float(dists[k]))
-        per_anchor_neighbors[i] = len(best_per_sector)
+            for start in sector_starts:
+                if _in_sector(bearings[k], start, SECTOR_WIDTH_DEG):
+                    cur = best_per_sector.get(start)
+                    if cur is None or dists[k] < cur[1]:
+                        best_per_sector[start] = (cand_idxs[k], float(dists[k]))
+        # Dedupe by candidate ref — same anchor may win multiple
+        # sectors; we count it once and take its (already unique)
+        # distance.
+        seen: set[int] = set()
+        for cand_idx, cand_dist in best_per_sector.values():
+            seen.add(cand_idx)
+        per_anchor_neighbors[i] = len(seen)
 
         ref_a  = anchors[i]["ref"]
         name_a = anchors[i]["name"]
         lon_a, lat_a = anchors[i]["lon"], anchors[i]["lat"]
+        # Emit each unique candidate once (many sectors may pick the
+        # same neighbor in the overlap band).
+        emitted: set[int] = set()
         for j, cost_m in best_per_sector.values():
+            if j in emitted:
+                continue
+            emitted.add(j)
             ref_b  = anchors[j]["ref"]
             name_b = anchors[j]["name"]
             lon_b, lat_b = anchors[j]["lon"], anchors[j]["lat"]
