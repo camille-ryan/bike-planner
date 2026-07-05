@@ -44,7 +44,7 @@ DATA="$REPO_ROOT/data"
 LOG_DIR="$DATA/spt/logs/pipeline_${PIPELINE_TS}"
 mkdir -p "$LOG_DIR"
 AGG_LOG="$LOG_DIR/pipeline.log"
-TOTAL=13
+TOTAL=16
 
 trap 'ntfy_send "bike-rebuild INTERRUPTED"' INT TERM
 
@@ -125,7 +125,7 @@ stage 2 classify_piers /app/chain/classify_piers.py     # task #49 — sea vs ri
 stage 3 anchors      /app/chain/select_anchors_bottom_up.py
 stage 4 chain_land   /app/chain/crow_flies_chain_graph.py
 stage 5 chain_ferry  /app/chain/augment_way_city_graph_with_ferries.py
-stage 6 anchor_polys /app/chain/compute_anchor_spt_polygons.py
+stage 6 anchor_polys_r1 /app/chain/compute_anchor_spt_polygons.py
 
 # Stage 7 needs the polygon-SPT NPZ dir clean before recompute.
 if ! is_current 7; then
@@ -136,47 +136,68 @@ if ! is_current 7; then
     find "$DATA/spt/${SPT_PROFILE}_polygon" -name '*.npz' -delete 2>/dev/null || true
   fi
 fi
-stage 7 spt_polygon /app/spt/compute_spts_polygon.py \
+stage 7 spt_polygon_r1 /app/spt/compute_spts_polygon.py \
   -e SPT_WORKERS=4 -e SPT_TILE_DEG=1.0 -e SPT_BUFFER_DEG=1.0
 
-stage 8 adapt_paired /app/paired/adapt_polygon_to_paired.py
-stage 9 build_paired /app/paired/build_polygon_paired_db_v2.py \
+# Task #53: filter chain graph by SPT reachability. Drops edges whose
+# target isn't reachable in the source's polygon SPT (cross-water,
+# cross-mountain, etc.), reweights survivors with actual SPT distance.
+# Then rerun anchor_polys + spt_polygon on the cleaned graph so
+# polygons shrink to real reach and adapt (stage 11) doesn't manufacture
+# spurious paired trunks from incidental SPT overlaps.
+stage 8 filter_chain /app/chain/filter_chain_reachability.py
+
+stage 9 anchor_polys_r2 /app/chain/compute_anchor_spt_polygons.py
+
+if ! is_current 10; then
+  log "wiping NPZs before stage 10 (round-2 SPT compute)"
+  if [[ "$DRY_RUN" = "1" ]]; then
+    echo "DRY_RUN: find $DATA/spt/${SPT_PROFILE}_polygon -name '*.npz' -delete"
+  else
+    find "$DATA/spt/${SPT_PROFILE}_polygon" -name '*.npz' -delete 2>/dev/null || true
+  fi
+fi
+stage 10 spt_polygon_r2 /app/spt/compute_spts_polygon.py \
+  -e SPT_WORKERS=4 -e SPT_TILE_DEG=1.0 -e SPT_BUFFER_DEG=1.0
+
+stage 11 adapt_paired /app/paired/adapt_polygon_to_paired.py
+stage 12 build_paired /app/paired/build_polygon_paired_db_v2.py \
   -e PAIRED_DB_NAME=paired_trunks_v2c.db
 
-# Stage 10 (pruner) loads ~6 GB of blobs into RAM; the API preload holds
+# Stage 13 (pruner) loads ~6 GB of blobs into RAM; the API preload holds
 # ~5.7 GB. Together they OOM the 11 GB WSL VM. Stop API before, restart
-# in stage 12 after the pruner has released its RAM.
-if ! is_current 10; then
+# in stage 15 after the pruner has released its RAM.
+if ! is_current 13; then
   log "stopping API before pruner"
   [[ "$DRY_RUN" = "1" ]] || docker compose stop api
 fi
-stage 10 prune /app/paired/prune_paired_trunks.py \
+stage 13 prune /app/paired/prune_paired_trunks.py \
   -e PAIRED_DB_NAME=paired_trunks_v2c.db \
   -e OUT_DB_NAME=paired_trunks_v2d.db
 
 # ---- Native stages (no docker container) -----------------------------
 
-log "STAGE 11/$TOTAL symlink: paired_trunks.db -> paired_trunks_v2d.db"
-if is_current 11; then
-  log "STAGE 11 symlink: SKIP (already pointing at v2d)"
+log "STAGE 14/$TOTAL symlink: paired_trunks.db -> paired_trunks_v2d.db"
+if is_current 14; then
+  log "STAGE 14 symlink: SKIP (already pointing at v2d)"
 else
   if [[ "$DRY_RUN" = "1" ]]; then
     echo "DRY_RUN: ln -sfn paired_trunks_v2d.db $DATA/spt/$SPT_PROFILE/paired_trunks.db"
   else
     ln -sfn paired_trunks_v2d.db "$DATA/spt/$SPT_PROFILE/paired_trunks.db"
-    log "STAGE 11 symlink: OK"
+    log "STAGE 14 symlink: OK"
   fi
 fi
 
-log "STAGE 12/$TOTAL api_restart"
+log "STAGE 15/$TOTAL api_restart"
 if [[ "$DRY_RUN" = "1" ]]; then
   echo "DRY_RUN: docker compose up -d --no-deps --force-recreate api"
 else
   docker compose up -d --no-deps --force-recreate api >/dev/null
-  log "STAGE 11 api_restart: OK (preload takes ~1-5 min)"
+  log "STAGE 15 api_restart: OK (preload takes ~1-5 min)"
 fi
 
-log "STAGE 13/$TOTAL verify: waiting for API preload…"
+log "STAGE 16/$TOTAL verify: waiting for API preload…"
 if [[ "$DRY_RUN" = "1" ]]; then
   echo "DRY_RUN: curl http://localhost:8001/trunk/route Graz->Cph"
 else
@@ -190,8 +211,8 @@ else
   # Test Graz→Cph route; fail if any non-skipped bridge is > 100 m.
   route_json="$(curl -fsS -G \
     -d from=15.4404,47.0707 -d to=12.5683,55.6761 -d profile="$SPT_PROFILE" \
-    http://localhost:8001/trunk/route 2>>"$LOG_DIR/stage-13-verify.log")"
-  echo "$route_json" >>"$LOG_DIR/stage-13-verify.log"
+    http://localhost:8001/trunk/route 2>>"$LOG_DIR/stage-16-verify.log")"
+  echo "$route_json" >>"$LOG_DIR/stage-16-verify.log"
   worst=$(python3 -c "
 import json, sys
 d = json.loads('''$route_json''')
@@ -199,7 +220,7 @@ bs = [b for b in d.get('route',{}).get('properties',{}).get('bridges',[])
       if not b.get('skipped')]
 worst = max((b.get('distance_m') or 0) for b in bs) if bs else 0
 print(f'{worst:.1f}')
-" 2>>"$LOG_DIR/stage-13-verify.log")
+" 2>>"$LOG_DIR/stage-16-verify.log")
   if [[ -z "$worst" ]]; then
     log "STAGE 12 verify: FAIL — could not parse route response"
     ntfy_send "bike-rebuild verify FAILED — could not parse route response"

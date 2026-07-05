@@ -186,21 +186,21 @@ def _api_symlink_stage() -> StageStatus:
     v2d = DATA / "spt" / SPT_PROFILE / "paired_trunks_v2d.db"
     v2c = DATA / "spt" / SPT_PROFILE / "paired_trunks_v2c.db"
     if not link.is_symlink():
-        return StageStatus(11, "symlink", ok=False,
+        return StageStatus(14, "symlink", ok=False,
                            detail=f"not a symlink: {link}",
                            output_path=str(link))
     target = os.readlink(link)
     if target != "paired_trunks_v2d.db":
-        return StageStatus(11, "symlink", ok=False,
+        return StageStatus(14, "symlink", ok=False,
                            detail=f"symlink points to {target}, expected paired_trunks_v2d.db",
                            output_path=str(link))
     m_v2d = _mtime(v2d)
     m_v2c = _mtime(v2c)
     if m_v2d and m_v2c and m_v2d < m_v2c:
-        return StageStatus(11, "symlink", ok=False, partial=True,
+        return StageStatus(14, "symlink", ok=False, partial=True,
                            detail="v2d.db older than v2c.db — pruner never ran on this v2c",
                            output_path=str(link))
-    return StageStatus(11, "symlink", ok=True,
+    return StageStatus(14, "symlink", ok=True,
                        detail=f"→ {target}",
                        output_path=str(link))
 
@@ -220,13 +220,13 @@ def _api_running_stage() -> StageStatus:
     except Exception as exc:                     # noqa: BLE001 — best-effort
         ok = False
         detail = f"docker ps failed: {exc}"
-    return StageStatus(12, "api_restart", ok=ok, detail=detail)
+    return StageStatus(15, "api_restart", ok=ok, detail=detail)
 
 
 def _verify_stage() -> StageStatus:
     """Stage 12: verify. No lasting artifact — always report as
     'not current' so the orchestrator re-runs it every time."""
-    return StageStatus(13, "verify", ok=False,
+    return StageStatus(16, "verify", ok=False,
                        detail="runtime check — always re-runs")
 
 
@@ -259,25 +259,38 @@ def _stages() -> list[Callable[[], StageStatus]]:
             DATA / "way_city_spt_polygons.geojson",
             upstream=[DATA / "way_city_graph.json"],
         ),
-        _spt_dir_stage,                                # 7
+        _spt_dir_stage,                                # 7 (round 1)
+        # Task #53 inserts filter_chain + round-2 polys/SPT here.
+        # These are always FORCE-run — no is_current check needed.
         lambda: _file_stage(                           # 8
-            8, "adapt_paired",
-            profile_dir / "city_graph.json",
+            8, "filter_chain",
+            DATA / "way_city_graph_dropped.json",
             upstream=[DATA / "spt" / f"{SPT_PROFILE}_polygon"],
         ),
         lambda: _file_stage(                           # 9
-            9, "build_paired",
+            9, "anchor_polys_r2",
+            DATA / "way_city_spt_polygons.geojson",
+            upstream=[DATA / "way_city_graph.json"],
+        ),
+        _spt_dir_stage,                                # 10 (round 2)
+        lambda: _file_stage(                           # 11
+            11, "adapt_paired",
+            profile_dir / "city_graph.json",
+            upstream=[DATA / "spt" / f"{SPT_PROFILE}_polygon"],
+        ),
+        lambda: _file_stage(                           # 12
+            12, "build_paired",
             profile_dir / "paired_trunks_v2c.db",
             upstream=[profile_dir / "city_graph.json"],
         ),
-        lambda: _file_stage(                           # 10
-            10, "prune",
+        lambda: _file_stage(                           # 13
+            13, "prune",
             profile_dir / "paired_trunks_v2d.db",
             upstream=[profile_dir / "paired_trunks_v2c.db"],
         ),
-        _api_symlink_stage,                            # 11
-        _api_running_stage,                            # 12
-        _verify_stage,                                 # 13
+        _api_symlink_stage,                            # 14
+        _api_running_stage,                            # 15
+        _verify_stage,                                 # 16
     ]
 
 
