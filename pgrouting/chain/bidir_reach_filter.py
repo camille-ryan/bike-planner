@@ -117,11 +117,16 @@ def _load_csr_for_bbox(bbox: tuple[float, float, float, float]):
     (csr, gid_to_local) where csr is a scipy sparse forward-cost matrix
     over the LOCAL vertex indexing.
     """
+    # Skip huge tiles early — bail BEFORE materializing the edge arrays.
+    # This prevents OOM during load itself. We peek at each cell's edge
+    # count and abort once the running total exceeds the tile cap.
+    max_edges = int(os.environ.get("BIDIR_MAX_TILE_EDGES", "70000000"))
     src_chunks: list[np.ndarray] = []
     dst_chunks: list[np.ndarray] = []
     fwd_chunks: list[np.ndarray] = []
     rev_chunks: list[np.ndarray] = []
     n_cells_hit = 0
+    running_edges = 0
     for cx, cy in _cells_in_bbox(bbox):
         path = CELL_DIR / f"{cx}_{cy}.npz"
         if not path.exists():
@@ -131,6 +136,10 @@ def _load_csr_for_bbox(bbox: tuple[float, float, float, float]):
             arr = z["edges"]
             if len(arr) == 0:
                 continue
+            running_edges += len(arr)
+            if running_edges > max_edges:
+                # Return special sentinel so caller can log + skip.
+                return "TILE_TOO_BIG", {}, n_cells_hit
             src_chunks.append(np.asarray(arr["src_id"]))
             dst_chunks.append(np.asarray(arr["dst_id"]))
             fwd_chunks.append(np.asarray(arr["cost"], dtype=np.float32))
@@ -304,6 +313,27 @@ def main() -> None:
                 "kept":    [],
                 "dropped": dropped[len_dropped_before:],
             }, ensure_ascii=False))
+            continue
+        # Early-exit sentinel from the loader when the tile would blow
+        # our memory budget. Defer the tile's edges and move on.
+        # (`isinstance` avoids scipy CSR's overloaded __eq__ which does
+        # elementwise comparison and blows up on string args.)
+        if isinstance(loaded[0], str) and loaded[0] == "TILE_TOO_BIG":
+            n_cells_seen = loaded[2] if isinstance(loaded, tuple) else 0
+            print(f"[bidir-filter]   tile {ti}/{len(tiles)} {tile}: "
+                  f"SKIPPED — would exceed MAX_TILE_EDGES "
+                  f"(saw {n_cells_seen} cells before bail) — "
+                  f"{len(anchors_here)} anchors deferred",
+                  flush=True)
+            for a_ref in anchors_here:
+                for e in edges_by_source[a_ref]:
+                    dropped.append({**e, "_reason": "tile too big at load"})
+            ckpt_path.write_text(json.dumps({
+                "tile":    [tile_lon, tile_lat],
+                "kept":    [],
+                "dropped": dropped[len_dropped_before:],
+            }, ensure_ascii=False))
+            gc.collect()
             continue
         csr, gid_to_local, n_cells_hit = loaded
         n_edges = csr.nnz // 2
