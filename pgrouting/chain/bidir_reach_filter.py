@@ -46,6 +46,7 @@ Env vars
 """
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -73,9 +74,18 @@ MAX_EDGE_M = MAX_EDGE_KM * 1000.0
 CORE_DEG = float(os.environ.get("BIDIR_TILE_CORE_DEG", "3.0"))
 BUFFER_DEG = float(os.environ.get("BIDIR_TILE_BUFFER_DEG", "2.0"))
 COST_CAP_MULT = float(os.environ.get("BIDIR_COST_CAP_MULT", "2.0"))
+# Skip tiles whose loaded subgraph exceeds this many edges. Big tiles
+# push CSR + Dijkstra memory past our 11 GB WSL VM budget. Skipped
+# tiles' edges are marked dropped-with-reason so a later rerun with
+# smaller cores can fill them in.
+MAX_TILE_EDGES = int(os.environ.get("BIDIR_MAX_TILE_EDGES", "70000000"))
 
 OUT_GRAPH = DATA_DIR / "way_city_graph.json"
 OUT_DROPPED = DATA_DIR / "way_city_graph_dropped.json"
+# Per-tile checkpoint dir. Each tile's results are saved to its own
+# file so an OOM mid-run doesn't lose completed work — just relaunch
+# and completed tiles are skipped.
+CKPT_DIR = DATA_DIR / "bidir_ckpt"
 R_EARTH_M = 6_371_000.0
 
 
@@ -110,6 +120,7 @@ def _load_csr_for_bbox(bbox: tuple[float, float, float, float]):
     src_chunks: list[np.ndarray] = []
     dst_chunks: list[np.ndarray] = []
     fwd_chunks: list[np.ndarray] = []
+    rev_chunks: list[np.ndarray] = []
     n_cells_hit = 0
     for cx, cy in _cells_in_bbox(bbox):
         path = CELL_DIR / f"{cx}_{cy}.npz"
@@ -123,27 +134,35 @@ def _load_csr_for_bbox(bbox: tuple[float, float, float, float]):
             src_chunks.append(np.asarray(arr["src_id"]))
             dst_chunks.append(np.asarray(arr["dst_id"]))
             fwd_chunks.append(np.asarray(arr["cost"], dtype=np.float32))
+            rev_chunks.append(np.asarray(arr["reverse_cost"], dtype=np.float32))
     if not src_chunks:
-        return None, {}
-    src_gid = np.concatenate(src_chunks)
-    dst_gid = np.concatenate(dst_chunks)
-    fwd = np.concatenate(fwd_chunks)
-    # Intern global vertex IDs to local 0..N-1.
+        return None, {}, 0
+    src_gid = np.concatenate(src_chunks); del src_chunks
+    dst_gid = np.concatenate(dst_chunks); del dst_chunks
+    fwd = np.concatenate(fwd_chunks);     del fwd_chunks
+    rev = np.concatenate(rev_chunks);     del rev_chunks
+    # Intern global vertex IDs to local 0..N-1 (int32 fits — n_verts
+    # per tile is < 2 billion).
     all_gids = np.concatenate([src_gid, dst_gid])
     unique_gids, inv = np.unique(all_gids, return_inverse=True)
+    del all_gids
     n_edges = len(src_gid)
-    src_local = inv[:n_edges]
-    dst_local = inv[n_edges:]
+    src_local = inv[:n_edges].astype(np.int32, copy=False)
+    dst_local = inv[n_edges:].astype(np.int32, copy=False)
+    del inv, src_gid, dst_gid
     n_verts = len(unique_gids)
-    # Undirected reachability: use forward cost, symmetric. Add
-    # both directions so Dijkstra can walk either way (real bike
-    # graphs are ~symmetric for reachability; asymmetric elevation
-    # cost is fine to blur here since we're only testing "is there
-    # a road path".)
-    row = np.concatenate([src_local, dst_local])
-    col = np.concatenate([dst_local, src_local])
-    data = np.concatenate([fwd, fwd])
+    # Build directed CSR with both fwd (src→dst) and rev (dst→src, with
+    # the reverse_cost from cell) entries. Cells encode "one-way, can't
+    # bike this direction" as negative reverse_cost; filter those out
+    # so dijkstra never sees negative weights.
+    fwd_ok = fwd >= 0
+    rev_ok = rev >= 0
+    row = np.concatenate([src_local[fwd_ok], dst_local[rev_ok]])
+    col = np.concatenate([dst_local[fwd_ok], src_local[rev_ok]])
+    data = np.concatenate([fwd[fwd_ok],       rev[rev_ok]])
+    del src_local, dst_local, fwd, rev, fwd_ok, rev_ok
     csr = csr_matrix((data, (row, col)), shape=(n_verts, n_verts))
+    del row, col, data
     gid_to_local = {int(g): i for i, g in enumerate(unique_gids)}
     return csr, gid_to_local, n_cells_hit
 
@@ -249,15 +268,29 @@ def main() -> None:
 
     print(f"[bidir-filter] {len(tiles)} non-empty source tiles", flush=True)
 
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
     kept: list[dict] = []
     dropped: list[dict] = []
     for ti, (tile, anchors_here) in enumerate(sorted(tiles.items()), 1):
         tile_lon, tile_lat = tile
+        ckpt_path = CKPT_DIR / f"tile_{tile_lon:+04d}_{tile_lat:+04d}.json"
+        if ckpt_path.exists():
+            data = json.loads(ckpt_path.read_text())
+            kept.extend(data.get("kept", []))
+            dropped.extend(data.get("dropped", []))
+            print(f"[bidir-filter]   tile {ti}/{len(tiles)} {tile}: "
+                  f"RESUMED from checkpoint "
+                  f"(kept {len(data.get('kept', []))}, "
+                  f"dropped {len(data.get('dropped', []))})",
+                  flush=True)
+            continue
         core = (tile_lon * CORE_DEG, tile_lat * CORE_DEG,
                 (tile_lon + 1) * CORE_DEG, (tile_lat + 1) * CORE_DEG)
         buf = (core[0] - BUFFER_DEG, core[1] - BUFFER_DEG,
                core[2] + BUFFER_DEG, core[3] + BUFFER_DEG)
         t_tile = time.time()
+        len_kept_before = len(kept)
+        len_dropped_before = len(dropped)
         loaded = _load_csr_for_bbox(buf)
         if loaded is None or loaded[0] is None:
             print(f"[bidir-filter]   tile {ti}/{len(tiles)} {tile}: "
@@ -266,10 +299,32 @@ def main() -> None:
             for a_ref in anchors_here:
                 for e in edges_by_source[a_ref]:
                     dropped.append({**e, "_reason": "empty tile subgraph"})
+            ckpt_path.write_text(json.dumps({
+                "tile":    [tile_lon, tile_lat],
+                "kept":    [],
+                "dropped": dropped[len_dropped_before:],
+            }, ensure_ascii=False))
             continue
         csr, gid_to_local, n_cells_hit = loaded
+        n_edges = csr.nnz // 2
+        if n_edges > MAX_TILE_EDGES:
+            print(f"[bidir-filter]   tile {ti}/{len(tiles)} {tile}: "
+                  f"SKIPPED — {n_edges:,} edges > {MAX_TILE_EDGES:,} "
+                  f"cap ({len(anchors_here)} anchors deferred)",
+                  flush=True)
+            for a_ref in anchors_here:
+                for e in edges_by_source[a_ref]:
+                    dropped.append({**e, "_reason": "tile too big"})
+            ckpt_path.write_text(json.dumps({
+                "tile":    [tile_lon, tile_lat],
+                "kept":    [],
+                "dropped": dropped[len_dropped_before:],
+            }, ensure_ascii=False))
+            del csr, gid_to_local
+            gc.collect()
+            continue
         print(f"[bidir-filter]   tile {ti}/{len(tiles)} {tile}: "
-              f"{csr.shape[0]:,} verts, {csr.nnz//2:,} edges, "
+              f"{csr.shape[0]:,} verts, {n_edges:,} edges, "
               f"{n_cells_hit} cells, {len(anchors_here)} sources, "
               f"loaded in {time.time()-t_tile:.1f}s", flush=True)
 
@@ -303,6 +358,10 @@ def main() -> None:
 
             dist = dijkstra(csr, indices=a_local, limit=cap,
                             return_predecessors=False)
+            # numpy allocates a fresh 20M-float array per call; help the
+            # allocator by dropping the previous ref before the next
+            # iteration.
+            gc.collect()
 
             for e, hav in zip(candidates, hav_by_edge):
                 b_city = ref_to_city.get(e["b"])
@@ -323,10 +382,19 @@ def main() -> None:
                     continue
                 kept.append({**e, "cost_m": best})
 
+        # Save checkpoint for this tile before freeing memory. If a
+        # future tile OOMs, relaunch and completed tiles resume.
+        ckpt_path.write_text(json.dumps({
+            "tile":    [tile_lon, tile_lat],
+            "kept":    kept[len_kept_before:],
+            "dropped": dropped[len_dropped_before:],
+        }, ensure_ascii=False))
         # Free before next tile.
         del csr, gid_to_local
+        gc.collect()
         print(f"[bidir-filter]     tile done in {time.time()-t_tile:.1f}s — "
-              f"kept {len(kept):,}, dropped {len(dropped):,} so far",
+              f"kept {len(kept):,}, dropped {len(dropped):,} so far  "
+              f"(checkpoint: {ckpt_path.name})",
               flush=True)
 
     print(f"[bidir-filter] DONE in {time.time()-t0:.1f}s — "
