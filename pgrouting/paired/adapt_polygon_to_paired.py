@@ -353,7 +353,7 @@ def _build_city_graph(anchors: list[dict]) -> None:
                 ng = ng[order]; cost = cost[order]
             to_ng_cache[ci_to] = (ng, cost)
             cache = to_ng_cache[ci_to]
-        if cache[0] == "missing":
+        if isinstance(cache[0], str) and cache[0] == "missing":
             return None
         ng, cost = cache
         seeds = np.asarray(from_anchor.get("snap_vids") or [], dtype=np.int64)
