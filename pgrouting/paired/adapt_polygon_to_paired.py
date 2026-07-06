@@ -300,119 +300,121 @@ def _find_ferry_owners(
 
 
 def _build_city_graph(anchors: list[dict]) -> None:
-    """For each (ci_from, ci_to) pair, look up ci_from's snap vertex in
-    ci_to's NPZ node_global array. If found, that's the cost of routing
-    ci_from → ci_to (directed; both directions emit their own edges).
+    """Translate the bidir-filtered chain graph into per-directed-edge
+    metadata for build_paired.
 
-    OUTER loop: ci_to (load ci_to.npz once).
-    INNER loop: ci_from (cheap searchsorted lookup).
+    For each undirected chain edge (a, b) in way_city_graph.json, emit
+    TWO directed metadata rows: (a→b) and (b→a). Weight is looked up
+    from the destination anchor's polygon SPT NPZ:
+      - a→b weight: look up a's snap vid in b's NPZ node_global; that
+        cost is the road distance b→a walking outward from b's seed.
+      - b→a weight: symmetric.
 
-    Then add ferry chain edges from postgres.
+    No polygon-overlap search — trunks are precisely the chain graph.
+    Router uses the same file (way_city_graph.json) at query time to
+    know which trunks exist, so trunks and chain graph stay 1:1.
+
+    Also emits ferry chain edges from the same file (they were already
+    added by augment_way_city_graph_with_ferries.py).
     """
-    print(f"[adapt] deriving city_graph via multi-seed SPT overlap ...",
-          flush=True)
+    print(f"[adapt] translating chain graph → city_graph…", flush=True)
     t0 = time.time()
 
-    # MULTI-SEED: each anchor has a SET of zero-cost vids (the entire 1km
-    # bbox of seed vertices). An (a → b) edge exists if ANY of a's seeds
-    # appears in b's NPZ; cost = min cost over the matched seeds.
-    valid_anchors = [a for a in anchors if a.get("snap_vids")]
-    ci_list = [a["city_idx"] for a in valid_anchors]
-    # Concatenate all seeds; remember which seed belongs to which ci.
-    seed_concat: list[int] = []
-    seed_owner_ci: list[int] = []
-    for a in valid_anchors:
-        for v in a["snap_vids"]:
-            seed_concat.append(int(v))
-            seed_owner_ci.append(int(a["city_idx"]))
-    seed_arr = np.array(seed_concat, dtype=np.int64)
-    owner_arr = np.array(seed_owner_ci, dtype=np.int32)
-    print(f"[adapt]   {len(valid_anchors):,} anchors / {len(seed_arr):,} "
-          f"total seed vids to probe in each NPZ", flush=True)
+    # Index anchors by ref for lookups.
+    ref_to_anchor = {a["ref"]: a for a in anchors}
+
+    # Load the bidir-filtered chain graph.
+    chain_path = Path("/data/way_city_graph.json")
+    chain_edges = json.loads(chain_path.read_text())
+    print(f"[adapt]   {len(chain_edges):,} undirected chain edges "
+          f"→ up to {2*len(chain_edges):,} directed", flush=True)
 
     from_city: list[int] = []
     to_city:   list[int] = []
     weight:    list[float] = []
 
-    last_log = t0
-    for n_done, ci_to in enumerate(ci_list, 1):
-        path = POLY_SPT_IN / f"{ci_to}.npz"
-        if not path.exists():
+    def _lookup_cost(from_anchor: dict, to_anchor: dict,
+                     to_ng_cache: dict) -> float | None:
+        """Look up from_anchor's snap_vids in to_anchor's SPT NPZ.
+        Return min cost, or None if none of from's seeds are reachable
+        in to's SPT."""
+        ci_to = to_anchor["city_idx"]
+        cache = to_ng_cache.get(ci_to)
+        if cache is None:
+            path = POLY_SPT_IN / f"{ci_to}.npz"
+            if not path.exists():
+                to_ng_cache[ci_to] = ("missing", None)
+                return None
+            with np.load(path) as z:
+                ng = np.asarray(z["node_global"], dtype=np.int64)
+                cost = np.asarray(z["cost"], dtype=np.float32)
+            if len(ng) > 1 and ng[1] < ng[0]:
+                order = np.argsort(ng, kind="stable")
+                ng = ng[order]; cost = cost[order]
+            to_ng_cache[ci_to] = (ng, cost)
+            cache = to_ng_cache[ci_to]
+        if cache[0] == "missing":
+            return None
+        ng, cost = cache
+        seeds = np.asarray(from_anchor.get("snap_vids") or [], dtype=np.int64)
+        if seeds.size == 0:
+            return None
+        idx = np.searchsorted(ng, seeds)
+        in_range = idx < len(ng)
+        matched = in_range & (ng[np.clip(idx, 0, len(ng) - 1)] == seeds)
+        if not matched.any():
+            return None
+        return float(cost[idx[matched]].min())
+
+    # LRU-ish NPZ cache — keep the last 64 anchors' SPT arrays loaded.
+    # 64 × ~1 M vertices × 12 bytes = ~750 MB, fits comfortably.
+    to_ng_cache: dict[int, tuple] = {}
+    from collections import OrderedDict as _OD
+    to_ng_cache = _OD()  # type: ignore
+    def _cache_bounded_lookup(from_anchor, to_anchor):
+        ci_to = to_anchor["city_idx"]
+        if ci_to in to_ng_cache:
+            to_ng_cache.move_to_end(ci_to)
+            return _lookup_cost(from_anchor, to_anchor, {ci_to: to_ng_cache[ci_to]})
+        w = _lookup_cost(from_anchor, to_anchor, to_ng_cache)
+        while len(to_ng_cache) > 64:
+            to_ng_cache.popitem(last=False)
+        return w
+
+    n_missing = 0
+    n_directed = 0
+    for i, e in enumerate(chain_edges, 1):
+        a = ref_to_anchor.get(e["a"])
+        b = ref_to_anchor.get(e["b"])
+        if a is None or b is None:
+            n_missing += 1
             continue
-        with np.load(path) as z:
-            to_ng = np.asarray(z["node_global"], dtype=np.int64)
-            to_cost = np.asarray(z["cost"], dtype=np.float32)
-        if len(to_ng) > 1 and to_ng[1] < to_ng[0]:
-            order = np.argsort(to_ng, kind="stable")
-            to_ng = to_ng[order]
-            to_cost = to_cost[order]
+        w_ab = _cache_bounded_lookup(a, b)
+        w_ba = _cache_bounded_lookup(b, a)
+        # Fall back to the chain graph's cost_m if the SPT lookup fails
+        # (e.g., NPZ missing). Not ideal but better than dropping an edge
+        # we know is real.
+        cost_fallback = float(e.get("cost_m") or 0.0)
+        if w_ab is None:
+            w_ab = cost_fallback
+        if w_ba is None:
+            w_ba = cost_fallback
+        from_city.append(a["city_idx"])
+        to_city.append(b["city_idx"])
+        weight.append(w_ab)
+        from_city.append(b["city_idx"])
+        to_city.append(a["city_idx"])
+        weight.append(w_ba)
+        n_directed += 2
+        if i % 500 == 0:
+            print(f"[adapt]   {i:,}/{len(chain_edges):,} chain edges → "
+                  f"{n_directed:,} directed  ({time.time()-t0:.0f}s)",
+                  flush=True)
 
-        # Vectorized: searchsorted all seeds against this NPZ.
-        idx = np.searchsorted(to_ng, seed_arr)
-        in_range = idx < len(to_ng)
-        matched_mask = np.zeros_like(in_range)
-        matched_mask[in_range] = to_ng[idx[in_range]] == seed_arr[in_range]
-        # For each owner_ci that has at least one matched seed in this
-        # NPZ, take min cost over its matched seeds.
-        matched_owners = owner_arr[matched_mask]
-        matched_costs = to_cost[idx[matched_mask]]
-        if len(matched_owners) == 0:
-            continue
-        # group-by min via sort
-        order = np.argsort(matched_owners, kind="stable")
-        mo_s = matched_owners[order]
-        mc_s = matched_costs[order]
-        # Find group boundaries
-        change = np.concatenate([[True], mo_s[1:] != mo_s[:-1]])
-        starts = np.flatnonzero(change)
-        ends = np.concatenate([starts[1:], [len(mo_s)]])
-        for s, e in zip(starts, ends):
-            owner = int(mo_s[s])
-            if owner == ci_to:
-                continue   # no self-loop
-            cost = float(mc_s[s:e].min())
-            from_city.append(owner)
-            to_city.append(ci_to)
-            weight.append(cost)
-
-        if time.time() - last_log >= 10:
-            pct = 100.0 * n_done / len(ci_list)
-            print(f"[adapt]   {n_done:,}/{len(ci_list):,} ({pct:.0f}%) "
-                  f"to-cities done, {len(from_city):,} edges so far, "
-                  f"{time.time()-t0:.0f}s", flush=True)
-            last_log = time.time()
-
-    print(f"[adapt]   {len(from_city):,} directed edges from SPT overlap in "
-          f"{time.time()-t0:.0f}s", flush=True)
-
-    # NOTE (2026-07-01): synthetic ferry chain edges (cost = 20 km +
-    # haversine between anchor centers) removed. Ferry connectivity is
-    # now handled by the polygon compute step, which emits a disjoint
-    # 5 km disc around each ferry-neighbor anchor. Since ferry `ways`
-    # are already bike-routable edges in the cell graph, the polygon
-    # SPT walks across the ferry naturally and chain edges emerge from
-    # real SPT overlap in the loop above.
-    print(f"[adapt]   total {len(from_city):,} directed edges "
-          f"(overlap-only; ferries handled via polygon SPT)",
+    print(f"[adapt]   translated in {time.time()-t0:.0f}s: "
+          f"{n_directed:,} directed edges "
+          f"({n_missing} chain edges skipped for missing refs)",
           flush=True)
-
-    # Sanity cap. Polygon-SPT overlap can produce trunks between
-    # anchors that are 100s or 1000s of km apart when many chain-
-    # neighbors of a dense chain graph (crow-flies) share incidental
-    # corridors. Those "long trunks" are guaranteed not to be picked
-    # by chain-Dijkstra (there's always a cheaper multi-hop) but they
-    # bloat stage 9 (build_paired) by 5×+. Drop trunks longer than the
-    # cap here — stage 9 stays honest to real routing choices.
-    MAX_TRUNK_M = float(os.environ.get("ADAPT_MAX_TRUNK_KM", "150")) * 1000.0
-    keep = [i for i, w in enumerate(weight) if w <= MAX_TRUNK_M]
-    n_before = len(from_city)
-    if len(keep) < n_before:
-        from_city = [from_city[i] for i in keep]
-        to_city   = [to_city[i] for i in keep]
-        weight    = [weight[i]   for i in keep]
-        print(f"[adapt]   dropped {n_before - len(from_city):,} trunks "
-              f"> {MAX_TRUNK_M/1000:.0f} km — {len(from_city):,} remain",
-              flush=True)
 
     cg = {"from_city": from_city, "to_city": to_city, "weight": weight}
     path = PAIRED_OUT / "city_graph.json"
