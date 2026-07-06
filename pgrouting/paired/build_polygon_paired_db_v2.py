@@ -70,14 +70,18 @@ def _synth_vid(city_idx: int) -> int:
 
 def _open_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    if db_path.exists():
+    # Preserve existing DB so add-only reruns work. `INSERT OR IGNORE`
+    # below skips any (src_city, dst_city) already stored, so we pack
+    # only trunks new to this run. Set BUILD_PAIRED_FRESH=1 to force a
+    # clean rebuild.
+    if db_path.exists() and os.environ.get("BUILD_PAIRED_FRESH", "0") == "1":
         db_path.unlink()
     db = sqlite3.connect(db_path)
     db.execute("PRAGMA journal_mode = WAL")
     db.execute("PRAGMA synchronous = NORMAL")
     db.execute(
         """
-        CREATE TABLE trunk_blobs (
+        CREATE TABLE IF NOT EXISTS trunk_blobs (
             src_city  INTEGER NOT NULL,
             dst_city  INTEGER NOT NULL,
             n_rows    INTEGER NOT NULL,
@@ -97,7 +101,7 @@ def _open_db(db_path: Path) -> sqlite3.Connection:
     # sorted ascending for searchsorted-friendly membership checks.
     db.execute(
         """
-        CREATE TABLE trunk_termini (
+        CREATE TABLE IF NOT EXISTS trunk_termini (
             src_city   INTEGER NOT NULL,
             dst_city   INTEGER NOT NULL,
             n_termini  INTEGER NOT NULL,
