@@ -316,16 +316,28 @@ def main() -> None:
     termini_batch: list[tuple[int, int, int, bytes]] = []
     BATCH_FLUSH = 5_000
 
+    # Fetch already-packed (src, dst) pairs so we can skip them entirely
+    # (avoids loading NPZs for edges that are already in the DB).
+    existing = {(r[0], r[1]) for r in
+                db.execute("SELECT src_city, dst_city FROM trunk_blobs")}
+    if existing:
+        print(f"[paired-db-v2] resuming — {len(existing):,} trunks already in "
+              f"DB; will skip those, pack only new ones", flush=True)
+
     for a_ci in sorted(edges_by_a):
+        # Skip loading A's SPT NPZ if all of A's edges are already packed.
+        pending = [b for b in edges_by_a[a_ci] if (a_ci, b) not in existing]
+        if not pending:
+            continue
         a = _load_a_spt(POLY_SPT_IN / f"{a_ci}.npz")
         if a is None:
-            n_missing_npz += len(edges_by_a[a_ci])
+            n_missing_npz += len(pending)
             continue
         a_info = by_idx.get(a_ci, {})
         a_lon = a_info.get("lon"); a_lat = a_info.get("lat")
         a_size = len(a["ng"])
 
-        for b_ci in edges_by_a[a_ci]:
+        for b_ci in pending:
             b_ng = _load_b_ng(str(POLY_SPT_IN / f"{b_ci}.npz"))
             b_info = by_idx.get(b_ci, {})
             b_lon = b_info.get("lon"); b_lat = b_info.get("lat")
