@@ -65,7 +65,14 @@ CELL_DEG = 1.0
 MAX_EDGE_KM = float(os.environ.get("CROW_MAX_EDGE_KM", "100"))
 MAX_EDGE_M = MAX_EDGE_KM * 1000.0
 BUFFER_FRAC = float(os.environ.get("BIDIR_BUFFER_FRAC", "0.20"))
-COST_CAP_MULT = float(os.environ.get("BIDIR_COST_CAP_MULT", "2.0"))
+COST_CAP_MULT = float(os.environ.get("BIDIR_COST_CAP_MULT", "8.0"))
+# 2026-07-06: bumped from 2.0 → 8.0. Cell `cost` is the WEIGHTED
+# views-profile score (length × grade penalty × surface penalty × …),
+# not raw meters. On rural roads with detours or elevation, the
+# weighted cost commonly hits 4–6× straight-line meters, so a 2×
+# haversine cap was over-rejecting real neighbors (e.g. Frohnleiten
+# lost 7/9 land connections). 8× gives real routes room while still
+# refusing a "sea/ferry detour" 5× longer than the direct road.
 MAX_BBOX_EDGES = int(os.environ.get("BIDIR_MAX_BBOX_EDGES", "50000000"))
 CELL_CACHE_SIZE = int(os.environ.get("BIDIR_CELL_CACHE_SIZE", "60"))
 
@@ -300,10 +307,18 @@ def _process_anchor(a_city, candidates, ref_to_city, cache, kept,
             loc = gid_to_local.get(int(b_snap))
             if loc is None:
                 continue
+            # Guard: if any of B's snap_vids maps to A's own local index
+            # (source vertex), `dist[a_local]` is 0. Accepting that as a
+            # valid path would kept-write cost_m=0 → chain-Dijkstra
+            # treats the edge as free and picks nonsense routes. Skip.
+            if loc == a_local:
+                continue
             d = float(dist[loc])
             if d < best:
                 best = d
-        if not math.isfinite(best) or best > COST_CAP_MULT * hav:
+        # cost_m=0 shouldn't happen here (would mean zero-length road)
+        # but guard defensively.
+        if not math.isfinite(best) or best > COST_CAP_MULT * hav or best <= 0:
             dropped.append({**e, "_reason": f"unreachable within {COST_CAP_MULT}×hav"})
             continue
         kept.append({**e, "cost_m": best})

@@ -143,24 +143,38 @@ def _build_polygon(anchor: dict,
     points.extend(_circle_points(anchor["lon"], anchor["lat"],
                                  FLOOR_RADIUS_M, CIRCLE_VERTICES))
 
-    # 1-hop: full A→B geometry for every adjacent B + 5 km disc around B.
+    # 1-hop: full A→B geometry for every LAND-anchor B + 5 km disc
+    # around B. Ferry-pier neighbors are special-cased below: they
+    # contribute only their own snap vertex (a single point). The SPT
+    # then reaches the pier vertex on the road network, and chain-
+    # Dijkstra hops the ferry — the OTHER pier's polygon SPT picks up
+    # from there.  This keeps A's polygon the size of its road-neighbor
+    # hull instead of ballooning across water toward a ferry pier
+    # 30 km away.
     a_edges = chain_by_ref.get(a_ref, [])
     for b_ref, geom_ab in a_edges:
+        if b_ref.startswith("ferry:"):
+            # Just the pier's location — no disc, no geometry walk,
+            # no 0.5-hop.
+            if geom_ab:
+                points.append((float(geom_ab[-1][0]), float(geom_ab[-1][1])))
+            continue
+
         points.extend((float(x), float(y)) for x, y in geom_ab)
 
-        # 2026-06-30: 5 km disc around B's center (= last polyline
-        # point). Makes B interior (not boundary corner), guarantees
-        # the SPT extends 5 km past every chain neighbor — picks up
-        # coastal coverage and stops shapely.contains_xy clipping
-        # neighbors out.
+        # 5 km disc around B's center (= last polyline point). Makes
+        # B interior (not boundary corner), guarantees the SPT extends
+        # 5 km past every LAND chain neighbor.
         if geom_ab:
             b_lon, b_lat = float(geom_ab[-1][0]), float(geom_ab[-1][1])
             points.extend(_circle_points(b_lon, b_lat,
                                          NEIGHBOR_DISC_M, CIRCLE_VERTICES))
 
-        # 0.5-hop further: from B, walk each onward B→C up to path-midpoint.
+        # 0.5-hop further: from B, walk each onward B→C up to path-
+        # midpoint. Skip ferry piers here too so the extension doesn't
+        # smuggle a pier into A's hull via a chain-neighbor's neighbors.
         for c_ref, geom_bc in chain_by_ref.get(b_ref, []):
-            if c_ref == a_ref:
+            if c_ref == a_ref or c_ref.startswith("ferry:"):
                 continue
             prefix = _walk_to_path_midpoint(geom_bc)
             points.extend((float(x), float(y)) for x, y in prefix)
