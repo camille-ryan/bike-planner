@@ -830,9 +830,26 @@ def route(
                         idxs = idxs[: last_in + 1]
 
         if bridge_m > 0:
+            a_ref = prof.cities[int(a)]["ref"]
+            b_ref = prof.cities[int(b)]["ref"]
+            # Classify: `ferry_leg` iff at least one endpoint is a pier
+            # (chain-Dijkstra picked a ferry hop; the straight-line is
+            # the ferry crossing itself). Otherwise a genuine routing
+            # `gap` — the paired trunk should have covered this but a
+            # vertex is missing.
+            kind = ("ferry_leg"
+                    if a_ref.startswith("ferry:") or b_ref.startswith("ferry:")
+                    else "gap")
+            from_coord = ([float(coords[-1][0]), float(coords[-1][1])]
+                          if coords else None)
+            to_coord = [float(arr["lon"][idxs[0]]),
+                        float(arr["lat"][idxs[0]])]
             bridges.append({
                 "leg": i, "from_city": int(a), "to_city": int(b),
                 "distance_m": round(bridge_m, 1),
+                "kind": kind,
+                "from_lonlat": from_coord,
+                "to_lonlat":   to_coord,
             })
         for k in idxs:
             coords.append([float(arr["lon"][k]), float(arr["lat"][k])])
@@ -852,7 +869,10 @@ def route(
         if first_mile_m > 0:
             bridges.insert(0, {"leg": "first_mile", "from_city": None,
                                "to_city": int(start_city),
-                               "distance_m": round(first_mile_m, 1)})
+                               "distance_m": round(first_mile_m, 1),
+                               "kind": "gap",
+                               "from_lonlat": [float(start[0]), float(start[1])],
+                               "to_lonlat":   [coords[1][0], coords[1][1]]})
 
     # Last-mile (task #36 option-a: parent-walk concat).
     # `_last_mile` stitches parent-chains inside end_city's polygon
@@ -923,7 +943,10 @@ def route(
         if last_mile_m > 0:
             bridges.append({"leg": "last_mile", "from_city": int(end_city),
                             "to_city": None,
-                            "distance_m": round(last_mile_m, 1)})
+                            "distance_m": round(last_mile_m, 1),
+                            "kind": "gap",
+                            "from_lonlat": [last_walked[0], last_walked[1]],
+                            "to_lonlat":   [float(end[0]), float(end[1])]})
     t_last_mile = time.time() - t3
 
     # Cheap gross-length stat for the response (over the full polyline,

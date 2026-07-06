@@ -91,18 +91,36 @@ map.on("load", () => {
   // are visually obvious. Detected client-side by scanning the
   // returned polyline (server-side `bridges` gives distances but not
   // coords).
-  map.addSource("route-bridges", {
+  // Two bridge layers so ferry legs (which are legitimate route
+  // segments — the ferry crossing itself) render differently from
+  // genuine routing gaps (chain-handoff failures the router couldn't
+  // fill).
+  map.addSource("route-bridges-ferry", {
     type: "geojson", data: emptyFC(), tolerance: 0,
   });
   map.addLayer({
-    id: "route-bridges-line",
+    id: "route-bridges-ferry-line",
     type: "line",
-    source: "route-bridges",
+    source: "route-bridges-ferry",
     paint: {
-      "line-color": "#22d3ee",
+      "line-color": "#22d3ee",   // cyan — ferries
       "line-width": 4,
       "line-opacity": 0.95,
       "line-dasharray": [1.5, 1.5],
+    },
+  });
+  map.addSource("route-bridges-gap", {
+    type: "geojson", data: emptyFC(), tolerance: 0,
+  });
+  map.addLayer({
+    id: "route-bridges-gap-line",
+    type: "line",
+    source: "route-bridges-gap",
+    paint: {
+      "line-color": "#ef4444",   // red — genuine routing gaps
+      "line-width": 4,
+      "line-opacity": 0.95,
+      "line-dasharray": [3, 2],
     },
   });
 });
@@ -514,26 +532,47 @@ function _hav(a, b) {
 }
 
 function extractBridges(features) {
-  // For every merged route feature, walk consecutive coord pairs and
-  // emit any segment > BRIDGE_MIN_M as its own LineString feature.
-  const out = [];
+  // Server tells us per-bridge kind + coords. Split into ferry_leg
+  // (legitimate ferry crossings — cyan) vs gap (routing failures the
+  // paired trunk should have covered — red). Fall back to a coord scan
+  // for older API responses that don't include from_lonlat/to_lonlat.
+  const ferry = [], gap = [];
   for (const f of features) {
-    const coords = f.geometry.coordinates || [];
-    for (let i = 1; i < coords.length; i++) {
-      const d = _hav(coords[i-1], coords[i]);
-      if (d > BRIDGE_MIN_M) {
-        out.push({
+    const bridges = f.properties?.bridges || [];
+    for (const b of bridges) {
+      if (b.skipped) continue;
+      const kind = b.kind || "gap";
+      const bin = kind === "ferry_leg" ? ferry : gap;
+      if (b.from_lonlat && b.to_lonlat) {
+        bin.push({
           type: "Feature",
           geometry: {
             type: "LineString",
-            coordinates: [coords[i-1], coords[i]],
+            coordinates: [b.from_lonlat, b.to_lonlat],
           },
-          properties: { distance_m: d, profile: f.properties?.profile },
+          properties: { distance_m: b.distance_m, kind, leg: b.leg,
+                        profile: f.properties?.profile },
         });
       }
     }
+    if (!bridges.length || bridges.every(b => !b.from_lonlat)) {
+      // fallback: consecutive-coord scan (no ferry/gap info)
+      const coords = f.geometry.coordinates || [];
+      for (let i = 1; i < coords.length; i++) {
+        const d = _hav(coords[i-1], coords[i]);
+        if (d > BRIDGE_MIN_M) {
+          gap.push({
+            type: "Feature",
+            geometry: { type: "LineString",
+                        coordinates: [coords[i-1], coords[i]] },
+            properties: { distance_m: d, kind: "gap",
+                          profile: f.properties?.profile },
+          });
+        }
+      }
+    }
   }
-  return out;
+  return { ferry, gap };
 }
 
 function renderRoutes(results) {
@@ -545,9 +584,12 @@ function renderRoutes(results) {
     type: "FeatureCollection",
     features,
   });
-  map.getSource("route-bridges").setData({
-    type: "FeatureCollection",
-    features: extractBridges(features),
+  const brs = extractBridges(features);
+  map.getSource("route-bridges-ferry").setData({
+    type: "FeatureCollection", features: brs.ferry,
+  });
+  map.getSource("route-bridges-gap").setData({
+    type: "FeatureCollection", features: brs.gap,
   });
 
   // Fit to the union bbox of every successful profile's geometry.
@@ -575,12 +617,15 @@ function renderRoutes(results) {
     const p = r.route.properties || {};
     const km = fmtKm(+p.gross_length_m || 0);
     const cities = (p.chain_names || []).join(" → ");
-    const nBridges = (p.bridges || []).length;
+    const brs = (p.bridges || []).filter(b => !b.skipped);
+    const nFerry = brs.filter(b => b.kind === "ferry_leg").length;
+    const nGap   = brs.filter(b => (b.kind || "gap") === "gap").length;
     return `<div class="route-card" style="border-left:4px solid ${color}">
       <div class="name" style="color:${color}">${r.profile}</div>
       <div class="stat"><span>distance</span><span>${km}</span></div>
       <div class="stat"><span>nodes</span><span>${(+p.vertex_count || 0).toLocaleString()}</span></div>
-      ${nBridges ? `<div class="stat"><span>bridges</span><span>${nBridges}</span></div>` : ""}
+      ${nFerry ? `<div class="stat"><span>ferry legs</span><span style="color:#22d3ee">${nFerry}</span></div>` : ""}
+      ${nGap   ? `<div class="stat"><span>gaps</span><span style="color:#ef4444">${nGap}</span></div>` : ""}
       ${cities ? `<div class="stat" style="grid-template-columns: 1fr;"><span><em>${cities}</em></span></div>` : ""}
     </div>`;
   }).join("");
