@@ -1,28 +1,60 @@
 #!/usr/bin/env bash
-# Rebuild the routing DB end-to-end (12 stages, ~7-10 h wall clock).
+# Rebuild the routing DB end-to-end (14 stages, ~7-10 h wall clock).
+#
+# PIPELINE STAGES
+#   1  build_paved         Materializes ways_paved from postgres.ways.
+#   2  classify_piers      Sea vs river pier classification.
+#   3  anchors             Bottom-up anchor selection (cities + villages
+#                          + sea piers).
+#   4  chain_land          Crow-flies chain graph via 60° sectors with
+#                          30° overlap.
+#   5  chain_ferry         Ferry pier chain edges appended.
+#   6  bidir_reach         Per-anchor pair-scope Dijkstra to filter
+#                          non-reachable chain edges and reweight with
+#                          real road distance. Pier↔pier ferry edges
+#                          are kept unconditionally.
+#   7  anchor_polys        Anchor SPT polygons (5 km disc + neighbor hulls).
+#   8  spt_polygon         Per-anchor bounded Dijkstra on cell npz files.
+#   9  adapt_paired        Translate chain graph → per-directed-edge
+#                          metadata using SPT costs.
+#   10 build_paired        Materialize per-edge trunk blobs into v2c.db.
+#                          INCREMENTAL — reuses existing v2c.db and
+#                          adds only new (src, dst) pairs. Set
+#                          BUILD_PAIRED_FRESH=1 to force a clean rebuild.
+#   11 prune               v2c.db → v2d.db (iterative entry-point prune).
+#   12 symlink             paired_trunks.db → paired_trunks_v2d.db.
+#   13 api_restart         Restart bike-api container (preloads new DB).
+#   14 verify              curl Graz→Copenhagen route; fail if any
+#                          non-skipped bridge > 100 m.
 #
 # ENV KNOBS
-#   PG_DB           postgres db  (default bike_v2_test)
-#   SPT_PROFILE     cost profile (default views)
-#   NTFY_TOPIC      ntfy topic   (default bike-rebuild)
-#   FORCE_STAGES    comma-list of stages to run even if their output
-#                   is [x] current per pipeline_status.py (e.g. "8,9")
+#   PG_DB           postgres db   (default bike_v2_test)
+#   SPT_PROFILE     cost profile  (default views)
+#   NTFY_TOPIC      ntfy topic    (default SMJVoZsEr7s6TKGb — user's)
+#   FORCE_STAGES    comma-list to run even if output looks current
+#                   e.g. "9,10" — usually not needed unless
+#                   is_current gets confused
+#   SKIP_STAGES     comma-list to unconditionally skip. Useful for a
+#                   partial rerun (e.g. SKIP_STAGES=1,2,3 to reuse
+#                   ingest state).
 #   DRY_RUN=1       print each stage's docker command without running
 #   RESUME=1        (default) skip stages whose output pipeline_status
 #                   reports as [x]. Set RESUME=0 to force a full run.
 #
 # USAGE
-#   ./run_full_rebuild.sh                       # resume from where it stopped
-#   FORCE_STAGES=8,9 ./run_full_rebuild.sh      # rerun paired-db + prune
-#   DRY_RUN=1 ./run_full_rebuild.sh             # inspect without running
+#   ./run_full_rebuild.sh                          # start-to-finish
+#   FORCE_STAGES=9,10 ./run_full_rebuild.sh        # rerun adapt + build
+#   BUILD_PAIRED_FRESH=1 ./run_full_rebuild.sh     # nuke v2c.db first
+#   DRY_RUN=1 ./run_full_rebuild.sh                # inspect without running
 #
 # LOGS
 #   data/spt/logs/pipeline_<ts>/pipeline.log       aggregate
 #   data/spt/logs/pipeline_<ts>/stage-<n>-<name>.log per-stage
 #
 # NOTES
-# - Stage 9 (pruner) needs the API stopped so ~7 GB RAM is free.
-#   Orchestrator stops it automatically; stage 11 restarts.
+# - Stage 11 (pruner) loads ~6 GB of blobs into RAM; API's ~5.7 GB
+#   preload would OOM together on the 11 GB WSL VM. Orchestrator stops
+#   API before stage 11 and stage 13 restarts it.
 # - Failures halt immediately: log FAIL, ntfy, exit 1. The failing
 #   container is NOT removed (docker run --rm is dropped for the failing
 #   stage, so `docker logs <name>` can be used for postmortem).
@@ -111,26 +143,20 @@ stage() {
   log "STAGE $n/$TOTAL $name: OK"
 }
 
-# ---- 12 stages -------------------------------------------------------
+# ---- 14 stages -------------------------------------------------------
 
 log "== rebuild START (ts=$PIPELINE_TS, profile=$SPT_PROFILE, db=$PG_DB) =="
 
-stage 1 build_paved  /app/chain/build_ways_paved.py
-stage 2 classify_piers /app/chain/classify_piers.py     # task #49 — sea vs river piers
-# task #51 — one-time export of seed+ferry+named-promotable subgraph to
-# per-cell npz files so stage 4 (chain graph) reads flat files instead
-# of hitting postgres. Rerun only when PBFs / ways change.
-# NOTE: this is inserted between existing stages; downstream renumbers
-# happen elsewhere.
-stage 3 anchors      /app/chain/select_anchors_bottom_up.py
-stage 4 chain_land   /app/chain/crow_flies_chain_graph.py
-stage 5 chain_ferry  /app/chain/augment_way_city_graph_with_ferries.py
-# Task #54: verify road-network reachability per candidate chain edge
-# using bounded scipy dijkstra on cell-tiled subgraphs. Bounds each
-# pair's Dijkstra by 2× the pair's crow-flies distance so no coastal
-# / island anchor gets a "chain-neighbor" 200 km away via ferry detour.
-# Scales to any geography — tiles the anchor set 3° cores + 2° buffer.
-stage 6 bidir_reach /app/chain/bidir_reach_filter.py
+stage 1 build_paved    /app/chain/build_ways_paved.py
+stage 2 classify_piers /app/chain/classify_piers.py
+stage 3 anchors        /app/chain/select_anchors_bottom_up.py
+stage 4 chain_land     /app/chain/crow_flies_chain_graph.py
+stage 5 chain_ferry    /app/chain/augment_way_city_graph_with_ferries.py
+# Pair-scope per-anchor bounded scipy Dijkstra. Verifies each candidate
+# chain edge is reachable via road within COST_CAP_MULT × haversine.
+# Pier↔pier ferry edges are preserved unconditionally (sea distances
+# exceed the cap by design).
+stage 6 bidir_reach    /app/chain/bidir_reach_filter.py
 
 stage 7 anchor_polys /app/chain/compute_anchor_spt_polygons.py
 
@@ -207,17 +233,17 @@ worst = max((b.get('distance_m') or 0) for b in bs) if bs else 0
 print(f'{worst:.1f}')
 " 2>>"$LOG_DIR/stage-14-verify.log")
   if [[ -z "$worst" ]]; then
-    log "STAGE 12 verify: FAIL — could not parse route response"
+    log "STAGE 14 verify: FAIL — could not parse route response"
     ntfy_send "bike-rebuild verify FAILED — could not parse route response"
     exit 1
   fi
   worst_int="${worst%.*}"
   if (( worst_int > 100 )); then
-    log "STAGE 12 verify: FAIL — worst non-skipped bridge = ${worst} m > 100 m limit"
+    log "STAGE 14 verify: FAIL — worst non-skipped bridge = ${worst} m > 100 m limit"
     ntfy_send "bike-rebuild verify FAILED — worst bridge ${worst} m"
     exit 1
   fi
-  log "STAGE 12 verify: OK (worst non-skipped bridge ${worst} m)"
+  log "STAGE 14 verify: OK (worst non-skipped bridge ${worst} m)"
 fi
 
 log "== rebuild COMPLETE (ts=$PIPELINE_TS) =="
