@@ -254,44 +254,44 @@ def _stages() -> list[Callable[[], StageStatus]]:
             DATA / "way_city_graph.geojson",  # updated by augment
             upstream=[DATA / "way_city_graph.json"],
         ),
-        lambda: _file_stage(                           # 6
-            6, "anchor_polys",
-            DATA / "way_city_spt_polygons.geojson",
-            upstream=[DATA / "way_city_graph.json"],
-        ),
-        # Task #54: bidir_reach filter replaces round-1 SPT + filter +
-        # round-2 rebuild pattern. Directly checks per-pair road
-        # reachability via tiled scipy dijkstra on cell subgraph.
-        # Then single polygon compute + single SPT compute.
+        # Pair-scope Dijkstra reachability filter (task #54). Emits a
+        # dropped-edges audit file — its presence proves bidir ran.
         lambda: _file_stage(                           # 6
             6, "bidir_reach",
             DATA / "way_city_graph_dropped.json",
             upstream=[DATA / "way_city_graph.json"],
         ),
+        # Chain-triangle deduplication. Presence of the .pre_dedup.json
+        # backup file (written on first dedup run) proves the step ran.
         lambda: _file_stage(                           # 7
-            7, "anchor_polys",
+            7, "dedup_chain",
+            DATA / "way_city_graph.pre_dedup.json",
+            upstream=[DATA / "way_city_graph_dropped.json"],
+        ),
+        lambda: _file_stage(                           # 8
+            8, "anchor_polys",
             DATA / "way_city_spt_polygons.geojson",
             upstream=[DATA / "way_city_graph.json"],
         ),
-        _spt_dir_stage,                                # 8
-        lambda: _file_stage(                           # 9
-            9, "adapt_paired",
+        _spt_dir_stage,                                # 9
+        lambda: _file_stage(                           # 10
+            10, "adapt_paired",
             profile_dir / "city_graph.json",
             upstream=[DATA / "spt" / f"{SPT_PROFILE}_polygon"],
         ),
-        lambda: _file_stage(                           # 10
-            10, "build_paired",
+        lambda: _file_stage(                           # 11
+            11, "build_paired",
             profile_dir / "paired_trunks_v2c.db",
             upstream=[profile_dir / "city_graph.json"],
         ),
-        lambda: _file_stage(                           # 11
-            11, "prune",
+        lambda: _file_stage(                           # 12
+            12, "prune",
             profile_dir / "paired_trunks_v2d.db",
             upstream=[profile_dir / "paired_trunks_v2c.db"],
         ),
-        _api_symlink_stage,                            # 12
-        _api_running_stage,                            # 13
-        _verify_stage,                                 # 14
+        _api_symlink_stage,                            # 13
+        _api_running_stage,                            # 14
+        _verify_stage,                                 # 15
     ]
 
 

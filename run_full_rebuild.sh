@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild the routing DB end-to-end (14 stages, ~7-10 h wall clock).
+# Rebuild the routing DB end-to-end (15 stages, ~7-10 h wall clock).
 #
 # PIPELINE STAGES
 #   1  build_paved         Materializes ways_paved from postgres.ways.
@@ -13,18 +13,24 @@
 #                          non-reachable chain edges and reweight with
 #                          real road distance. Pier↔pier ferry edges
 #                          are kept unconditionally.
-#   7  anchor_polys        Anchor SPT polygons (5 km disc + neighbor hulls).
-#   8  spt_polygon         Per-anchor bounded Dijkstra on cell npz files.
-#   9  adapt_paired        Translate chain graph → per-directed-edge
+#   7  dedup_chain         Drop redundant chain triangles — (A, C) where
+#                          A→B→C ≤ DEDUP_TOL × direct(A, C). Chain-
+#                          Dijkstra always finds the two-hop, so the
+#                          shortcut adds no routing value but inflates
+#                          polygons for both endpoints. Empirically
+#                          removes ~30 % of edges, mostly long chords.
+#   8  anchor_polys        Anchor SPT polygons (5 km disc + neighbor hulls).
+#   9  spt_polygon         Per-anchor bounded Dijkstra on cell npz files.
+#   10 adapt_paired        Translate chain graph → per-directed-edge
 #                          metadata using SPT costs.
-#   10 build_paired        Materialize per-edge trunk blobs into v2c.db.
+#   11 build_paired        Materialize per-edge trunk blobs into v2c.db.
 #                          INCREMENTAL — reuses existing v2c.db and
 #                          adds only new (src, dst) pairs. Set
 #                          BUILD_PAIRED_FRESH=1 to force a clean rebuild.
-#   11 prune               v2c.db → v2d.db (iterative entry-point prune).
-#   12 symlink             paired_trunks.db → paired_trunks_v2d.db.
-#   13 api_restart         Restart bike-api container (preloads new DB).
-#   14 verify              curl Graz→Copenhagen route; fail if any
+#   12 prune               v2c.db → v2d.db (iterative entry-point prune).
+#   13 symlink             paired_trunks.db → paired_trunks_v2d.db.
+#   14 api_restart         Restart bike-api container (preloads new DB).
+#   15 verify              curl Graz→Copenhagen route; fail if any
 #                          non-skipped bridge > 100 m.
 #
 # ENV KNOBS
@@ -76,7 +82,7 @@ DATA="$REPO_ROOT/data"
 LOG_DIR="$DATA/spt/logs/pipeline_${PIPELINE_TS}"
 mkdir -p "$LOG_DIR"
 AGG_LOG="$LOG_DIR/pipeline.log"
-TOTAL=14
+TOTAL=15
 
 trap 'ntfy_send "bike-rebuild INTERRUPTED"' INT TERM
 
@@ -152,7 +158,7 @@ stage() {
   log "STAGE $n/$TOTAL $name: OK"
 }
 
-# ---- 14 stages -------------------------------------------------------
+# ---- 15 stages -------------------------------------------------------
 
 log "== rebuild START (ts=$PIPELINE_TS, profile=$SPT_PROFILE, db=$PG_DB) =="
 
@@ -166,58 +172,62 @@ stage 5 chain_ferry    /app/chain/augment_way_city_graph_with_ferries.py
 # Pier↔pier ferry edges are preserved unconditionally (sea distances
 # exceed the cap by design).
 stage 6 bidir_reach    /app/chain/bidir_reach_filter.py
+# Drop (A,C) edges where A→B→C ≤ DEDUP_TOL × direct(A,C) for some B.
+# Redundant with chain-Dijkstra's shortest-path pick; would only
+# inflate polygons.
+stage 7 dedup_chain    /app/chain/dedup_chain_triangles.py
 
-stage 7 anchor_polys /app/chain/compute_anchor_spt_polygons.py
+stage 8 anchor_polys /app/chain/compute_anchor_spt_polygons.py
 
-if ! is_current 8; then
-  log "wiping NPZs before stage 8 (SPT compute)"
+if ! is_current 9; then
+  log "wiping NPZs before stage 9 (SPT compute)"
   if [[ "$DRY_RUN" = "1" ]]; then
     echo "DRY_RUN: find $DATA/spt/${SPT_PROFILE}_polygon -name '*.npz' -delete"
   else
     find "$DATA/spt/${SPT_PROFILE}_polygon" -name '*.npz' -delete 2>/dev/null || true
   fi
 fi
-stage 8 spt_polygon /app/spt/compute_spts_polygon.py \
+stage 9 spt_polygon /app/spt/compute_spts_polygon.py \
   -e SPT_WORKERS=4 -e SPT_TILE_DEG=1.0 -e SPT_BUFFER_DEG=1.0
 
-stage 9 adapt_paired /app/paired/adapt_polygon_to_paired.py
-stage 10 build_paired /app/paired/build_polygon_paired_db_v2.py \
+stage 10 adapt_paired /app/paired/adapt_polygon_to_paired.py
+stage 11 build_paired /app/paired/build_polygon_paired_db_v2.py \
   -e PAIRED_DB_NAME=paired_trunks_v2c.db
 
-# Stage 11 (pruner) loads ~6 GB of blobs into RAM; the API preload holds
+# Stage 12 (pruner) loads ~6 GB of blobs into RAM; the API preload holds
 # ~5.7 GB. Together they OOM the 11 GB WSL VM. Stop API before, restart
-# in stage 13 after the pruner has released its RAM.
-if ! is_current 11; then
+# in stage 14 after the pruner has released its RAM.
+if ! is_current 12; then
   log "stopping API before pruner"
   [[ "$DRY_RUN" = "1" ]] || docker compose stop api
 fi
-stage 11 prune /app/paired/prune_paired_trunks.py \
+stage 12 prune /app/paired/prune_paired_trunks.py \
   -e PAIRED_DB_NAME=paired_trunks_v2c.db \
   -e OUT_DB_NAME=paired_trunks_v2d.db
 
 # ---- Native stages (no docker container) -----------------------------
 
-log "STAGE 12/$TOTAL symlink: paired_trunks.db -> paired_trunks_v2d.db"
-if is_current 12; then
-  log "STAGE 12 symlink: SKIP (already pointing at v2d)"
+log "STAGE 13/$TOTAL symlink: paired_trunks.db -> paired_trunks_v2d.db"
+if is_current 13; then
+  log "STAGE 13 symlink: SKIP (already pointing at v2d)"
 else
   if [[ "$DRY_RUN" = "1" ]]; then
     echo "DRY_RUN: ln -sfn paired_trunks_v2d.db $DATA/spt/$SPT_PROFILE/paired_trunks.db"
   else
     ln -sfn paired_trunks_v2d.db "$DATA/spt/$SPT_PROFILE/paired_trunks.db"
-    log "STAGE 12 symlink: OK"
+    log "STAGE 13 symlink: OK"
   fi
 fi
 
-log "STAGE 13/$TOTAL api_restart"
+log "STAGE 14/$TOTAL api_restart"
 if [[ "$DRY_RUN" = "1" ]]; then
   echo "DRY_RUN: docker compose up -d --no-deps --force-recreate api"
 else
   docker compose up -d --no-deps --force-recreate api >/dev/null
-  log "STAGE 13 api_restart: OK (preload takes ~1-5 min)"
+  log "STAGE 14 api_restart: OK (preload takes ~1-5 min)"
 fi
 
-log "STAGE 14/$TOTAL verify: waiting for API preload…"
+log "STAGE 15/$TOTAL verify: waiting for API preload…"
 if [[ "$DRY_RUN" = "1" ]]; then
   echo "DRY_RUN: curl http://localhost:8001/trunk/route Graz->Cph"
 else
@@ -242,17 +252,17 @@ worst = max((b.get('distance_m') or 0) for b in bs) if bs else 0
 print(f'{worst:.1f}')
 " 2>>"$LOG_DIR/stage-14-verify.log")
   if [[ -z "$worst" ]]; then
-    log "STAGE 14 verify: FAIL — could not parse route response"
+    log "STAGE 15 verify: FAIL — could not parse route response"
     ntfy_send "bike-rebuild verify FAILED — could not parse route response"
     exit 1
   fi
   worst_int="${worst%.*}"
   if (( worst_int > 100 )); then
-    log "STAGE 14 verify: FAIL — worst non-skipped bridge = ${worst} m > 100 m limit"
+    log "STAGE 15 verify: FAIL — worst non-skipped bridge = ${worst} m > 100 m limit"
     ntfy_send "bike-rebuild verify FAILED — worst bridge ${worst} m"
     exit 1
   fi
-  log "STAGE 14 verify: OK (worst non-skipped bridge ${worst} m)"
+  log "STAGE 15 verify: OK (worst non-skipped bridge ${worst} m)"
 fi
 
 log "== rebuild COMPLETE (ts=$PIPELINE_TS) =="
