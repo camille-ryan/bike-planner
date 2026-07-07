@@ -124,10 +124,19 @@ stage() {
     return 0
   fi
 
+  # Forward any BUILD_PAIRED_FRESH / BIDIR_* / ADAPT_* / other tool-
+  # specific env vars into the container. Bare `-e VAR` (no `=VAL`)
+  # forwards the current shell's value, so ./run_full_rebuild.sh
+  # BUILD_PAIRED_FRESH=1 … actually reaches build_paired.
   docker compose --profile preprocess run -d --rm --name "$cname" \
     -v "$REPO_ROOT/pgrouting:/app" \
     -e PGDATABASE="$PG_DB" -e SPT_PROFILE="$SPT_PROFILE" \
     -e PYTHONUNBUFFERED=1 \
+    -e BUILD_PAIRED_FRESH \
+    -e BIDIR_COST_CAP_MULT -e BIDIR_BUFFER_FRAC \
+    -e BIDIR_MAX_BBOX_EDGES -e BIDIR_CELL_CACHE_SIZE \
+    -e ADAPT_MAX_TRUNK_KM \
+    -e CROW_SECTOR_WIDTH_DEG -e CROW_SECTOR_STRIDE_DEG \
     "$@" \
     --entrypoint python3 \
     pgrouting "$script" >/dev/null
