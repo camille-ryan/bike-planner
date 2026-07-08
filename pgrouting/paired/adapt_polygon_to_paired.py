@@ -391,14 +391,24 @@ def _build_city_graph(anchors: list[dict]) -> None:
             continue
         w_ab = _cache_bounded_lookup(a, b)
         w_ba = _cache_bounded_lookup(b, a)
-        # Fall back to the chain graph's cost_m if the SPT lookup fails
-        # (e.g., NPZ missing). Not ideal but better than dropping an edge
-        # we know is real.
-        cost_fallback = float(e.get("cost_m") or 0.0)
+        # Use MIN of SPT-lookup cost and chain graph's cost_m. Rationale:
+        # bidir already computed a real-road weighted-Dijkstra cost that
+        # isn't bounded by a polygon boundary. adapt's SPT lookup is
+        # bounded by the DESTINATION anchor's polygon SPT — so if the
+        # shortest road path leaves the polygon and re-enters, the SPT
+        # only sees the detour cost (much larger than the true road
+        # cost). Taking the min lets us keep the more accurate of the
+        # two per direction. Falls back to chain graph cost if SPT
+        # lookup returned None (NPZ missing, out of polygon, etc.).
+        cost_chain = float(e.get("cost_m") or 0.0)
         if w_ab is None:
-            w_ab = cost_fallback
+            w_ab = cost_chain
+        elif cost_chain > 0:
+            w_ab = min(w_ab, cost_chain)
         if w_ba is None:
-            w_ba = cost_fallback
+            w_ba = cost_chain
+        elif cost_chain > 0:
+            w_ba = min(w_ba, cost_chain)
         from_city.append(a["city_idx"])
         to_city.append(b["city_idx"])
         weight.append(w_ab)
