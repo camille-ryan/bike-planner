@@ -697,7 +697,7 @@ def route(
         a1, b1 = chain[1], chain[2]
         trunk_ab = prof.trunks.get((a1, b1))
         if trunk_ab is not None:
-            arr_ab, _ = trunk_ab
+            arr_ab, next_idx_ab = trunk_ab
             R = 6_371_000.0
             lat_a = math.radians(start[1])
             lat_v = np.radians(arr_ab["lat"].astype(np.float64))
@@ -706,7 +706,20 @@ def route(
                    + math.cos(lat_a) * np.cos(lat_v)
                    * np.sin(lon_diff / 2) ** 2)
             hav_dist = 2 * R * np.arcsin(np.sqrt(hav))
-            pos_T = int(np.argmin(hav_dist))
+            # Restrict T_vid selection to B-frontier vertices — the trunk
+            # entries where succ = NULL_SENTINEL. These are the natural
+            # entry gates from the A∩B boundary toward B; picking argmin
+            # over ALL trunk vertices lets an F-only-ancestor in a
+            # wrong-direction backbone win, producing a V-shaped stitch
+            # (walker goes up toward a1's seed, then back down toward
+            # some SW-corner backbone). B-frontier limits the target to
+            # the shared boundary between a1 and b1.
+            b_front_mask = (next_idx_ab == NULL_SENTINEL)
+            if b_front_mask.any():
+                b_front_pos = np.flatnonzero(b_front_mask)
+                pos_T = int(b_front_pos[np.argmin(hav_dist[b_front_pos])])
+            else:
+                pos_T = int(np.argmin(hav_dist))
             T_vid = int(arr_ab["vid"][pos_T])
             if T_vid != start_vid:
                 fm_coords = None
@@ -832,13 +845,14 @@ def route(
         if bridge_m > 0:
             a_ref = prof.cities[int(a)]["ref"]
             b_ref = prof.cities[int(b)]["ref"]
-            # Classify: `ferry_leg` iff at least one endpoint is a pier
-            # (chain-Dijkstra picked a ferry hop; the straight-line is
-            # the ferry crossing itself). Otherwise a genuine routing
-            # `gap` — the paired trunk should have covered this but a
-            # vertex is missing.
+            # Classify: `ferry_leg` iff BOTH endpoints are ferry piers
+            # (chain-Dijkstra picked a pier-to-pier ferry hop; the
+            # straight-line is the ferry crossing itself). A pier↔land
+            # bridge is a `gap`, not a ferry — the pier should have
+            # road access to the land anchor, so a bridge means the
+            # paired trunk didn't cover it (routing failure).
             kind = ("ferry_leg"
-                    if a_ref.startswith("ferry:") or b_ref.startswith("ferry:")
+                    if a_ref.startswith("ferry:") and b_ref.startswith("ferry:")
                     else "gap")
             from_coord = ([float(coords[-1][0]), float(coords[-1][1])]
                           if coords else None)

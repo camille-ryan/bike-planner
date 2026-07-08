@@ -91,10 +91,11 @@ map.on("load", () => {
   // are visually obvious. Detected client-side by scanning the
   // returned polyline (server-side `bridges` gives distances but not
   // coords).
-  // Two bridge layers so ferry legs (which are legitimate route
-  // segments — the ferry crossing itself) render differently from
-  // genuine routing gaps (chain-handoff failures the router couldn't
-  // fill).
+  // Ferry legs are legitimate route segments (the ferry crossing
+  // itself) — render as a solid cyan line, treated visually as part of
+  // the route.  Routing gaps are chain-handoff failures the paired
+  // trunk should have covered — render red, dashed, thick, with red
+  // circles at the endpoints so they jump out on the map as bugs.
   map.addSource("route-bridges-ferry", {
     type: "geojson", data: emptyFC(), tolerance: 0,
   });
@@ -103,10 +104,9 @@ map.on("load", () => {
     type: "line",
     source: "route-bridges-ferry",
     paint: {
-      "line-color": "#22d3ee",   // cyan — ferries
+      "line-color": "#22d3ee",
       "line-width": 4,
       "line-opacity": 0.95,
-      "line-dasharray": [1.5, 1.5],
     },
   });
   map.addSource("route-bridges-gap", {
@@ -117,10 +117,26 @@ map.on("load", () => {
     type: "line",
     source: "route-bridges-gap",
     paint: {
-      "line-color": "#ef4444",   // red — genuine routing gaps
-      "line-width": 4,
-      "line-opacity": 0.95,
-      "line-dasharray": [3, 2],
+      "line-color": "#ef4444",
+      "line-width": 6,
+      "line-opacity": 1.0,
+      "line-dasharray": [2, 2],
+    },
+  });
+  // Endpoint markers on gaps so they're impossible to miss even
+  // when the dashed line runs over a busy basemap.
+  map.addSource("route-bridges-gap-pts", {
+    type: "geojson", data: emptyFC(), tolerance: 0,
+  });
+  map.addLayer({
+    id: "route-bridges-gap-pts-circle",
+    type: "circle",
+    source: "route-bridges-gap-pts",
+    paint: {
+      "circle-radius": 6,
+      "circle-color": "#ef4444",
+      "circle-stroke-color": "#fff",
+      "circle-stroke-width": 2,
     },
   });
 });
@@ -958,6 +974,11 @@ async function fetchSptStatus() {
     sptStatus.refByIdx = new Map(d.cities.map(c => [c.city_idx, c.ref]));
     // Inverse map ref -> city_idx, so anchor features can be tagged.
     sptStatus.idxByRef = new Map(d.cities.map(c => [c.ref, c.city_idx]));
+    // city_idx -> [lon, lat] — direct coord lookup that avoids the
+    // 82 MB cities.json fetch. The spt-status payload is compact
+    // (~200 KB for 2k anchors).
+    sptStatus.coordByIdx = new Map(
+      d.cities.map(c => [c.city_idx, [c.lon, c.lat]]));
     const badge = document.getElementById("spt-status-badge");
     if (badge) {
       const pct = d.total ? (100 * d.done / d.total).toFixed(1) : "0.0";
@@ -1462,49 +1483,22 @@ document.getElementById("show-way-graph-edges").addEventListener("change", async
   }
 });
 
-// --- Per-anchor SPT overlay for the planned route -----------------------
+// --- Per-anchor polygon overlay for the planned route -------------------
 //
-// For each chain anchor in the last route, fetch its polygon-bounded
-// SPT and render them all into one combined layer (red→green cost
-// ramp). Also outline each anchor's polygon in white so the boundary
-// between adjacent paired SPTs reads cleanly. Purpose: README
-// screenshots that explain the paired-SPT methodology.
-
-const ROUTE_SPTS_MAX_PER_ANCHOR = 8000;   // cap edges per anchor
-const ROUTE_SPTS_CONCURRENCY    = 6;      // simultaneous fetches
+// For each chain anchor in the last route, outline its polygon and drop
+// a clickable anchor point. Clicking a point highlights that anchor's
+// polygon so you can spot which anchor owns a given corridor. Purpose:
+// troubleshooting — inspect polygon extents along the route without the
+// visual clutter of every SPT edge.
 
 let routeSptsLayerReady = false;
 let routeSptsAllPolygons = null;          // cached way_city_spt_polygons.geojson
+let routeSptsPolyByIdx   = null;          // Map<city_idx, GeoJSON polygon>
 
 function ensureRouteSptsLayer() {
   if (routeSptsLayerReady) return;
-  map.addSource("route-spts", {
-    type: "geojson",
-    data: { type: "FeatureCollection", features: [] },
-  });
-  map.addLayer({
-    id: "route-spts-line",
-    type: "line",
-    source: "route-spts",
-    paint: {
-      "line-color": [
-        "interpolate", ["linear"], ["get", "cost"],
-        0,      "#22c55e",
-        10000,  "#84cc16",
-        30000,  "#facc15",
-        60000,  "#f97316",
-        100000, "#dc2626",
-      ],
-      "line-width": [
-        "interpolate", ["linear"], ["zoom"],
-        8,  0.7,
-        12, 1.4,
-        16, 2.2,
-      ],
-      "line-opacity": 0.85,
-    },
-  }, "routes-multi-line");
 
+  // Polygon outlines (all route anchors, thin white line).
   map.addSource("route-spt-polygons", {
     type: "geojson",
     data: { type: "FeatureCollection", features: [] },
@@ -1515,10 +1509,99 @@ function ensureRouteSptsLayer() {
     source: "route-spt-polygons",
     paint: {
       "line-color": "#ffffff",
-      "line-width": 1.4,
-      "line-opacity": 0.9,
+      "line-width": 1.2,
+      "line-opacity": 0.6,
     },
   });
+
+  // Highlighted polygon (fill + thick outline; set on anchor click).
+  map.addSource("route-spt-polygon-highlight", {
+    type: "geojson",
+    data: { type: "FeatureCollection", features: [] },
+  });
+  map.addLayer({
+    id: "route-spt-polygon-highlight-fill",
+    type: "fill",
+    source: "route-spt-polygon-highlight",
+    paint: {
+      "fill-color": "#facc15",
+      "fill-opacity": 0.18,
+    },
+  });
+  map.addLayer({
+    id: "route-spt-polygon-highlight-line",
+    type: "line",
+    source: "route-spt-polygon-highlight",
+    paint: {
+      "line-color": "#facc15",
+      "line-width": 3,
+      "line-opacity": 0.95,
+    },
+  });
+
+  // Anchor points along the route, clickable.
+  map.addSource("route-spt-anchors", {
+    type: "geojson",
+    data: { type: "FeatureCollection", features: [] },
+  });
+  map.addLayer({
+    id: "route-spt-anchors-circle",
+    type: "circle",
+    source: "route-spt-anchors",
+    paint: {
+      "circle-radius": [
+        "interpolate", ["linear"], ["zoom"], 6, 3, 10, 5, 14, 7,
+      ],
+      "circle-color": "#38bdf8",
+      "circle-stroke-color": "#0c4a6e",
+      "circle-stroke-width": 1.5,
+    },
+  });
+  map.addLayer({
+    id: "route-spt-anchors-label",
+    type: "symbol",
+    source: "route-spt-anchors",
+    layout: {
+      "text-field": ["get", "name"],
+      "text-size": 11,
+      "text-anchor": "left",
+      "text-offset": [0.6, 0],
+      "text-optional": true,
+    },
+    paint: {
+      "text-color": "#0f172a",
+      "text-halo-color": "#ffffff",
+      "text-halo-width": 1.5,
+    },
+  });
+
+  // Click an anchor → highlight that polygon.
+  map.on("click", "route-spt-anchors-circle", (e) => {
+    const f = e.features?.[0];
+    if (!f) return;
+    const ci = f.properties?.city_idx;
+    const poly = routeSptsPolyByIdx?.get(ci);
+    const badge = document.getElementById("route-spts-status");
+    if (poly) {
+      map.getSource("route-spt-polygon-highlight").setData({
+        type: "FeatureCollection", features: [poly],
+      });
+      if (badge) badge.textContent =
+        `highlighted: ${f.properties?.name || ci}`;
+    } else {
+      map.getSource("route-spt-polygon-highlight").setData(
+        { type: "FeatureCollection", features: [] });
+      if (badge) badge.textContent =
+        `no polygon for ${f.properties?.name || ci}`;
+    }
+  });
+  map.on("mouseenter", "route-spt-anchors-circle", () => {
+    map.getCanvas().style.cursor = "pointer";
+  });
+  map.on("mouseleave", "route-spt-anchors-circle", () => {
+    map.getCanvas().style.cursor = "";
+  });
+
   routeSptsLayerReady = true;
 }
 
@@ -1530,33 +1613,57 @@ async function fetchAllPolygonsOnce() {
   return routeSptsAllPolygons;
 }
 
+let routeSptsAnchorsGeoJSON = null;
+async function fetchAnchorsGeojsonOnce() {
+  if (routeSptsAnchorsGeoJSON) return routeSptsAnchorsGeoJSON;
+  const r = await fetch("/data/way_city_anchors.geojson?ts=" + Date.now());
+  if (!r.ok) throw new Error(`way_city_anchors: ${r.status}`);
+  routeSptsAnchorsGeoJSON = await r.json();
+  return routeSptsAnchorsGeoJSON;
+}
+
 async function loadRouteSpts() {
   ensureRouteSptsLayer();
   const route = state.routesByProfile["views"]
              || Object.values(state.routesByProfile)[0];
   const chainIdx = route?.properties?.chain_city_idx;
+  const chainNames = route?.properties?.chain_names || [];
   const badge = document.getElementById("route-spts-status");
   if (!chainIdx || chainIdx.length === 0) {
     badge.textContent = "(plan a route first)";
-    map.getSource("route-spts").setData({ type: "FeatureCollection", features: [] });
     map.getSource("route-spt-polygons").setData({ type: "FeatureCollection", features: [] });
+    map.getSource("route-spt-anchors").setData({ type: "FeatureCollection", features: [] });
+    map.getSource("route-spt-polygon-highlight").setData(
+      { type: "FeatureCollection", features: [] });
     return;
   }
-  badge.textContent = `loading 0 / ${chainIdx.length}…`;
+  badge.textContent = "loading polygons + anchors…";
 
-  // Outline polygons up front — these are cheap (one static GeoJSON).
+  // Build ref ↔ city_idx map from sptStatus so we can join the polygon
+  // geojson (keyed by ref) to chain city indices.
+  const refForIdx = new Map();
+  if (sptStatus.refByIdx) {
+    for (const ci of chainIdx) {
+      const ref = sptStatus.refByIdx.get(ci);
+      if (ref) refForIdx.set(ref, ci);
+    }
+  }
+
+  // Polygon outlines for every anchor in the chain.
+  routeSptsPolyByIdx = new Map();
   try {
     const allPolys = await fetchAllPolygonsOnce();
-    const wanted = new Set(chainIdx);
-    // Polygons are keyed by ref; need ref → city_idx via sptStatus.
-    const refForIdx = new Map();
-    if (sptStatus.refByIdx) {
-      for (const ci of chainIdx) {
-        const ref = sptStatus.refByIdx.get(ci);
-        if (ref) refForIdx.set(ref, ci);
-      }
+    const polyFeats = [];
+    for (const f of allPolys.features || []) {
+      const ci = refForIdx.get(f.properties?.ref);
+      if (ci === undefined) continue;
+      const feat = {
+        ...f,
+        properties: { ...(f.properties || {}), city_idx: ci },
+      };
+      polyFeats.push(feat);
+      routeSptsPolyByIdx.set(ci, feat);
     }
-    const polyFeats = (allPolys.features || []).filter(f => refForIdx.has(f.properties?.ref));
     map.getSource("route-spt-polygons").setData({
       type: "FeatureCollection", features: polyFeats,
     });
@@ -1564,54 +1671,55 @@ async function loadRouteSpts() {
     console.warn("route-spt polygon outline load failed:", e.message);
   }
 
-  // Fetch SPTs with bounded concurrency. Stream features into the
-  // source as each batch arrives so the user sees progress.
-  const all = [];
-  let done = 0;
-  const queue = [...chainIdx];
-  async function worker() {
-    while (queue.length) {
-      const ci = queue.shift();
-      try {
-        const url = `${API_BASE}/way-graph/spt/${ci}?profile=views_polygon&max_features=${ROUTE_SPTS_MAX_PER_ANCHOR}`;
-        const r = await fetch(url);
-        if (r.ok) {
-          const fc = await r.json();
-          for (const f of fc.features || []) {
-            f.properties = f.properties || {};
-            f.properties.anchor_idx = ci;
-            all.push(f);
-          }
-        }
-      } catch (e) {
-        // silently skip failures — overlay is best-effort
-      }
-      done++;
-      badge.textContent = `loading ${done} / ${chainIdx.length}…`;
-      if (done % 5 === 0 || done === chainIdx.length) {
-        map.getSource("route-spts").setData({
-          type: "FeatureCollection", features: all,
-        });
-      }
-    }
+  // Anchor points — coord lookup via sptStatus.coordByIdx (built from
+  // the compact spt-status endpoint, ~200 KB for 2k anchors). If the
+  // page just loaded and sptStatus isn't populated yet, re-fetch it.
+  if (!sptStatus.coordByIdx || sptStatus.coordByIdx.size === 0) {
+    await fetchSptStatus();
   }
-  await Promise.all(Array.from({ length: ROUTE_SPTS_CONCURRENCY }, worker));
-  map.getSource("route-spts").setData({
-    type: "FeatureCollection", features: all,
+  const anchorFeats = [];
+  for (let i = 0; i < chainIdx.length; i++) {
+    const ci = chainIdx[i];
+    const c = sptStatus.coordByIdx?.get(ci);
+    if (!c) continue;
+    anchorFeats.push({
+      type: "Feature",
+      geometry: { type: "Point", coordinates: c },
+      properties: {
+        city_idx: ci,
+        name: chainNames[i] || `city ${ci}`,
+        leg: i,
+      },
+    });
+  }
+  map.getSource("route-spt-anchors").setData({
+    type: "FeatureCollection", features: anchorFeats,
   });
-  badge.textContent = `${chainIdx.length} anchors · ${all.length.toLocaleString()} edges`;
+  map.getSource("route-spt-polygon-highlight").setData(
+    { type: "FeatureCollection", features: [] });
+
+  badge.textContent =
+    `${anchorFeats.length} anchors · ${routeSptsPolyByIdx.size} polygons · click an anchor to highlight`;
 }
 
 document.getElementById("show-route-spts").addEventListener("change", async (e) => {
   ensureRouteSptsLayer();
   if (e.target.checked) {
-    map.setLayoutProperty("route-spts-line", "visibility", "visible");
-    map.setLayoutProperty("route-spt-polygons-line", "visibility", "visible");
+    for (const id of ["route-spt-polygons-line", "route-spt-anchors-circle",
+                      "route-spt-anchors-label",
+                      "route-spt-polygon-highlight-fill",
+                      "route-spt-polygon-highlight-line"]) {
+      map.setLayoutProperty(id, "visibility", "visible");
+    }
     try { await loadRouteSpts(); }
     catch (err) { setError(`route SPTs: ${err.message}`); }
   } else {
-    map.setLayoutProperty("route-spts-line", "visibility", "none");
-    map.setLayoutProperty("route-spt-polygons-line", "visibility", "none");
+    for (const id of ["route-spt-polygons-line", "route-spt-anchors-circle",
+                      "route-spt-anchors-label",
+                      "route-spt-polygon-highlight-fill",
+                      "route-spt-polygon-highlight-line"]) {
+      map.setLayoutProperty(id, "visibility", "none");
+    }
   }
 });
 
@@ -1922,4 +2030,55 @@ map.on("load", () => {
   refreshWaypointMarkers();
   updateRouteButton();
   initScenicnessOverlays();
+});
+
+// --- Consolidated debug toggles ----------------------------------------
+//
+// Two coarse toggles that fan out to the legacy per-layer checkboxes
+// (kept hidden in index.html). Simpler mental model:
+//   * "Show city graph"  — chain edges + anchors, click anchor → its polygon.
+//   * "Show route data"  — polygons + walked paired trunks for the current route.
+
+async function _fireHiddenToggle(id, on) {
+  const cb = document.getElementById(id);
+  if (!cb) return;
+  if (cb.checked !== on) {
+    cb.checked = on;
+    cb.dispatchEvent(new Event("change"));
+  }
+}
+
+document.getElementById("show-city-graph").addEventListener("change", async (e) => {
+  const on = e.target.checked;
+  const badge = document.getElementById("city-graph-status");
+  badge.textContent = on ? "loading…" : "off";
+  await _fireHiddenToggle("show-way-graph-edges", on);
+  await _fireHiddenToggle("show-way-graph-nodes", on);
+  // Load polygons in the background so click-to-highlight works, but keep
+  // the "all polygons" line layer hidden — the user opts in to just the
+  // clicked anchor's polygon.
+  if (on) {
+    try {
+      await ensureWayGraphPolygons();
+      map.setLayoutProperty("way-graph-polygons-line", "visibility", "none");
+      map.setLayoutProperty("way-graph-polygon-highlight-line",
+                            "visibility", "visible");
+      badge.textContent = "on · click an anchor to see its polygon";
+    } catch (err) {
+      badge.textContent = `err: ${err.message}`;
+    }
+  } else if (wayGraphPolygonsLoaded) {
+    map.setLayoutProperty("way-graph-polygon-highlight-line", "visibility", "none");
+    const src = map.getSource("way-graph-polygon-highlight");
+    if (src) src.setData({ type: "FeatureCollection", features: [] });
+  }
+});
+
+document.getElementById("show-route-data").addEventListener("change", async (e) => {
+  const on = e.target.checked;
+  const badge = document.getElementById("route-data-status");
+  badge.textContent = on ? "loading…" : "off";
+  await _fireHiddenToggle("show-route-spts",   on);
+  await _fireHiddenToggle("show-route-trunks", on);
+  badge.textContent = on ? "on" : "off";
 });

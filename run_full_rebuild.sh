@@ -89,6 +89,26 @@ trap 'ntfy_send "bike-rebuild INTERRUPTED"' INT TERM
 log()       { echo "=== [$(date -Iseconds)] $*" | tee -a "$AGG_LOG"; }
 ntfy_send() { curl -fsS -m 5 -d "$*" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null || true; }
 
+# The web container bind-mounts $REPO_ROOT/web/public — NOT $REPO_ROOT/data —
+# so viz files (anchors, chain graph, SPT polygons) need to be copied
+# from the live pipeline output into the web tree. This helper syncs
+# them; called at pipeline end and any time a stage rewrites one of
+# these files.
+publish_web_data() {
+  local WEB="$REPO_ROOT/web/public/data"
+  local FILES=(
+    way_city_anchors.geojson
+    way_city_graph.geojson
+    way_city_graph.json
+    way_city_spt_polygons.geojson
+  )
+  for f in "${FILES[@]}"; do
+    if [[ -f "$DATA/$f" ]]; then
+      cp -u "$DATA/$f" "$WEB/$f" 2>/dev/null || true
+    fi
+  done
+}
+
 # is_current N — exit 0 iff stage N's output is current (skip).
 # Precedence: SKIP_STAGES (always skip) > FORCE_STAGES (always run) >
 # pipeline_status --check-current (inspects data).
@@ -161,6 +181,10 @@ stage() {
 # ---- 15 stages -------------------------------------------------------
 
 log "== rebuild START (ts=$PIPELINE_TS, profile=$SPT_PROFILE, db=$PG_DB) =="
+# Bring web/public/data up to date on entry so anything the previous
+# run produced is visible even if the current run doesn't touch that
+# stage (e.g. SKIP_STAGES=1..7).
+publish_web_data
 
 stage 1 build_paved    /app/chain/build_ways_paved.py
 stage 2 classify_piers /app/chain/classify_piers.py
@@ -265,5 +289,6 @@ print(f'{worst:.1f}')
   log "STAGE 15 verify: OK (worst non-skipped bridge ${worst} m)"
 fi
 
+publish_web_data
 log "== rebuild COMPLETE (ts=$PIPELINE_TS) =="
 ntfy_send "bike-rebuild complete (profile=$SPT_PROFILE)"

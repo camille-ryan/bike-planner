@@ -57,20 +57,28 @@
         <label class="checkbox"><input type="checkbox" id="show-rail-lines" />Passenger rail: lines (OSM track geometry, filtered to served by GTFS)</label>
         <label class="checkbox"><input type="checkbox" id="show-rail-stations" />Passenger rail: stations (GTFS-served only)</label>
         <label class="checkbox"><input type="checkbox" id="show-hillshade" />Terrain hillshade (AWS Open Data, terrarium-encoded)</label>
-        <label class="checkbox"><input type="checkbox" id="show-way-graph-edges" />Way-graph edges (Voronoi adjacency on trunk + primary)</label>
-        <label class="checkbox"><input type="checkbox" id="show-way-graph-nodes" />Way-graph anchors (cities + towns + villages on the road set)</label>
-        <label class="checkbox"><input type="checkbox" id="show-way-graph-polygons" />SPT polygons (1.5-hop hull ∪ 5 km disc) <span id="spt-status-badge" class="hint" style="margin-left:0.5em;"></span></label>
-        <label class="checkbox"><input type="checkbox" id="show-route-spts" />Per-anchor SPTs along route (paired-SPT visualization) <span id="route-spts-status" class="hint" style="margin-left:0.5em;"></span></label>
-        <label class="checkbox"><input type="checkbox" id="show-route-trunks" />Paired trunks along route (routing data itself) <span id="route-trunks-status" class="hint" style="margin-left:0.5em;"></span></label>
+        <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name.</p>
+      </section>
+
+      <section id="debug-section">
+        <h2>Debug overlays</h2>
         <label class="checkbox">
-          <input type="checkbox" id="trunk-viz-mode" />
-          Paired-trunk viz (click 2 anchors → render trunk (A→B))
+          <input type="checkbox" id="show-city-graph" />
+          Show city graph (chain edges + anchors; click anchor → its polygon)
+          <span id="city-graph-status" class="hint" style="margin-left:0.5em;"></span>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" id="show-route-data" />
+          Show route data (per-anchor polygons + walked paired trunks)
+          <span id="route-data-status" class="hint" style="margin-left:0.5em;"></span>
+        </label>
+        <label class="checkbox" style="margin-left:1.5em;">
+          Trunk DB:
           <select id="trunk-viz-db" style="margin-left:0.4em;">
             <option value="paired_trunks_v2d.db">v2d (deployed — pruned)</option>
             <option value="paired_trunks_v2c.db">v2c (unpruned)</option>
             <option value="paired_trunks_v1.db">v1</option>
           </select>
-          <span id="trunk-viz-status" class="hint" style="margin-left:0.5em;">off</span>
         </label>
         <label class="checkbox" style="margin-left:1.5em;">
           SPT detail:
@@ -83,8 +91,26 @@
             <option value="2000000">2M (all)</option>
           </select>
         </label>
-        <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name. Way-graph: experimental chain backbone built from highway topology — each line connects two anchors with no third anchor between them along the trunk/primary corridor; colour = corridor distance (green&lt;10 km → red&gt;100 km). Lines pass through every kink the actual road makes.</p>
+        <p class="hint">City graph: shows the chain backbone across every anchor (not just the route). Anchor click surfaces that anchor's polygon. Route data: for the current route only — outlines every route anchor's polygon and overlays the paired trunks the router walked, so you can see whether trunk vertices track the corridor.</p>
       </section>
+
+      <!-- Hidden legacy inputs kept so existing JS event listeners
+           (show-way-graph-edges, show-way-graph-nodes,
+           show-way-graph-polygons, show-route-spts, show-route-trunks,
+           trunk-viz-mode) find their targets. Wired programmatically by
+           the new consolidated toggles above. -->
+      <div style="display:none">
+        <input type="checkbox" id="show-way-graph-edges" />
+        <input type="checkbox" id="show-way-graph-nodes" />
+        <input type="checkbox" id="show-way-graph-polygons" />
+        <input type="checkbox" id="show-route-spts" />
+        <input type="checkbox" id="show-route-trunks" />
+        <input type="checkbox" id="trunk-viz-mode" />
+        <span id="spt-status-badge"></span>
+        <span id="route-spts-status"></span>
+        <span id="route-trunks-status"></span>
+        <span id="trunk-viz-status"></span>
+      </div>
 
       <section id="scenicness-section">
         <h2>Scenicness signals</h2>
@@ -112,6 +138,6 @@
   </div>
 
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-  <script src="app.js?v=20260702b"></script>
+  <script src="app.js?v=20260708a"></script>
 </body>
 </html>
