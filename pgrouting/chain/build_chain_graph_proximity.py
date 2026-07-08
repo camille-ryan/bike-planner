@@ -75,7 +75,7 @@ CELL_DEG = 1.0
 
 RADIUS_M         = float(os.environ.get("INTERMED_ANCHOR_RADIUS_M", "5000"))
 COST_CAP_MULT    = float(os.environ.get("INTERMED_COST_CAP_MULT", "8.0"))
-CELL_CACHE_SIZE  = int(os.environ.get("INTERMED_CELL_CACHE_SIZE", "60"))
+CELL_CACHE_SIZE  = int(os.environ.get("INTERMED_CELL_CACHE_SIZE", "24"))
 MAX_BBOX_EDGES   = int(os.environ.get("INTERMED_MAX_BBOX_EDGES", "50000000"))
 BUFFER_FRAC      = float(os.environ.get("INTERMED_BUFFER_FRAC", "0.20"))
 MAX_PATH_LEN     = int(os.environ.get("INTERMED_MAX_PATH_LEN", "20000"))
@@ -415,9 +415,13 @@ def _process_source_batch(source, targets, cache, anchor_records,
             for t in testable]
     cap = COST_CAP_MULT * max(havs) if havs else 0.0
 
-    dist, preds = dijkstra(csr, indices=src_verts,
-                           return_predecessors=True,
-                           min_only=True, limit=cap)
+    # scipy min_only=True + return_predecessors=True → 3-tuple:
+    # (dist_per_vertex, pred_per_vertex, source_per_vertex). We don't
+    # need `sources` for the path trace (walking preds back until <0
+    # reaches whichever source it was), so discard it.
+    dist, preds, _ = dijkstra(csr, indices=src_verts,
+                              return_predecessors=True,
+                              min_only=True, limit=cap)
     del csr
 
     for t, hav in zip(testable, havs):
@@ -461,13 +465,24 @@ def _process_source_batch(source, targets, cache, anchor_records,
                                "a_name": c_hit.get("name"),
                                "b_name": t.get("name")})
         else:
-            # geom = downsampled polyline. Every vertex would be a lot;
-            # keep every ~5 m step's worth of vertices at most.
-            if len(path_coords) > MAX_PATH_LEN:
-                # Truncate defensively.
-                path_coords = path_coords[:MAX_PATH_LEN]
+            # Cap geom length so accumulating `kept_all` doesn't blow
+            # memory. Strided downsample to at most GEOM_TARGET_VERTS
+            # points, always keeping the endpoints so the polyline
+            # still starts/ends on the source & destination anchors.
+            GEOM_TARGET_VERTS = 200
+            n = len(path_coords)
+            if n > GEOM_TARGET_VERTS:
+                stride = max(1, n // (GEOM_TARGET_VERTS - 1))
+                idx = list(range(0, n - 1, stride)) + [n - 1]
+                pc = path_coords[idx]
+            else:
+                pc = path_coords
+            # tolist() + explicit floats is smaller than a numpy array
+            # held in kept_all, but each entry adds a few hundred bytes
+            # of Python overhead.  ~200 verts × ~64 B/entry ≈ 12 KB / edge
+            # × ~7000 edges ≈ 85 MB total — manageable.
             geom = [[float(lon), float(lat)]
-                    for lon, lat in path_coords.tolist()]
+                    for lon, lat in pc.tolist()]
             kept.append({
                 "a": source["ref"], "b": t["ref"],
                 "a_name": source.get("name"), "b_name": t.get("name"),
@@ -625,15 +640,30 @@ def main() -> None:
                 dropped_all.extend(d)
                 rnd_expansions.extend(exp)
             n_done += 1
+            # Aggressive GC on every source-anchor batch — the CSR +
+            # dist + preds arrays for a wide bbox can be several
+            # hundred MB, and without an explicit collect Python's
+            # allocator can hold onto them long enough that the
+            # process peaks above the WSL VM limit.
+            gc.collect()
+
             if time.time() - last_log >= 30:
                 elapsed = time.time() - t_rnd
-                total_edges = sum(len(v) for v in by_source.values())
                 hits = cache.hits; misses = cache.misses
                 hit_rate = 100 * hits / max(hits + misses, 1)
+                try:
+                    with open("/proc/self/status") as fh:
+                        rss_kb = int(
+                            next(l for l in fh
+                                 if l.startswith("VmRSS:")).split()[1])
+                    rss_gb = rss_kb / 1_048_576
+                except Exception:
+                    rss_gb = -1.0
                 print(f"[intermed]   {n_done}/{n_srcs} src  "
                       f"kept {len(kept_all):,}  drop {len(dropped_all):,}  "
                       f"expansions {len(rnd_expansions):,}  "
                       f"cache hit {hit_rate:.0f}%  "
+                      f"rss={rss_gb:.2f}GB  "
                       f"{elapsed:.0f}s", flush=True)
                 last_log = time.time()
 
