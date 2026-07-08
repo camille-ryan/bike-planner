@@ -1,4 +1,11 @@
-"""Drop redundant chain-graph triangles.
+"""DEPRECATED — replaced by build_chain_graph_proximity.py (stage 6 as
+of 2026-07-08). This file is kept for audit / A-B comparison. It does
+not run in the current pipeline. The replacement folds triangle
+removal into a single multi-source-Dijkstra pass whose proximity-
+based intermediate-C test catches passes-through-anchor cases this
+script's cost-only test could miss.
+
+Drop redundant chain-graph triangles.
 
 An edge (A, C) is redundant when the chain graph also contains
 (A, B) and (B, C) for some B and cost(A,B) + cost(B,C) is within

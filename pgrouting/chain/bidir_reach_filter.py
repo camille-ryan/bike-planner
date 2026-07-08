@@ -1,4 +1,11 @@
-"""Filter candidate chain edges by road-network reachability + reweight.
+"""DEPRECATED — replaced by build_chain_graph_proximity.py (stage 6 as
+of 2026-07-08). This file is kept for audit / A-B comparison. It does
+not run in the current pipeline. The replacement combines this
+script's reachability filter with the old dedup_chain_triangles.py in
+a single multi-source-Dijkstra pass that also does proximity-based
+triangle removal.
+
+Filter candidate chain edges by road-network reachability + reweight.
 
 **Per-anchor pair-scope approach** (task #54, v3):
 
