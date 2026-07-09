@@ -37,7 +37,8 @@ import psycopg
 from scipy.spatial import cKDTree
 
 import config
-from deprecated.build_way_graph import (
+import os
+from chain.build_way_graph import (
     _load_db_anchors,
     _lonlat_to_xyz,
     _chord_for_arc,
