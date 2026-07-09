@@ -2,12 +2,20 @@
 
 Reads `data/ferry_piers.geojsonseq` (411 piers as of 2026-07) and the
 `ways WHERE is_ferry` subgraph from postgres. Groups piers by
-connected component of the ferry-only subgraph, sums each component's
-total ferry-way length, and classifies:
+connected component of the ferry-only subgraph, then classifies each
+component on TWO signals:
 
-  * component total length > THRESHOLD_KM (default 20 km) → **sea**
+  * The MAX single ferry-way length in the component. A real sea
+    crossing shows up as one long way (Rødby-Puttgarden is 19 km on
+    one way). A river cluster is many short (< 1 km) crossings even
+    if they sum to > 20 km — so total-length alone misclassifies.
+  * The component total length as a secondary heuristic (default not
+    used; only kicks in if MAX_SEA_WAY_KM is set to 0 to disable).
+
+Classification:
+  * max single-way length ≥ MAX_SEA_WAY_KM (default 5 km) → **sea**
     (piers become chain anchors, get their own polygon SPT).
-  * component total length ≤ THRESHOLD_KM → **river**
+  * otherwise → **river**
     (piers dropped from the anchor set; the ferry way stays in
     `ways` as an is_ferry route the bike Dijkstra can still take,
     just not a chain hop).
@@ -28,7 +36,11 @@ Runs quickly (~5 s) — the ferry subgraph is small (<10k edges).
 
 Env vars:
   * PGDATABASE
-  * FERRY_SEA_THRESHOLD_KM (default 20)
+  * MAX_SEA_WAY_KM (default 5.0) — a component with any single ferry
+    way at least this long is classified sea. Set to 0 to fall back
+    on the old component-total heuristic.
+  * FERRY_SEA_THRESHOLD_KM (default 20) — legacy component-total
+    threshold, still used when MAX_SEA_WAY_KM is 0.
 """
 from __future__ import annotations
 
@@ -51,6 +63,8 @@ OUT_SUMMARY     = DATA_DIR / "ferry_classification.json"
 
 THRESHOLD_KM = float(os.environ.get("FERRY_SEA_THRESHOLD_KM", "20"))
 THRESHOLD_M  = THRESHOLD_KM * 1000.0
+MAX_SEA_WAY_KM = float(os.environ.get("MAX_SEA_WAY_KM", "5.0"))
+MAX_SEA_WAY_M  = MAX_SEA_WAY_KM * 1000.0
 
 
 def _load_piers() -> list[dict]:
@@ -125,10 +139,13 @@ def _components(
 
     n_components = len(root_to_id)
     total_len_by_cid: list[float] = [0.0] * n_components
+    max_len_by_cid:   list[float] = [0.0] * n_components
     for s, _t, length_m in edges:
         cid = vid_to_cid[s]
         total_len_by_cid[cid] += float(length_m)
-    return vid_to_cid, total_len_by_cid
+        if float(length_m) > max_len_by_cid[cid]:
+            max_len_by_cid[cid] = float(length_m)
+    return vid_to_cid, total_len_by_cid, max_len_by_cid
 
 
 def _write_geojsonseq(path: Path, features: list[dict]) -> None:
@@ -150,10 +167,19 @@ def main() -> None:
         edges = _load_ferry_edges(conn)
     print(f"[classify_piers] loaded {len(edges):,} ferry edges", flush=True)
 
-    vid_to_cid, total_len_by_cid = _components(edges)
+    vid_to_cid, total_len_by_cid, max_len_by_cid = _components(edges)
     n_components = len(total_len_by_cid)
-    print(f"[classify_piers] {n_components} connected ferry components",
+    print(f"[classify_piers] {n_components} connected ferry components  "
+          f"(max_sea_way={MAX_SEA_WAY_KM} km)",
           flush=True)
+
+    def _is_sea(cid: int) -> bool:
+        # Primary rule: a single ferry way in the component ≥ 5 km.
+        # Falls back to legacy component-total heuristic when
+        # MAX_SEA_WAY_KM is 0.
+        if MAX_SEA_WAY_M > 0:
+            return max_len_by_cid[cid] >= MAX_SEA_WAY_M
+        return total_len_by_cid[cid] > THRESHOLD_M
 
     # Bucket piers by component.
     sea_piers: list[dict] = []
@@ -169,7 +195,7 @@ def main() -> None:
             unclassified.append(pier)
             continue
         component_piers[cid].append(pier["id"])
-        if total_len_by_cid[cid] > THRESHOLD_M:
+        if _is_sea(cid):
             sea_piers.append(pier)
         else:
             river_piers.append(pier)
@@ -188,8 +214,9 @@ def main() -> None:
         "components": [
             {
                 "id":          cid,
-                "kind":        "sea" if total_len_by_cid[cid] > THRESHOLD_M else "river",
+                "kind":        "sea" if _is_sea(cid) else "river",
                 "total_len_m": round(total_len_by_cid[cid], 1),
+                "max_len_m":   round(max_len_by_cid[cid], 1),
                 "n_piers":     len(component_piers[cid]),
                 "piers":       component_piers[cid],
             }

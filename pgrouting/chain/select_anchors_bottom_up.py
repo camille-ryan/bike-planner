@@ -149,6 +149,89 @@ def _load_all_places(conn: psycopg.Connection) -> list[dict]:
     return db_anchors + villages + ferry_piers
 
 
+PIER_DEDUP_M = float(os.environ.get("PIER_DEDUP_M", "500"))
+PIER_EATS_TOWN_M = float(os.environ.get("PIER_EATS_TOWN_M", "5000"))
+
+
+def _dedup_and_absorb(places: list[dict]) -> list[dict]:
+    """Two pier-focused passes before the main greedy dropout.
+
+    1. Dedup piers within PIER_DEDUP_M (default 500 m). OSM often has
+       multiple pier features per physical ferry landing (different
+       ferry routes docking at the same terminal); we keep the first
+       one seen per cluster.
+    2. Piers "eat" nearby town anchors: any town/village whose centroid
+       is within PIER_EATS_TOWN_M (default 5 km) of a surviving pier
+       gets dropped. If the town has a name/population, splice its
+       name onto the pier so the anchor retains a human-readable
+       identity (e.g. "Gedser" instead of "Ferry pier 34988792").
+
+    Rationale: user diagnostic on Graz→Copenhagen — the Rødby ferry
+    pier and Gedser town were both anchors 570 m apart. Chain-Dijkstra
+    picked hops through both, leading to a spurious near-zero-distance
+    chain edge + a 49 km paired-SPT handoff gap. Merging them into one
+    anchor eliminates the failing handoff.
+    """
+    if not places:
+        return places
+    is_pier = np.array([p["kind"] == "ferry_pier" for p in places])
+    xyz = _lonlat_to_xyz(
+        np.array([p["lon"] for p in places]),
+        np.array([p["lat"] for p in places]),
+    )
+    tree = cKDTree(xyz)
+
+    # Pass 1: pier dedup.
+    keep = np.ones(len(places), dtype=bool)
+    chord_dedup = _chord_for_arc(PIER_DEDUP_M)
+    for i in np.flatnonzero(is_pier):
+        if not keep[i]:
+            continue
+        nearby = tree.query_ball_point(xyz[i], r=chord_dedup)
+        for j in nearby:
+            if j != i and keep[j] and is_pier[j]:
+                keep[j] = False
+    n_dedup = int((~keep & is_pier).sum())
+
+    # Pass 2: piers eat nearby towns. Note we splice the town's name
+    # (and population, for future promotion logic) onto the pier so the
+    # anchor retains its human-readable identity.
+    chord_eat = _chord_for_arc(PIER_EATS_TOWN_M)
+    n_eaten = 0
+    for i in np.flatnonzero(is_pier & keep):
+        nearby = tree.query_ball_point(xyz[i], r=chord_eat)
+        best_j = -1
+        best_pop = -1
+        for j in nearby:
+            if j == i or not keep[j] or is_pier[j]:
+                continue
+            # eat the highest-pop town in range so identity attaches to
+            # the "real" town for the anchor
+            pop = places[j].get("pop", 0) or 0
+            if pop > best_pop:
+                best_pop = pop; best_j = j
+        # Then drop ALL non-pier neighbours in range (whether or not
+        # they were the "identity" one).
+        for j in nearby:
+            if j == i or not keep[j] or is_pier[j]:
+                continue
+            keep[j] = False
+            n_eaten += 1
+        if best_j >= 0:
+            t = places[best_j]
+            places[i]["name"] = t.get("name") or places[i].get("name")
+            # Preserve town's population so downstream can still favor
+            # this anchor by importance.
+            places[i]["pop"] = max(places[i].get("pop", 0) or 0,
+                                   int(t.get("population") or 0))
+            # Bookkeeping — makes it obvious in the anchors geojson.
+            places[i]["_absorbed_ref"] = t.get("ref")
+
+    print(f"[bottom-up]   pier dedup dropped {n_dedup}, "
+          f"piers ate {n_eaten} nearby town anchors", flush=True)
+    return [places[i] for i in range(len(places)) if keep[i]]
+
+
 def _greedy_dropout(places: list[dict], min_spacing_m: float) -> list[dict]:
     """Iterate places in ascending-pop order. Drop a place if any OTHER
     still-kept, NON-protected place lies within min_spacing_m. Returns
@@ -240,6 +323,13 @@ def main() -> None:
           f"({sum(1 for p in places if p['kind']=='db'):,} db + "
           f"{sum(1 for p in places if p['kind']=='village'):,} villages + "
           f"{sum(1 for p in places if p['kind']=='ferry_pier'):,} ferry piers)",
+          flush=True)
+
+    print(f"[bottom-up] pier dedup + eats-town pass "
+          f"(dedup {PIER_DEDUP_M:.0f} m, eat radius {PIER_EATS_TOWN_M:.0f} m)…",
+          flush=True)
+    places = _dedup_and_absorb(places)
+    print(f"[bottom-up]   {len(places):,} places remain after pier passes",
           flush=True)
 
     print("[bottom-up] running greedy dropout…", flush=True)

@@ -483,10 +483,19 @@ def _process_source_batch(source, targets, cache, anchor_records,
             # × ~7000 edges ≈ 85 MB total — manageable.
             geom = [[float(lon), float(lat)]
                     for lon, lat in pc.tolist()]
+            # Floor cost_m at the anchor-centroid haversine. The
+            # multi-source Dijkstra effectively measures road distance
+            # from A's 5 km disc EDGE to B's 5 km disc EDGE — for close
+            # anchors that under-counts by up to 2 × RADIUS_M. Chain-
+            # Dijkstra would then treat the leg as nearly free and
+            # pick nonsense routes. Take max of the two so cost is at
+            # least the true centroid-to-centroid straight-line
+            # distance.
+            cost_m = max(best_dist, hav)
             kept.append({
                 "a": source["ref"], "b": t["ref"],
                 "a_name": source.get("name"), "b_name": t.get("name"),
-                "cost_m": best_dist,
+                "cost_m": cost_m,
                 "geom": geom,
             })
 
