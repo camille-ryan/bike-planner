@@ -1,0 +1,252 @@
+<meta charset="utf-8">
+<title>pipeline progress</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0f172a;
+         color: #e2e8f0; margin: 0; padding: 2rem;
+         font-size: 14px; }
+  h1 { font-size: 1.1rem; margin: 0 0 1rem 0; color: #94a3b8; }
+  .row { display: flex; gap: 2rem; max-width: 1400px; }
+  .col { flex: 1; }
+  .stages { display: flex; flex-direction: column; gap: 0.35rem; }
+  .stage { display: grid;
+           grid-template-columns: 2.5rem 2rem 1fr 5rem 6rem;
+           align-items: center; gap: 0.6rem;
+           padding: 0.55rem 0.9rem;
+           background: #1e293b; border: 1px solid #334155;
+           border-radius: 6px; font-family: monospace; }
+  .stage .num { color: #64748b; font-size: 0.8rem; }
+  .stage .icon { font-size: 1rem; text-align: center; }
+  .stage .name { font-weight: 500; }
+  .stage .dur { color: #94a3b8; font-size: 0.8rem; text-align: right; }
+  .stage .status { color: #64748b; font-size: 0.75rem; text-align: right;
+                   text-transform: uppercase; letter-spacing: 0.05em; }
+  .stage.done   { border-color: #14532d; }
+  .stage.done   .icon  { color: #22c55e; }
+  .stage.done   .status{ color: #22c55e; }
+  .stage.running { border-color: #1e40af; background: #1e293b;
+                   animation: pulse 2s ease-in-out infinite; }
+  .stage.running .icon { color: #60a5fa; }
+  .stage.running .status { color: #60a5fa; }
+  .stage.failed { border-color: #7f1d1d; }
+  .stage.failed .icon  { color: #ef4444; }
+  .stage.failed .status{ color: #ef4444; }
+  .stage.skipped .icon  { color: #64748b; }
+  .stage.pending .icon  { color: #475569; }
+  .stage.pending .name  { color: #64748b; }
+  .stage.pending .status { color: #475569; }
+  @keyframes pulse { 50% { border-color: #60a5fa; } }
+
+  .details { background: #1e293b; border: 1px solid #334155;
+             border-radius: 6px; padding: 1rem; }
+  .details h2 { margin: 0 0 0.6rem 0; font-size: 0.85rem;
+                color: #94a3b8; text-transform: uppercase;
+                letter-spacing: 0.05em; }
+  .metric { display: grid;
+            grid-template-columns: 1fr auto;
+            padding: 0.4rem 0; border-bottom: 1px solid #334155;
+            font-size: 0.9rem; }
+  .metric:last-child { border-bottom: none; }
+  .metric .k { color: #94a3b8; }
+  .metric .v { font-family: monospace; color: #f1f5f9; font-variant-numeric: tabular-nums; }
+  .bar { grid-column: span 2; height: 6px; background: #334155;
+         border-radius: 3px; margin-top: 0.4rem; overflow: hidden; }
+  .fill { height: 100%; background: linear-gradient(90deg, #22d3ee, #4ade80);
+          transition: width 1s; }
+  .lastline { margin-top: 1rem; padding: 0.7rem; background: #0f172a;
+              border-radius: 4px; font-family: monospace; font-size: 0.75rem;
+              color: #cbd5e1; word-break: break-all; overflow-wrap: anywhere; }
+  .sysbox { margin-top: 1rem; background: #1e293b;
+            border: 1px solid #334155; border-radius: 6px;
+            padding: 1rem; }
+  .sysbox h2 { margin: 0 0 0.6rem 0; font-size: 0.85rem;
+               color: #94a3b8; text-transform: uppercase;
+               letter-spacing: 0.05em; }
+  .diag-tags { display: flex; gap: 0.3rem; flex-wrap: wrap;
+               margin-bottom: 0.7rem; }
+  .tag { padding: 0.15rem 0.6rem; border-radius: 999px;
+         font-size: 0.7rem; font-weight: 500;
+         font-family: system-ui; text-transform: uppercase;
+         letter-spacing: 0.04em; }
+  .tag.ok      { background: #064e3b; color: #6ee7b7; }
+  .tag.warn    { background: #78350f; color: #fdba74; }
+  .tag.danger  { background: #7f1d1d; color: #fca5a5; }
+  .tag.neutral { background: #334155; color: #cbd5e1; }
+  .barlabel { display: flex; justify-content: space-between;
+              font-size: 0.75rem; color: #94a3b8; margin-top: 0.5rem; }
+  .barlabel .k { }
+  .barlabel .v { font-family: monospace; color: #f1f5f9;
+                 font-variant-numeric: tabular-nums; }
+  .minibar { height: 5px; background: #334155; border-radius: 3px;
+             overflow: hidden; margin-top: 0.2rem; }
+  .minibar .fill-cpu   { height: 100%; background: #22d3ee;
+                         transition: width 1s; }
+  .minibar .fill-mem   { height: 100%; background: #4ade80;
+                         transition: width 1s; }
+  .minibar .fill-mem.warn   { background: #f59e0b; }
+  .minibar .fill-mem.danger { background: #ef4444; }
+  .header { max-width: 1400px; display: flex; justify-content: space-between;
+            align-items: center; margin-bottom: 1rem; }
+  .header .sub { color: #64748b; font-size: 0.85rem; }
+</style>
+<div class="header">
+  <h1>Pipeline progress</h1>
+  <div class="sub" id="head-sub">loading…</div>
+</div>
+<div class="row">
+  <div class="col">
+    <div class="stages" id="stages"></div>
+  </div>
+  <div class="col" style="flex: 0.85">
+    <div class="details" id="details">no running stage</div>
+  </div>
+</div>
+<script>
+const STAGE_STATUS_ICONS = {
+  done: "✓", running: "▶", failed: "✕", skipped: "○", pending: "·",
+};
+function fmt(n) { return n == null ? "—" : Number(n).toLocaleString(); }
+function fmtDur(s) {
+  if (s == null) return "—";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + (s%60) + "s";
+  return (s/3600).toFixed(1) + "h";
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/data/pipeline_progress.json?ts=" + Date.now());
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    const head = document.getElementById("head-sub");
+    head.textContent = "elapsed " + (d.overall_elapsed_h ?
+      d.overall_elapsed_h.toFixed(2) + " h" : "—") +
+      " · last poll " + new Date().toLocaleTimeString();
+
+    // Stage list
+    const stages = document.getElementById("stages");
+    stages.innerHTML = d.stages.map(s => `
+      <div class="stage ${s.status}">
+        <div class="num">${s.n}/${d.stages.length}</div>
+        <div class="icon">${STAGE_STATUS_ICONS[s.status] || "·"}</div>
+        <div class="name">${s.name}</div>
+        <div class="dur">${fmtDur(s.duration_s)}</div>
+        <div class="status">${s.status}</div>
+      </div>`).join("");
+
+    // Details for running stage
+    const det = document.getElementById("details");
+    const r_ = d.running || {};
+    const cur = d.stages.find(s => s.n === d.current_stage);
+    if (!cur) {
+      det.innerHTML = "<h2>No stage running</h2><p>Pipeline may be idle or complete.</p>";
+    } else {
+      let html = `<h2>Stage ${cur.n} — ${cur.name}</h2>`;
+      const rows = [];
+      if (r_.kind === "chain_proximity") {
+        const pct = r_.src_total ? (100 * r_.src_done / r_.src_total).toFixed(1) : 0;
+        rows.push(["round", r_.round || 1]);
+        rows.push(["source anchors", `${fmt(r_.src_done)} / ${fmt(r_.src_total)} (${pct}%)`]);
+        html += `<div class="metric"><span class="k">progress</span><span class="v">${pct}%</span>
+          <div class="bar"><div class="fill" style="width: ${pct}%"></div></div></div>`;
+        rows.push(["chain edges kept", fmt(r_.kept)]);
+        rows.push(["dropped", fmt(r_.dropped)]);
+        rows.push(["expansions queued", fmt(r_.expansions)]);
+        rows.push(["cell cache hit", r_.cache_hit_pct + "%"]);
+        rows.push(["process RSS", r_.rss_gb + " GB"]);
+        rows.push(["stage elapsed", fmtDur(r_.elapsed_s)]);
+      } else if (r_.kind === "spt_polygon") {
+        const pct = r_.tile_total ? (100 * r_.tile_done / r_.tile_total).toFixed(1) : 0;
+        rows.push(["tile", `${r_.tile_done} / ${r_.tile_total} (${pct}%)`]);
+        html += `<div class="metric"><span class="k">tiles</span><span class="v">${pct}%</span>
+          <div class="bar"><div class="fill" style="width: ${pct}%"></div></div></div>`;
+        if (r_.anchors_done != null) rows.push(["anchors done", fmt(r_.anchors_done)]);
+        if (r_.anchors_skipped != null) rows.push(["skipped", fmt(r_.anchors_skipped)]);
+        if (r_.elapsed_min != null) rows.push(["stage elapsed", r_.elapsed_min.toFixed(1) + " min"]);
+      } else if (r_.kind === "build_paired") {
+        rows.push(["trunks packed", `${fmt(r_.trunks_done)} / ${fmt(r_.trunks_total)} (${r_.pct}%)`]);
+        html += `<div class="metric"><span class="k">trunks</span><span class="v">${r_.pct}%</span>
+          <div class="bar"><div class="fill" style="width: ${r_.pct}%"></div></div></div>`;
+        rows.push(["vertices packed", fmt(r_.vertices)]);
+        rows.push(["stage elapsed", fmtDur(r_.elapsed_s)]);
+      } else if (r_.kind === "prune") {
+        rows.push(["pass", r_.pass]);
+        rows.push(["vertices this pass", fmt(r_.verts_dropped) + " dropped"]);
+        rows.push(["vertices total", fmt(r_.verts_total)]);
+      } else if (r_.kind === "adapt_paired") {
+        rows.push(["stage", "adapt in progress"]);
+      } else {
+        rows.push(["stage", cur.name + " (no parser)"]);
+      }
+      html += rows.map(([k, v]) =>
+        `<div class="metric"><span class="k">${k}</span><span class="v">${v}</span></div>`
+      ).join("");
+      if (r_.last_line) {
+        html += `<div class="lastline">${r_.last_line}</div>`;
+      }
+
+      // System / diagnostics block
+      const sys = d.system || {};
+      const dg = d.diagnosis || {};
+      const c  = sys.container || {};
+      const h  = sys.host || {};
+      const l  = sys.load || {};
+      const tags = [];
+      if (dg.mem_critical)   tags.push(["danger", "MEMORY CRITICAL"]);
+      else if (dg.mem_pressure) tags.push(["warn",   "memory pressure"]);
+      else                      tags.push(["ok",     "memory ok"]);
+      if (dg.swap_pressure)    tags.push(["danger", "swap pressure"]);
+      else if (dg.swap_used)   tags.push(["neutral", `swap ${dg.swap_used} GB (informational)`]);
+      if (dg.cpu_saturated)  tags.push(["ok",     "cpu-bound (saturated)"]);
+      else if (dg.cpu_bound) tags.push(["ok",     "cpu-bound"]);
+      else                    tags.push(["neutral","cpu idle (io-bound?)"]);
+      if (dg.overloaded)     tags.push(["warn",   `load ${l['1m']} / ${sys.cpu_count} cores`]);
+
+      let sysHtml = `<div class="sysbox">
+        <h2>system</h2>
+        <div class="diag-tags">
+          ${tags.map(([kind, txt]) => `<span class="tag ${kind}">${txt}</span>`).join("")}
+        </div>`;
+      if (c.name) {
+        const cpuBar = c.cpu_pct != null ?
+          `<div class="minibar"><div class="fill-cpu" style="width:${
+            Math.min(100, c.cpu_pct / (sys.cpu_count || 1))}%"></div></div>` : "";
+        const memClass = (c.mem_pct >= 90) ? "danger" : (c.mem_pct >= 75 ? "warn" : "");
+        const memBar = c.mem_pct != null ?
+          `<div class="minibar"><div class="fill-mem ${memClass}" style="width:${c.mem_pct.toFixed(0)}%"></div></div>` : "";
+        sysHtml += `
+          <div class="barlabel"><span class="k">container CPU</span>
+            <span class="v">${c.cpu_pct != null ? c.cpu_pct.toFixed(0) + "%" : "—"}
+              ${sys.cpu_count ? `<span style="color:#64748b">/ ${100 * sys.cpu_count}% (${sys.cpu_count} cores)</span>` : ""}</span></div>${cpuBar}
+          <div class="barlabel"><span class="k">container memory</span>
+            <span class="v">${c.mem_used_gb != null ? c.mem_used_gb.toFixed(2) : "—"} /
+              ${c.mem_limit_gb != null ? c.mem_limit_gb.toFixed(1) : "—"} GB</span></div>${memBar}
+          <div class="barlabel"><span class="k">container disk I/O</span>
+            <span class="v">${c.bio_read_gb != null ? c.bio_read_gb.toFixed(2) + " GB read" : "—"} · ${c.bio_write_gb != null ? c.bio_write_gb.toFixed(2) + " GB write" : "—"}</span></div>
+          <div class="barlabel"><span class="k">python threads</span>
+            <span class="v">${c.pids || "—"}</span></div>`;
+      }
+      if (h.mem_total_gb) {
+        const hMemClass = (h.mem_used_pct >= 90) ? "danger" : (h.mem_used_pct >= 75 ? "warn" : "");
+        sysHtml += `
+          <div class="barlabel"><span class="k">host RAM</span>
+            <span class="v">${(h.mem_total_gb - h.mem_avail_gb).toFixed(1)} / ${h.mem_total_gb.toFixed(1)} GB (${h.mem_used_pct.toFixed(0)}%)</span></div>
+          <div class="minibar"><div class="fill-mem ${hMemClass}" style="width:${h.mem_used_pct.toFixed(0)}%"></div></div>
+          <div class="barlabel"><span class="k">host swap</span>
+            <span class="v">${h.swap_used_mb != null ? h.swap_used_mb.toFixed(0) + " / " + h.swap_total_mb.toFixed(0) + " MB" : "—"}</span></div>`;
+      }
+      if (l["1m"] != null) {
+        sysHtml += `
+          <div class="barlabel"><span class="k">load average</span>
+            <span class="v">${l["1m"].toFixed(2)} · ${l["5m"].toFixed(2)} · ${l["15m"].toFixed(2)}${dg.load_per_core != null ? `  (${dg.load_per_core}/core)` : ""}</span></div>`;
+      }
+      sysHtml += `</div>`;
+
+      det.innerHTML = html + sysHtml;
+    }
+  } catch (e) {
+    document.getElementById("head-sub").textContent = "poll error: " + e.message;
+  }
+}
+tick();
+setInterval(tick, 15000);
+</script>

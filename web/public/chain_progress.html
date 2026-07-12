@@ -1,0 +1,105 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>chain-proximity progress</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0f172a;
+           color: #e2e8f0; margin: 0; padding: 2rem; }
+    h1 { font-size: 1.2rem; margin: 0 0 1rem 0; color: #94a3b8; }
+    .grid { display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem; max-width: 1100px; }
+    .card { background: #1e293b; border-radius: 8px; padding: 1rem;
+            border: 1px solid #334155; }
+    .label { font-size: 0.75rem; color: #64748b; text-transform: uppercase;
+             letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+    .value { font-size: 1.6rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .sub { font-size: 0.85rem; color: #94a3b8; margin-top: 0.3rem; }
+    .bar { height: 8px; background: #334155; border-radius: 4px;
+           overflow: hidden; margin-top: 0.4rem; }
+    .fill { height: 100%; background: linear-gradient(90deg, #22d3ee, #4ade80);
+            transition: width 1s ease; }
+    .status { max-width: 1100px; margin-top: 1.5rem; padding: 1rem;
+              background: #1e293b; border-radius: 8px; font-family: monospace;
+              font-size: 0.85rem; border: 1px solid #334155; }
+    .status .k { color: #94a3b8; }
+    .footer { max-width: 1100px; margin-top: 1rem; color: #64748b;
+              font-size: 0.8rem; }
+    .stale { color: #f87171; }
+  </style>
+</head>
+<body>
+  <h1>Stage 6 chain_proximity — live progress</h1>
+  <div class="grid" id="grid"></div>
+  <div class="status" id="status">loading…</div>
+  <div class="footer" id="footer">Polls /data/chain_progress.json every 15 s.</div>
+  <script>
+    const grid = document.getElementById('grid');
+    const status = document.getElementById('status');
+    const footer = document.getElementById('footer');
+
+    function fmt(n) {
+      if (n == null) return '—';
+      return n.toLocaleString();
+    }
+
+    function eta(pct, wall_h) {
+      if (!pct || !wall_h) return null;
+      return wall_h * (100 - pct) / pct;
+    }
+
+    async function tick() {
+      try {
+        const r = await fetch('/data/chain_progress.json?ts=' + Date.now());
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const d = await r.json();
+        const now = Math.floor(Date.now() / 1000);
+        const age = now - d.ts;
+        const staleTag = age > 60 ? ' <span class="stale">(stale ' + age + 's)</span>' : '';
+
+        const rem_h = eta(d.src_pct, d.wall_h);
+        grid.innerHTML = `
+          <div class="card"><div class="label">round</div>
+            <div class="value">${d.round_no}</div>
+            <div class="sub">${d.wall_h.toFixed(1)} h elapsed${staleTag}</div>
+          </div>
+          <div class="card"><div class="label">source anchors</div>
+            <div class="value">${fmt(d.src_done)} / ${fmt(d.src_total)}</div>
+            <div class="bar"><div class="fill" style="width: ${d.src_pct}%"></div></div>
+            <div class="sub">${d.src_pct.toFixed(1)}% · ETA ${rem_h ? rem_h.toFixed(1) + ' h' : '—'}</div>
+          </div>
+          <div class="card"><div class="label">chain edges kept</div>
+            <div class="value">${fmt(d.kept)}</div>
+            <div class="sub">real-road weighted-Dijkstra costs</div>
+          </div>
+          <div class="card"><div class="label">edges dropped</div>
+            <div class="value">${fmt(d.dropped)}</div>
+            <div class="sub">unreachable + intermediate-C hits</div>
+          </div>
+          <div class="card"><div class="label">expansions queued</div>
+            <div class="value">${fmt(d.expansions)}</div>
+            <div class="sub">for the next round</div>
+          </div>
+          <div class="card"><div class="label">cell cache hit rate</div>
+            <div class="value">${d.cache_hit_pct}%</div>
+            <div class="sub">LRU size 24 slots</div>
+          </div>
+          <div class="card"><div class="label">process RSS</div>
+            <div class="value">${d.rss_gb} GB</div>
+            <div class="sub">/proc/self/status VmRSS</div>
+          </div>
+        `;
+        status.innerHTML = '<span class="k">last log line:</span> ' +
+          d.last_line + '<br>' +
+          '<span class="k">pipeline:</span> ' + d.pipe_status;
+        footer.textContent = 'Polls /data/chain_progress.json every 15 s. Last poll ' + new Date().toLocaleTimeString();
+      } catch (e) {
+        status.innerHTML = 'poll error: ' + e.message;
+      }
+    }
+    tick();
+    setInterval(tick, 15000);
+  </script>
+</body>
+</html>

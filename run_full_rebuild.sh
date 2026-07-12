@@ -179,7 +179,18 @@ stage() {
     exit 1
   fi
   log "STAGE $n/$TOTAL $name: OK"
+  # Sync any newly-produced viz files into web/public/data as soon as
+  # the stage that writes them completes. Keeps the dashboard fresh
+  # mid-run, and guarantees files are published even if a later stage
+  # fails before the exit trap fires.
+  publish_web_data
 }
+
+# EXIT trap: publish one last time no matter how the script exits.
+# Prevents stale-web-data bug where a mid-pipeline failure (e.g. verify
+# crash, ctrl-C) skipped the end-of-run publish and left the dashboard
+# showing data from the run before last.
+trap 'publish_web_data' EXIT
 
 # ---- 14 stages -------------------------------------------------------
 
@@ -266,18 +277,23 @@ else
     sleep 10
   done
   # Test Graz→Cph route; fail if any non-skipped bridge is > 100 m.
-  route_json="$(curl -fsS -G \
+  # Route JSON polylines can be several hundred KB — pass via stdin
+  # rather than argv (`python3 -c "…$route_json…"` blows past
+  # ARG_MAX with a real graph and dies "Argument list too long").
+  route_file="$LOG_DIR/stage-14-verify-route.json"
+  curl -fsS -G \
     -d from=15.4404,47.0707 -d to=12.5683,55.6761 -d profile="$SPT_PROFILE" \
-    http://localhost:8001/trunk/route 2>>"$LOG_DIR/stage-14-verify.log")"
-  echo "$route_json" >>"$LOG_DIR/stage-14-verify.log"
-  worst=$(python3 -c "
-import json, sys
-d = json.loads('''$route_json''')
+    http://localhost:8001/trunk/route \
+    2>>"$LOG_DIR/stage-14-verify.log" > "$route_file"
+  worst=$(ROUTE_FILE="$route_file" python3 - <<'PYEOF' 2>>"$LOG_DIR/stage-14-verify.log"
+import json, os
+d = json.load(open(os.environ["ROUTE_FILE"]))
 bs = [b for b in d.get('route',{}).get('properties',{}).get('bridges',[])
       if not b.get('skipped')]
 worst = max((b.get('distance_m') or 0) for b in bs) if bs else 0
 print(f'{worst:.1f}')
-" 2>>"$LOG_DIR/stage-14-verify.log")
+PYEOF
+)
   if [[ -z "$worst" ]]; then
     log "STAGE 14 verify: FAIL — could not parse route response"
     ntfy_send "bike-rebuild verify FAILED — could not parse route response"
@@ -292,6 +308,6 @@ print(f'{worst:.1f}')
   log "STAGE 14 verify: OK (worst non-skipped bridge ${worst} m)"
 fi
 
-publish_web_data
+# publish_web_data is called by the EXIT trap.
 log "== rebuild COMPLETE (ts=$PIPELINE_TS) =="
 ntfy_send "bike-rebuild complete (profile=$SPT_PROFILE)"
