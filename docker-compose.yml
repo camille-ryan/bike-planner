@@ -25,8 +25,11 @@ services:
       # filesystem via 9P breaks both. Cost: less inspectable from
       # the host. Worth it.
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    # No host port mapping — the `api` and `pgrouting` services reach
+    # postgres over the internal Docker network at hostname `postgres`.
+    # If you need a psql shell from the host, add a temporary
+    # `ports: - "127.0.0.1:5432:5432"` line locally. The dev-default
+    # POSTGRES_PASSWORD is weak on purpose, so it must not be exposed.
     shm_size: "1g"
     # Cgroup cap so a runaway query gets killed inside the container
     # rather than taking down the entire WSL VM. Bumped to 10 GB so
