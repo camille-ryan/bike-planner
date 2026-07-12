@@ -41,6 +41,10 @@ const map = new maplibregl.Map({
 });
 map.addControl(new maplibregl.NavigationControl(), "top-right");
 map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "bottom-left");
+// Expose the map instance so companion scripts (chat.js) can add
+// overlay sources/layers. Top-level `const` in a plain <script> is
+// NOT attached to window automatically.
+window.map = map;
 
 // --- state -------------------------------------------------------------
 

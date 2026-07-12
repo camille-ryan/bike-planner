@@ -135,9 +135,28 @@
       <div id="map"></div>
       <div id="elevation"></div>
     </main>
+
+    <aside id="chat">
+      <header>
+        <h2>Planner</h2>
+        <p class="hint">Ask for a plan; the map updates as I compute.</p>
+      </header>
+      <div id="chat-log"></div>
+      <form id="chat-form">
+        <textarea id="chat-input" rows="2"
+          placeholder="e.g. plan Graz→Vienna, ~80 km/day, rail-accessible overnights"></textarea>
+        <div class="row">
+          <button type="submit" id="chat-send">Send</button>
+          <button type="button" id="chat-reset" class="secondary" title="Clear conversation">Reset</button>
+        </div>
+      </form>
+    </aside>
   </div>
 
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-  <script src="app.js?v=20260708a"></script>
+  <!-- marked.js: markdown → HTML renderer for assistant messages in chat pane -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@14.1.3/marked.min.js"></script>
+  <script src="app.js?v=20260712e"></script>
+  <script src="chat.js?v=20260712g"></script>
 </body>
 </html>
