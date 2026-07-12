@@ -37,8 +37,13 @@ _RAIL_ROUTE_TYPES: set[int] = {2} | set(range(100, 118))
 # Stuttgart Hbf, München Hbf, etc.); without a geographic filter those
 # leak into the station layer.
 _COUNTRY_BBOX: dict[str, tuple[float, float, float, float]] = {
-    # (min_lon, min_lat, max_lon, max_lat)
-    "austria": (9.2, 46.3, 17.5, 49.2),
+    # (min_lon, min_lat, max_lon, max_lat) — chosen slightly wider than
+    # the country border so stations at frontiers (e.g. Aachen for DE,
+    # or Rødby for DK) aren't clipped.
+    "austria":        ( 9.2, 46.3, 17.5, 49.2),
+    "germany":        ( 5.5, 47.1, 15.2, 55.2),
+    "denmark":        ( 7.9, 54.5, 15.4, 57.9),
+    "czech-republic": (12.0, 48.5, 19.0, 51.1),
 }
 
 # Cluster radius (in degrees) for collapsing sibling-platform stops into
