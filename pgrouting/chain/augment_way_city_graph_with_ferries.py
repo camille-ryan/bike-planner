@@ -121,6 +121,19 @@ def main() -> None:
     print(f"[augment]   {len(ferry_rows):,} ferry `ways` rows in "
           f"{time.time()-t:.1f}s", flush=True)
 
+    # Persist ferry (src_vid, dst_vid) pairs so the stage-6 proximity
+    # Dijkstra can mask ferry edges out of its road graph. Design
+    # intent: LAND anchors reach chain neighbors via road only; ferry
+    # crossings are chain-level hops between piers (added below via the
+    # pier↔pier BFS). Without this mask, the proximity Dijkstra rides a
+    # heavily-weighted sea ferry way and manufactures bogus LAND↔PIER
+    # chain edges like Rostock LAND → Gedser PIER.
+    ferry_edges_out = Path("/data/ferry_edges.json")
+    ferry_edges_out.write_text(json.dumps(
+        [[int(r["src_vid"]), int(r["dst_vid"])] for r in ferry_rows]))
+    print(f"[augment]   wrote {ferry_edges_out.name} "
+          f"({ferry_edges_out.stat().st_size / 1024:.0f} KB)", flush=True)
+
     # 1) Ferry chain edges (pier ↔ pier via ferry-only subgraph).
     #
     # Ferry ways in OSM are usually split into a *chain* of short

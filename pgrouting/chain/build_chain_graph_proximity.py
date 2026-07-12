@@ -85,8 +85,31 @@ OUT_GRAPH   = DATA_DIR / "way_city_graph.json"
 OUT_GEOJSON = DATA_DIR / "way_city_graph.geojson"
 OUT_DROPPED = DATA_DIR / "way_city_graph_dropped.json"
 OUT_ORPHANS = DATA_DIR / "way_city_graph_orphans.json"
+FERRY_EDGES_IN = DATA_DIR / "ferry_edges.json"
 R_EARTH_M   = 6_371_000.0
 RADIUS_DEG  = RADIUS_M / 111_000.0
+
+
+def _load_ferry_edge_set() -> set[tuple[int, int]]:
+    """Return the set of (src_vid, dst_vid) tuples for every ferry way,
+    both directions. Empty set if ferry_edges.json isn't there (older
+    augment step; the mask is silently a no-op).
+
+    Rationale: LAND anchors should reach chain neighbors via road only.
+    Ferry crossings are chain hops between piers and are added by the
+    ferry augment step's pier↔pier BFS. Without this mask, the stage-6
+    proximity Dijkstra rides a heavily-weighted sea ferry way and
+    manufactures bogus LAND↔PIER chain edges (e.g. Rostock → Gedser).
+    Pier↔pier chain edges are handled by an unconditional-keep
+    fast-path higher up, so this mask doesn't strand them."""
+    if not FERRY_EDGES_IN.exists():
+        return set()
+    pairs = json.loads(FERRY_EDGES_IN.read_text())
+    out: set[tuple[int, int]] = set()
+    for s, d in pairs:
+        out.add((int(s), int(d)))
+        out.add((int(d), int(s)))
+    return out
 
 
 def _haversine_m(lon1, lat1, lon2, lat2):
@@ -169,9 +192,10 @@ class CellCache:
         return self.items[key]
 
 
-def _load_csr_for_bbox(bbox, cache):
+def _load_csr_for_bbox(bbox, cache, ferry_set=None):
     """Load cells intersecting bbox from cache. Filter negative rev
-    edges. Returns (csr, gid_to_local, coords, n_edges_total).
+    edges and (if ferry_set is provided) any (src, dst) pair belonging
+    to a ferry way. Returns (csr, gid_to_local, coords, n_edges_total).
     coords[local_idx] = (lon, lat). Returns (None, {}, None, 0) if
     the bbox is empty of edges."""
     cells = _cells_in_bbox(bbox)
@@ -219,6 +243,26 @@ def _load_csr_for_bbox(bbox, cache):
 
     fwd_ok = fwd >= 0
     rev_ok = rev >= 0
+
+    # Mask ferry ways out of the road graph. Ferry crossings are chain
+    # hops between piers (added by the augment step's pier↔pier BFS);
+    # LAND anchors have no business chaining across water via the
+    # Dijkstra's own graph. See _load_ferry_edge_set() for the "why".
+    if ferry_set:
+        # Need to look at the original (global) vertex IDs, not the
+        # remapped locals, because the ferry set is keyed on OSM vids.
+        # Rebuild the (src, dst) global ids for this batch.
+        src_global = unique_gids[src_local]
+        dst_global = unique_gids[dst_local]
+        ferry_mask = np.fromiter(
+            ((int(s), int(d)) in ferry_set
+             for s, d in zip(src_global, dst_global)),
+            dtype=bool, count=n_edges,
+        )
+        fwd_ok &= ~ferry_mask
+        rev_ok &= ~ferry_mask
+        del ferry_mask, src_global, dst_global
+
     row = np.concatenate([src_local[fwd_ok], dst_local[rev_ok]])
     col = np.concatenate([dst_local[fwd_ok], src_local[rev_ok]])
     data = np.concatenate([fwd[fwd_ok],       rev[rev_ok]])
@@ -345,10 +389,12 @@ def _canonical_key(a_ref, b_ref):
 
 
 def _process_source_batch(source, targets, cache, anchor_records,
-                          anchor_kdtree, ref_to_anchor,
+                          anchor_kdtree, ref_to_anchor, ferry_set=None,
                           depth=0, max_depth=4):
     """Run one Dijkstra from source's 5-km disc; return (kept, dropped,
-    expansions). Recursively sector-splits on MAX_BBOX_EDGES overrun."""
+    expansions). Recursively sector-splits on MAX_BBOX_EDGES overrun.
+    ferry_set masks ferry ways out of the Dijkstra graph — see
+    _load_ferry_edge_set() for the rationale."""
     kept: list[dict] = []
     dropped: list[dict] = []
     expansions: list[dict] = []
@@ -381,12 +427,14 @@ def _process_source_batch(source, targets, cache, anchor_records,
             k, d, e = _process_source_batch(source, g, cache,
                                             anchor_records, anchor_kdtree,
                                             ref_to_anchor,
+                                            ferry_set=ferry_set,
                                             depth=depth + 1,
                                             max_depth=max_depth)
             kept.extend(k); dropped.extend(d); expansions.extend(e)
         return kept, dropped, expansions
 
-    csr, gid_to_local, coords, n_edges = _load_csr_for_bbox(bbox, cache)
+    csr, gid_to_local, coords, n_edges = _load_csr_for_bbox(
+        bbox, cache, ferry_set=ferry_set)
     if csr is None:
         for t in testable:
             dropped.append({
@@ -584,6 +632,11 @@ def main() -> None:
     print(f"[intermed] {len(anchor_records):,} anchors, "
           f"{len(candidates):,} candidate edges", flush=True)
 
+    ferry_set = _load_ferry_edge_set()
+    print(f"[intermed] ferry-mask: {len(ferry_set):,} directed pairs "
+          f"({'active' if ferry_set else 'no ferry_edges.json — mask disabled'})",
+          flush=True)
+
     cache = CellCache(CELL_CACHE_SIZE)
     kept_all: list[dict] = []
     dropped_all: list[dict] = []
@@ -644,7 +697,8 @@ def main() -> None:
             if target_anchors:
                 k, d, exp = _process_source_batch(
                     source, target_anchors, cache,
-                    anchor_records, anchor_kdtree, ref_to_anchor)
+                    anchor_records, anchor_kdtree, ref_to_anchor,
+                    ferry_set=ferry_set)
                 kept_all.extend(k)
                 dropped_all.extend(d)
                 rnd_expansions.extend(exp)

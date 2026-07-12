@@ -44,6 +44,21 @@ POLYGONS_OUT       = Path("/data/way_city_spt_polygons.json")
 POLYGONS_OUT_GEOJSON = Path("/data/way_city_spt_polygons.geojson")
 
 FLOOR_RADIUS_M    = 5_000.0   # disc around the anchor itself
+# Chain edges whose road cost is >K× their endpoint haversine are
+# detour edges — the road goes the long way around an obstacle
+# (water, mountain, closed border). We keep them in the chain graph
+# for global routing but exclude them from A's polygon: A's SPT has
+# no business ballooning across water to reach the far endpoint;
+# the OTHER anchor's polygon covers its own neighborhood, and the
+# router bridges the handoff.
+#
+# This ratio is SCALE-INVARIANT: a legit 160 km rural edge in
+# Utah/Nevada has ratio ~1.25 and passes through. Only ~1% of edges
+# hit ratio > 4 in the Europe dataset (p50=1.0, p95=1.6, p99=4.3),
+# and every one that does is a cross-water/mountain outlier.
+# Compare this to a fixed km cap, which would starve sparse
+# geographies. See feedback_no_hard_edge_caps.md.
+DETOUR_RATIO_CUTOFF = 4.0
 NEIGHBOR_DISC_M   = 5_000.0   # 2026-06-30: ALSO add a 5 km disc
 # around each chain neighbor's center. With just the polylines,
 # chain neighbors landed at hull corners and got clipped by
@@ -118,15 +133,34 @@ def _load_inputs() -> tuple[list[dict], list[dict]]:
 
 
 def _edges_by_endpoint(chain_edges: list[dict]
-                       ) -> dict[str, list[tuple[str, list[list[float]]]]]:
-    """ref -> [(other_ref, geom_oriented_away_from_ref), ...]
+                       ) -> dict[str, list[tuple[str, list[list[float]], float]]]:
+    """ref -> [(other_ref, geom_oriented_away_from_ref, cost_m), ...]
     Geom is oriented so geom[0] is at `ref` and geom[-1] is at `other_ref`."""
-    out: dict[str, list[tuple[str, list[list[float]]]]] = {}
+    out: dict[str, list[tuple[str, list[list[float]], float]]] = {}
     for e in chain_edges:
         a, b, geom = e["a"], e["b"], e["geom"]
-        out.setdefault(a, []).append((b, list(geom)))
-        out.setdefault(b, []).append((a, list(reversed(geom))))
+        cost = float(e.get("cost_m", 0.0))
+        out.setdefault(a, []).append((b, list(geom), cost))
+        out.setdefault(b, []).append((a, list(reversed(geom)), cost))
     return out
+
+
+def _is_detour_edge(geom: list[list[float]], cost_m: float) -> bool:
+    """True if this chain edge's road-cost exceeds DETOUR_RATIO_CUTOFF
+    times its endpoint haversine — the road detours around something
+    (water, mountain, closed border). Such edges are legit for chain-
+    Dijkstra but shouldn't shape the polygon boundary."""
+    if not geom or len(geom) < 2 or cost_m <= 0:
+        return False
+    ax, ay = float(geom[0][0]), float(geom[0][1])
+    bx, by = float(geom[-1][0]), float(geom[-1][1])
+    rl1 = math.radians(ay); rl2 = math.radians(by)
+    dl  = math.radians(by - ay); dn = math.radians(bx - ax)
+    h = math.sin(dl/2)**2 + math.cos(rl1)*math.cos(rl2)*math.sin(dn/2)**2
+    hav_m = 2 * R_EARTH_M * math.asin(math.sqrt(h))
+    if hav_m <= 0:
+        return False
+    return (cost_m / hav_m) > DETOUR_RATIO_CUTOFF
 
 
 def _build_polygon(anchor: dict,
@@ -151,11 +185,27 @@ def _build_polygon(anchor: dict,
     # from there.  This keeps A's polygon the size of its road-neighbor
     # hull instead of ballooning across water toward a ferry pier
     # 30 km away.
+    a_is_pier = a_ref.startswith("ferry:")
     a_edges = chain_by_ref.get(a_ref, [])
-    for b_ref, geom_ab in a_edges:
+    for b_ref, geom_ab, cost_ab in a_edges:
+        # Detour edge (road-cost >> haversine → wraps around water/
+        # mountain/border). Skip BEFORE the pier-specific branch —
+        # otherwise a cross-Baltic pier point would still land in a
+        # land anchor's hull.
+        if _is_detour_edge(geom_ab, cost_ab):
+            continue
+
         if b_ref.startswith("ferry:"):
-            # Just the pier's location — no disc, no geometry walk,
-            # no 0.5-hop.
+            # Pier↔pier ferry hops (Rostock → Gedser, etc.) have no
+            # road-network representation — they're consumed by
+            # chain-Dijkstra, not the polygon SPT. Skip entirely: the
+            # OTHER pier's polygon extends to Denmark on its own,
+            # driven by ITS landward chain neighbors.
+            if a_is_pier:
+                continue
+            # A is a land anchor with a pier neighbor — add just the
+            # pier's location so A's SPT reaches the pier vertex on
+            # the road network. No disc, no geometry walk, no 0.5-hop.
             if geom_ab:
                 points.append((float(geom_ab[-1][0]), float(geom_ab[-1][1])))
             continue
@@ -173,8 +223,11 @@ def _build_polygon(anchor: dict,
         # 0.5-hop further: from B, walk each onward B→C up to path-
         # midpoint. Skip ferry piers here too so the extension doesn't
         # smuggle a pier into A's hull via a chain-neighbor's neighbors.
-        for c_ref, geom_bc in chain_by_ref.get(b_ref, []):
+        # Same detour-edge filter as the 1-hop.
+        for c_ref, geom_bc, cost_bc in chain_by_ref.get(b_ref, []):
             if c_ref == a_ref or c_ref.startswith("ferry:"):
+                continue
+            if _is_detour_edge(geom_bc, cost_bc):
                 continue
             prefix = _walk_to_path_midpoint(geom_bc)
             points.extend((float(x), float(y)) for x, y in prefix)
