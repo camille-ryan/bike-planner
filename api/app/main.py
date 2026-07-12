@@ -14,7 +14,7 @@ from pydantic import BaseModel
 import json
 from pathlib import Path
 
-from . import db, pois, trunk_router
+from . import chat, db, pois, trunk_router
 from .settings import DEFAULT_PROFILE, SPT_DIR
 
 
@@ -47,6 +47,9 @@ def _parse_lonlat(s: str, name: str) -> tuple[float, float]:
     except Exception:
         raise HTTPException(400, f"{name} must be 'lon,lat' (got '{s}')")
     return (lon, lat)
+
+
+app.include_router(chat.router)
 
 
 @app.get("/health")

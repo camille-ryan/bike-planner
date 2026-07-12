@@ -32,3 +32,7 @@ __pycache__/
 # bypass-mode overrides. Nothing here is needed by other users of the
 # repo.
 .claude/
+
+# API secrets — ANTHROPIC_API_KEY etc. Ship api/.env.example for the
+# shape; keep the real values local.
+api/.env

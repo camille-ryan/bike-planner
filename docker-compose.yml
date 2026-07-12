@@ -82,6 +82,18 @@ services:
       - "8001:8000"   # 8000 collides with another local service; map to 8001 on the host
     volumes:
       - ./data:/data:ro
+      # Bind-mount the app source so edits to chat.py / main.py land
+      # without rebuilding the image. The image still ships a baseline
+      # copy for prod / CI; the bind-mount overlays it in dev. Uvicorn
+      # is NOT started with --reload, so a `docker compose restart api`
+      # is enough to pick up code changes.
+      - ./api/app:/app/app
+    # api/.env supplies ANTHROPIC_API_KEY for the /chat planner
+    # endpoint. Absent-file is tolerated by compose; the /chat endpoint
+    # 500s with a clear message if the key isn't set.
+    env_file:
+      - path: ./api/.env
+        required: false
     environment:
       - DATA_DIR=/data
       - DEFAULT_PROFILE=views
@@ -104,9 +116,11 @@ services:
     # Bind-mount the static tree so edits to index.html / app.js /
     # data/*.geojson land without rebuilding the image. The image is
     # still built (carries the baseline files for prod / CI), the
-    # bind-mount overlays it in dev.
+    # bind-mount overlays it in dev. nginx.conf is bind-mounted for
+    # the same reason — SSE / proxy tuning shouldn't require a rebuild.
     volumes:
       - ./web/public:/usr/share/nginx/html:ro
+      - ./web/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - api
     restart: unless-stopped
