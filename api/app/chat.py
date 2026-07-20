@@ -25,8 +25,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
-from . import trunk_router
+from . import pois, trunk_router
 from .settings import DEFAULT_PROFILE, DATA_DIR
+
+POI_CATEGORIES = ("food", "viewpoint", "lodging", "water", "bike_service")
 
 
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-sonnet-5")
@@ -117,6 +119,58 @@ TOOLS = [
                 "limit": {"type": "integer", "default": 8, "minimum": 1, "maximum": 30},
             },
             "required": ["lon", "lat"],
+        },
+    },
+    {
+        "name": "pois_near_anchor",
+        "description": (
+            "List points-of-interest (OSM) within `radius_km` of an anchor "
+            "city, filtered by category. Categories: food, viewpoint, "
+            "lodging, water, bike_service. Use this to enrich an overnight "
+            "stop with nearby lodging or attractions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Anchor ref, e.g. 'db:224'"},
+                "category": {
+                    "type": "string",
+                    "enum": list(POI_CATEGORIES),
+                },
+                "radius_km": {"type": "number", "default": 5, "minimum": 0.2, "maximum": 30},
+                "limit": {"type": "integer", "default": 15, "minimum": 1, "maximum": 100},
+            },
+            "required": ["ref", "category"],
+        },
+    },
+    {
+        "name": "pois_along_route",
+        "description": (
+            "List points-of-interest (OSM) within `buffer_km` of the LAST "
+            "computed route's polyline, filtered by category. Reads the "
+            "polyline from the cached route (same one `split_into_stages` "
+            "uses) so you don't need to pass it. Categories: food, viewpoint, "
+            "lodging, water, bike_service. Use this to enrich a leg with "
+            "scenic detours or refreshment stops."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "from_ref": {"type": "string", "description": "Same as `route`'s from_ref (used to look up the cached polyline)"},
+                "to_ref":   {"type": "string", "description": "Same as `route`'s to_ref"},
+                "via_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Same `via_refs` you used with `route` (for cache match).",
+                },
+                "category": {
+                    "type": "string",
+                    "enum": list(POI_CATEGORIES),
+                },
+                "buffer_km": {"type": "number", "default": 3, "minimum": 0.2, "maximum": 20},
+                "limit": {"type": "integer", "default": 30, "minimum": 1, "maximum": 200},
+            },
+            "required": ["from_ref", "to_ref", "category"],
         },
     },
     {
@@ -298,10 +352,25 @@ def _tool_route(inp: dict) -> dict:
     coords = geom.get("coordinates", []) if geom.get("type") == "LineString" else []
     total_km = (props.get("gross_length_m") or 0) / 1000.0
     _ROUTE_CACHE[_route_cache_key(inp)] = coords
+    # Enriched chain metadata: each hop's name + population + country + kind
+    # so the model can pick "major cities" (population filter) or reason
+    # about country transitions without extra search_anchors calls.
+    prof = trunk_router._load_profile(DEFAULT_PROFILE)
+    chain_stops = []
+    for name, ci in zip(props.get("chain_names", []),
+                        props.get("chain_city_idx", [])):
+        c = prof.cities[int(ci)] if 0 <= int(ci) < len(prof.cities) else {}
+        chain_stops.append({
+            "name": name,
+            "ref": c.get("ref"),
+            "population": c.get("population"),
+            "country": c.get("country"),
+            "kind": c.get("place"),
+        })
     return {
         "total_km": round(total_km, 1),
         "polyline": coords,
-        "chain_stops": props.get("chain_names", []),
+        "chain_stops": chain_stops,
         "n_bridges": len(props.get("bridges", [])),
     }
 
@@ -443,11 +512,113 @@ def _tool_split_into_stages(inp: dict) -> dict:
     return {"total_km": round(total_km, 1), "n_days": n_days, "stages": stages}
 
 
+def _tool_pois_near_anchor(inp: dict) -> dict:
+    ref = inp.get("ref")
+    category = inp.get("category")
+    radius_km = float(inp.get("radius_km", 5))
+    limit = int(inp.get("limit", 15))
+    if not ref or not category:
+        return {"error": "ref and category are required"}
+    prof = trunk_router._load_profile(DEFAULT_PROFILE)
+    ci = prof.city_idx_by_ref.get(ref)
+    if ci is None:
+        return {"error": f"unknown anchor ref: {ref}"}
+    c = prof.cities[int(ci)]
+    lon, lat = float(c["lon"]), float(c["lat"])
+    radius_m = radius_km * 1000.0
+    # Coarse bbox around the anchor, then exact haversine filter.
+    r_deg_lat = radius_km / 111.0
+    r_deg_lon = r_deg_lat / max(math.cos(math.radians(lat)), 0.1)
+    bbox = (lon - r_deg_lon, lat - r_deg_lat, lon + r_deg_lon, lat + r_deg_lat)
+    # Query 3× the limit so exact-radius filtering has candidates.
+    raw = pois.query_bbox(bbox, [category], limit * 3)
+    hits = []
+    for p in raw:
+        d = _hav_m(lon, lat, float(p["lon"]), float(p["lat"]))
+        if d <= radius_m:
+            hits.append({
+                "name": p.get("name") or f"{p.get('category')}:{p.get('subtype') or '?'}",
+                "subtype": p.get("subtype"),
+                "lon": float(p["lon"]),
+                "lat": float(p["lat"]),
+                "distance_km": round(d / 1000.0, 2),
+            })
+    hits.sort(key=lambda h: h["distance_km"])
+    return {"pois": hits[:limit], "anchor": {"ref": ref, "name": c.get("name"),
+                                              "lon": lon, "lat": lat}}
+
+
+def _tool_pois_along_route(inp: dict) -> dict:
+    from_ref = inp.get("from_ref")
+    to_ref = inp.get("to_ref")
+    via_refs = tuple(inp.get("via_refs") or [])
+    category = inp.get("category")
+    buffer_km = float(inp.get("buffer_km", 3))
+    limit = int(inp.get("limit", 30))
+    if not category:
+        return {"error": "category is required"}
+    # Cache lookup mirrors split_into_stages: try exact key, fall back
+    # to any cached route for the same endpoints, else compute inline.
+    poly = _ROUTE_CACHE.get((from_ref, to_ref, via_refs))
+    if not poly:
+        for (fr, tr, _via), coords in _ROUTE_CACHE.items():
+            if fr == from_ref and tr == to_ref:
+                poly = coords
+                break
+    if not poly:
+        route_result = _tool_route({
+            "from_ref": from_ref, "to_ref": to_ref,
+            "via_refs": list(via_refs) if via_refs else None,
+        })
+        poly = route_result.get("polyline") or []
+    if len(poly) < 2:
+        return {"error": "no cached route for that endpoint pair; call `route` first"}
+    # Polyline bbox padded by buffer (rough — bbox will over-include,
+    # exact haversine filter culls after).
+    lons = [p[0] for p in poly]
+    lats = [p[1] for p in poly]
+    lat_mid = (min(lats) + max(lats)) / 2
+    r_deg_lat = buffer_km / 111.0
+    r_deg_lon = r_deg_lat / max(math.cos(math.radians(lat_mid)), 0.1)
+    bbox = (min(lons) - r_deg_lon, min(lats) - r_deg_lat,
+            max(lons) + r_deg_lon, max(lats) + r_deg_lat)
+    # Pull more than `limit` because bbox is coarse; we'll filter to true
+    # buffer and keep the closest N.
+    raw = pois.query_bbox(bbox, [category], min(limit * 20, 2000))
+    buffer_m = buffer_km * 1000.0
+
+    # Nearest polyline vertex per POI. O(len(poly) × len(raw)) — fine
+    # for a few hundred POIs × ~1000-vertex polyline; keeps it simple.
+    def _nearest_seg_dist_m(plon, plat):
+        best = float("inf")
+        for i in range(len(poly)):
+            d = _hav_m(plon, plat, poly[i][0], poly[i][1])
+            if d < best:
+                best = d
+        return best
+
+    hits = []
+    for p in raw:
+        d = _nearest_seg_dist_m(float(p["lon"]), float(p["lat"]))
+        if d <= buffer_m:
+            hits.append({
+                "name": p.get("name") or f"{p.get('category')}:{p.get('subtype') or '?'}",
+                "subtype": p.get("subtype"),
+                "lon": float(p["lon"]),
+                "lat": float(p["lat"]),
+                "distance_km": round(d / 1000.0, 2),
+            })
+    hits.sort(key=lambda h: h["distance_km"])
+    return {"pois": hits[:limit], "n_matched_full_buffer": len(hits)}
+
+
 TOOL_IMPLS = {
     "search_anchors":    _tool_search_anchors,
     "route":             _tool_route,
     "stations_near":     _tool_stations_near,
     "split_into_stages": _tool_split_into_stages,
+    "pois_near_anchor":  _tool_pois_near_anchor,
+    "pois_along_route":  _tool_pois_along_route,
 }
 
 
