@@ -86,6 +86,19 @@ _KEEP_RAILWAY = {"rail", "light_rail"}
 _KEEP_USAGE   = {"main", "branch"}
 _DROP_SERVICE = {"spur", "siding", "yard", "crossover"}
 
+# OSM node tag values that mark a real rail stop. `station` = big
+# staffed station; `halt` = flag stop / unstaffed; `stop` = generic
+# stop position on a rail line; `tram_stop` explicitly excluded (we
+# want heavy/regional rail, not urban tram). `station_site` and
+# `service_station` are yard/depot markers — skip.
+_KEEP_OSM_RAIL_STOP = {"station", "halt", "stop"}
+
+# Radius for cross-checking GTFS-derived station centroids against
+# nearby OSM railway stop nodes. Bigger than the ~50m typical GTFS/
+# OSM disagreement, tighter than any two different stops in the same
+# small town. Rescues legitimate rail stops whose GTFS coord drifts.
+_OSM_MATCH_RADIUS_M = 250.0
+
 # Spatial filter: drop OSM lines that aren't within this many meters of
 # any GTFS-served station (geographic distance via geography cast).
 # 200 m is generous enough to absorb the slight lateral offset between
@@ -298,6 +311,61 @@ def _ingest_stations(conn: psycopg.Connection,
 # OSM line parsing
 # ---------------------------------------------------------------------
 
+def _extract_osm_rail_nodes(pbf: Path) -> list[tuple[float, float]]:
+    """Return every OSM node tagged `railway ∈ _KEEP_OSM_RAIL_STOP` in
+    the PBF, as a list of (lon, lat). Streams the file without
+    building the location index (nodes carry their own coords)."""
+    t0 = time.time()
+    out: list[tuple[float, float]] = []
+    fp = (osmium.FileProcessor(str(pbf))
+          .with_filter(osmium.filter.KeyFilter("railway")))
+    for obj in fp:
+        if obj.is_node() and obj.tags.get("railway") in _KEEP_OSM_RAIL_STOP:
+            out.append((float(obj.location.lon), float(obj.location.lat)))
+    print(f"[railways]   OSM: {len(out):,} `railway=station|halt|stop` nodes "
+          f"in {time.time()-t0:.1f}s")
+    return out
+
+
+def _cross_check_against_osm(stations: list[dict],
+                             osm_rail: list[tuple[float, float]]
+                             ) -> list[dict]:
+    """Keep only GTFS-derived stations that have an OSM railway
+    station/halt/stop node within _OSM_MATCH_RADIUS_M. Drops MHD bus
+    and tram stops that GTFS misclassifies as `route_type=2`
+    (dominant failure mode in the CZ tangero aggregate feed)."""
+    if not osm_rail:
+        print("[railways]   WARN: no OSM rail nodes — skipping cross-check "
+              "(keeping all GTFS stations)")
+        return stations
+    import numpy as np
+    from scipy.spatial import cKDTree
+    arr = np.array(osm_rail, dtype=np.float64)
+    tree = cKDTree(arr)
+    # Radius in degrees at the mean latitude (small-angle approximation
+    # — good to <1% at the scale we care about, and this is a proximity
+    # test not a routing distance).
+    mean_lat = float(arr[:, 1].mean())
+    import math
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * math.cos(math.radians(mean_lat))
+    # Use lon-scaled degrees so a distance_upper_bound in degrees is
+    # roughly the same in meters regardless of latitude.
+    radius_deg = _OSM_MATCH_RADIUS_M / min(m_per_deg_lat, m_per_deg_lon)
+    kept = []
+    for s in stations:
+        d, _ = tree.query([s["lon"], s["lat"]],
+                          distance_upper_bound=radius_deg)
+        if d < radius_deg:
+            kept.append(s)
+    dropped = len(stations) - len(kept)
+    pct = (dropped * 100 // max(len(stations), 1))
+    print(f"[railways]   OSM cross-check: kept {len(kept):,}/{len(stations):,} "
+          f"(dropped {dropped:,} = {pct}% with no OSM rail node "
+          f"within {_OSM_MATCH_RADIUS_M:.0f}m)")
+    return kept
+
+
 def _accept_way(tags: dict) -> bool:
     """Filter OSM ways to passenger-grade rail trunks."""
     railway = tags.get("railway")
@@ -468,6 +536,14 @@ def ingest(conn: psycopg.Connection,
     """End-to-end ingest of one country's passenger rails."""
     print(f"[railways] === {country} ===")
     stations = _parse_gtfs(gtfs_zip, country)
+    # Cross-check against OSM `railway=station|halt|stop` nodes to
+    # filter out MHD bus/tram/trolley stops that some aggregated GTFS
+    # feeds (notably CZ tangero) mistag as `route_type=2`. Uses the
+    # same PBF that _ingest_osm_lines reads a step later — parsed
+    # in-memory here since the OSM stop count is small (~10k per
+    # country) and doesn't need Postgres.
+    osm_rail_nodes = _extract_osm_rail_nodes(pbf)
+    stations = _cross_check_against_osm(stations, osm_rail_nodes)
     _ingest_stations(conn, country, stations)
     _ingest_osm_lines(conn, country, pbf)
     _filter_connected_to_stations(conn, country)
