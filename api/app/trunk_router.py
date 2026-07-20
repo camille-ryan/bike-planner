@@ -683,82 +683,126 @@ def route(
                 "distance_m": 0.0, "skipped": True,
             })
 
-    # First-mile (task #37): route start_vid → nearest trunk vertex T
-    # inside chain[walk_start_i]'s polygon SPT via parent-walk stitch,
-    # instead of letting `_walk`'s straight-line haversine bridge kick
-    # in. That anchor's polygon includes chain[walk_start_i-1]'s 5 km
-    # disc, so start_vid is (almost always) present in its polygon SPT
-    # — same rationale as the last-mile stitch, mirrored to the front.
-    # Falls back to the straight bridge if the SPT NPZ is unavailable
-    # or the walks don't converge.
-    # If task-#47 skip fired, walk_start_i > 1 and start_vid is directly
-    # in that trunk — no stitch needed, we walk from start_vid.
+    # First-mile stitch: walk fm_start_vid's parent chain in chain[1]'s
+    # polygon SPT, stopping at the first vertex that's a member of
+    # trunk(chain[1], chain[2]). Use that as chain_terminus_vid so the
+    # main walk loop's succ chain takes over naturally from there.
+    #
+    # Prior version picked T_vid = B-frontier terminal nearest to start
+    # by haversine, then did a bidirectional-LCA parent-walk stitch
+    # (_last_mile). When both endpoints were downstream of a distant
+    # SPT-seed on different branches, that produced a V-shape: walk up
+    # to the seed, then back down to T_vid — visible as a several-km
+    # backtrack (Wien → NE to Gerasdorf → SW to Wien's north edge).
+    #
+    # A single upward parent walk finds the tree-shortest ancestor of
+    # fm_start_vid that lives in the trunk; no LCA, no reversal, no V.
+    # Fall back to the prior _last_mile stitch if the parent walk
+    # doesn't reach a trunk vertex (rare).
     if len(chain) >= 3 and walk_start_i == 1:
         a1, b1 = chain[1], chain[2]
         trunk_ab = prof.trunks.get((a1, b1))
         if trunk_ab is not None:
             arr_ab, next_idx_ab = trunk_ab
-            R = 6_371_000.0
-            lat_a = math.radians(start[1])
-            lat_v = np.radians(arr_ab["lat"].astype(np.float64))
-            lon_diff = np.radians(arr_ab["lon"].astype(np.float64) - start[0])
-            hav = (np.sin((lat_v - lat_a) / 2) ** 2
-                   + math.cos(lat_a) * np.cos(lat_v)
-                   * np.sin(lon_diff / 2) ** 2)
-            hav_dist = 2 * R * np.arcsin(np.sqrt(hav))
-            # Restrict T_vid selection to B-frontier vertices — the trunk
-            # entries where succ = NULL_SENTINEL. These are the natural
-            # entry gates from the A∩B boundary toward B; picking argmin
-            # over ALL trunk vertices lets an F-only-ancestor in a
-            # wrong-direction backbone win, producing a V-shaped stitch
-            # (walker goes up toward a1's seed, then back down toward
-            # some SW-corner backbone). B-frontier limits the target to
-            # the shared boundary between a1 and b1.
-            b_front_mask = (next_idx_ab == NULL_SENTINEL)
-            if b_front_mask.any():
-                b_front_pos = np.flatnonzero(b_front_mask)
-                pos_T = int(b_front_pos[np.argmin(hav_dist[b_front_pos])])
-            else:
-                pos_T = int(np.argmin(hav_dist))
-            T_vid = int(arr_ab["vid"][pos_T])
-            if T_vid != start_vid:
-                fm_coords = None
-                # Try chain[1]'s polygon SPT first — that's the "second
-                # pair" the router will actually walk into. Postgres
-                # may have snapped start_vid to a road vertex that isn't
-                # in chain[1]'s SPT (different bike-routable filter
-                # than the cell edge set); re-snap here to a vertex
-                # that's guaranteed present. If chain[1]'s NPZ doesn't
-                # cover the start coord, fall back to chain[0]'s SPT.
-                for stitch_city in (int(a1), int(chain[0])):
-                    fm_start_vid = _snap_coord_to_spt(
-                        profile, stitch_city, start[0], start[1],
-                    )
-                    if fm_start_vid is None:
-                        continue
-                    try:
-                        with db_mod.connect() as conn:
-                            fm_coords = _last_mile(
-                                profile, stitch_city,
-                                fm_start_vid, T_vid, conn,
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"[trunk_router] _first_mile stitch failed for "
-                              f"city {stitch_city}: {exc}", flush=True)
-                        fm_coords = None
-                    if fm_coords:
+            trunk_vids = arr_ab["vid"]
+            stitched = False
+            for stitch_city in (int(a1), int(chain[0])):
+                fm_start_vid = _snap_coord_to_spt(
+                    profile, stitch_city, start[0], start[1],
+                )
+                if fm_start_vid is None:
+                    continue
+                try:
+                    ng_s, par_s = _load_anchor_spt(profile, stitch_city)
+                except FileNotFoundError:
+                    continue
+                loaded_coords = _load_anchor_spt_coords(profile, stitch_city)
+                if loaded_coords is None:
+                    continue
+                _ng_c, spt_coords_arr, _tree = loaded_coords
+                # Walk parent chain; stop at first trunk-membership hit.
+                entry_pos = int(np.searchsorted(ng_s, fm_start_vid))
+                if entry_pos >= len(ng_s) or int(ng_s[entry_pos]) != fm_start_vid:
+                    continue
+                i = entry_pos
+                stitch_positions: list[int] = []
+                trunk_entry_vid = -1
+                trunk_entry_pos = -1
+                for _ in range(_MAX_WALK_STEPS):
+                    stitch_positions.append(i)
+                    cur_vid = int(ng_s[i])
+                    tpos = int(np.searchsorted(trunk_vids, cur_vid))
+                    if tpos < len(trunk_vids) and int(trunk_vids[tpos]) == cur_vid:
+                        trunk_entry_vid = cur_vid
+                        trunk_entry_pos = tpos
                         break
-                if fm_coords:
-                    # Drop the final stitched coord (== T_vid's road pos);
-                    # the trunk walk below will emit T_vid as its first
-                    # vertex, so we'd otherwise duplicate that point.
-                    for c in fm_coords[:-1]:
-                        coords.append([float(c[0]), float(c[1])])
-                    chain_terminus_vid = T_vid
-                    chain_terminus_coord = (
-                        float(arr_ab["lat"][pos_T]),
-                        float(arr_ab["lon"][pos_T]),
-                    )
+                    p = int(par_s[i])
+                    if p < 0:
+                        break
+                    i = p
+                if trunk_entry_vid < 0:
+                    continue
+                # Emit stitch coords (parent walk up to the trunk entry).
+                # Drop the final one because the trunk walk emits it as
+                # its first vertex — avoid duplicate.
+                for spos in stitch_positions[:-1]:
+                    c = spt_coords_arr[spos]
+                    coords.append([float(c[0]), float(c[1])])
+                chain_terminus_vid = trunk_entry_vid
+                chain_terminus_coord = (
+                    float(arr_ab["lat"][trunk_entry_pos]),
+                    float(arr_ab["lon"][trunk_entry_pos]),
+                )
+                stitched = True
+                break
+
+            if not stitched:
+                # Fallback to the prior bidirectional-LCA stitch. Can
+                # produce a V-shape but at least gets us onto the trunk.
+                R = 6_371_000.0
+                lat_a = math.radians(start[1])
+                lat_v = np.radians(arr_ab["lat"].astype(np.float64))
+                lon_diff = np.radians(arr_ab["lon"].astype(np.float64) - start[0])
+                hav = (np.sin((lat_v - lat_a) / 2) ** 2
+                       + math.cos(lat_a) * np.cos(lat_v)
+                       * np.sin(lon_diff / 2) ** 2)
+                hav_dist = 2 * R * np.arcsin(np.sqrt(hav))
+                b_front_mask = (next_idx_ab == NULL_SENTINEL)
+                if b_front_mask.any():
+                    b_front_pos = np.flatnonzero(b_front_mask)
+                    pos_T = int(b_front_pos[np.argmin(hav_dist[b_front_pos])])
+                else:
+                    pos_T = int(np.argmin(hav_dist))
+                T_vid = int(arr_ab["vid"][pos_T])
+                if T_vid != start_vid:
+                    fm_coords = None
+                    for stitch_city in (int(a1), int(chain[0])):
+                        fm_start_vid = _snap_coord_to_spt(
+                            profile, stitch_city, start[0], start[1],
+                        )
+                        if fm_start_vid is None:
+                            continue
+                        try:
+                            with db_mod.connect() as conn:
+                                fm_coords = _last_mile(
+                                    profile, stitch_city,
+                                    fm_start_vid, T_vid, conn,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"[trunk_router] _first_mile fallback stitch "
+                                  f"failed for city {stitch_city}: {exc}",
+                                  flush=True)
+                            fm_coords = None
+                        if fm_coords:
+                            break
+                    if fm_coords:
+                        for c in fm_coords[:-1]:
+                            coords.append([float(c[0]), float(c[1])])
+                        chain_terminus_vid = T_vid
+                        chain_terminus_coord = (
+                            float(arr_ab["lat"][pos_T]),
+                            float(arr_ab["lon"][pos_T]),
+                        )
 
     # In-loop skip-lookahead (task #46): before entering trunk i,
     # check if the incoming chain_terminus_vid is already a vertex in

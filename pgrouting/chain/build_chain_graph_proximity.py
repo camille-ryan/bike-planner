@@ -80,6 +80,20 @@ MAX_BBOX_EDGES   = int(os.environ.get("INTERMED_MAX_BBOX_EDGES", "50000000"))
 BUFFER_FRAC      = float(os.environ.get("INTERMED_BUFFER_FRAC", "0.20"))
 MAX_PATH_LEN     = int(os.environ.get("INTERMED_MAX_PATH_LEN", "20000"))
 MAX_ROUNDS       = int(os.environ.get("INTERMED_MAX_ROUNDS", "6"))
+# Chain edges whose road cost is >K× the anchor-centroid haversine
+# are detour edges — the road wraps around water/mountain/border to
+# reach the far endpoint. We DROP them here so the chain graph is
+# authoritative; downstream stages (polygons, SPT, paired trunks)
+# don't need their own filter. Pier↔pier ferry hops are exempt via
+# the unconditional-keep fast path in _process_source_batch — sea
+# routes always exceed this ratio by design.
+#
+# The ratio is SCALE-INVARIANT: a legit 160 km rural edge in
+# Utah/Nevada has ratio ~1.25 and passes through. In the Europe
+# dataset ~1% of edges hit ratio > 4 (p50=1.0, p95=1.6, p99=4.3),
+# and every one that does is a cross-water/mountain outlier. See
+# feedback_no_hard_edge_caps.md for why this beats a fixed km cap.
+DETOUR_RATIO_CUTOFF = float(os.environ.get("INTERMED_DETOUR_RATIO_CUTOFF", "4.0"))
 
 OUT_GRAPH   = DATA_DIR / "way_city_graph.json"
 OUT_GEOJSON = DATA_DIR / "way_city_graph.geojson"
@@ -130,6 +144,18 @@ def _haversine_m_vec(lon1, lat1, lons, lats):
     a = (np.sin(dlat / 2) ** 2
          + math.cos(lat1_r) * np.cos(lats_r) * np.sin(dlon / 2) ** 2)
     return 2.0 * R_EARTH_M * np.arcsin(np.sqrt(a))
+
+
+def _is_detour_edge(cost_m: float,
+                    a_lon: float, a_lat: float,
+                    b_lon: float, b_lat: float) -> bool:
+    """True if this chain edge's road-cost exceeds DETOUR_RATIO_CUTOFF
+    times the anchor-centroid haversine A↔B. Uses the anchor centroids
+    (not geom endpoints) so the ratio reflects real road overhead."""
+    hav = _haversine_m(a_lon, a_lat, b_lon, b_lat)
+    if hav <= 0 or cost_m <= 0:
+        return False
+    return (cost_m / hav) > DETOUR_RATIO_CUTOFF
 
 
 def _bearing_deg(lon1, lat1, lon2, lat2):
@@ -540,6 +566,20 @@ def _process_source_batch(source, targets, cache, anchor_records,
             # least the true centroid-to-centroid straight-line
             # distance.
             cost_m = max(best_dist, hav)
+            # Detour filter — chain graph is the authority on which
+            # edges are valid. If the road wraps around water/mountain
+            # to reach B (cost / centroid-haversine > cutoff), drop
+            # the edge. Pier↔pier hops bypass this via the earlier
+            # unconditional-keep fast path.
+            if _is_detour_edge(cost_m,
+                               source["lon"], source["lat"],
+                               t["lon"], t["lat"]):
+                dropped.append({
+                    "a": source["ref"], "b": t["ref"],
+                    "cost_m": cost_m,
+                    "_reason": f"detour ratio>{DETOUR_RATIO_CUTOFF}",
+                })
+                continue
             kept.append({
                 "a": source["ref"], "b": t["ref"],
                 "a_name": source.get("name"), "b_name": t.get("name"),
