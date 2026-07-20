@@ -44,7 +44,11 @@ def _get_client() -> anthropic.Anthropic:
         key = os.environ.get("ANTHROPIC_API_KEY")
         if not key:
             raise HTTPException(500, "ANTHROPIC_API_KEY not set in the API container's env")
-        _client = anthropic.Anthropic(api_key=key)
+        # Per-request timeout so a stalled upstream can't hang the SSE
+        # loop indefinitely. 120s covers even long extended-thinking
+        # rounds; anything longer than that is a genuine failure the
+        # client should see quickly.
+        _client = anthropic.Anthropic(api_key=key, timeout=120.0)
     return _client
 
 
@@ -493,6 +497,11 @@ Workflow — do exactly what the user asked, no more. DO NOT stop mid-workflow f
 - Call `split_into_stages` ONLY if the user asked for a multi-day plan, daily stages, km/day, or overnights — cues like "plan a X-day tour", "80 km/day", "break into stages". Do NOT split just because a route is long.
 - Call `stations_near` ONLY if the user asked about rail, train, meeting the partner, or station-accessible overnights.
 - Then write the final summary. Keep it proportional to what was asked — a single route gets one bullet with total km and chain waypoints, not a day-by-day breakdown.
+
+Reformat / recall requests — DO NOT re-run tools:
+- When the user asks to rephrase, reformat, summarize, tabulate, "make it prettier", "give me markdown", "show as a list", "just the overnights", "recap", or any variant that references content ALREADY produced in this conversation, work directly from the prior tool_result blocks and assistant messages in your context.
+- Only call tools again if the user CHANGED a parameter (different endpoints, different km/day, added a via, "route via X" that wasn't there before, "add a stop", "shorten the days"). Anything that could produce a genuinely different route requires re-routing; anything that's pure presentation must NOT.
+- If unsure whether a request is presentation-only vs. parameter-change, err on the side of NOT re-calling tools — reformat from context and add a one-sentence "let me know if you want me to re-route with different parameters."
 
 Style:
 - Be concise. No hedging preamble like "I'll help you plan…" — just start doing the work.
