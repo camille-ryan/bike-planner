@@ -12,29 +12,13 @@ const PROFILE_COLORS = {
 
 const map = new maplibregl.Map({
   container: "map",
-  style: {
-    version: 8,
-    sources: {
-      basemap: {
-        // CartoDB Dark Matter — free, no API key, designed for data
-        // overlays. Four subdomains in the tile list let MapLibre
-        // parallelise tile requests across them.
-        type: "raster",
-        tiles: [
-          "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-          "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-          "https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-          "https://d.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-        ],
-        tileSize: 256,
-        attribution:
-          '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · ' +
-          '© <a href="https://carto.com/attributions">CARTO</a>',
-        maxzoom: 19,
-      },
-    },
-    layers: [{ id: "basemap", type: "raster", source: "basemap" }],
-  },
+  // OpenFreeMap "positron" — free, no API key, no auth, hosted
+  // vector tiles based on planet OSM. Replaces the previous CartoDB
+  // raster tiles (some networks were seeing "api key required"
+  // errors from Carto's CDN). Positron is the light neutral style
+  // designed for data overlays; alternatives are "bright" and
+  // "liberty". See https://openfreemap.org for style previews.
+  style: "https://tiles.openfreemap.org/styles/positron",
   center: [13.5, 51],
   zoom: 5,
   hash: true,
