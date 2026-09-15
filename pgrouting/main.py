@@ -272,7 +272,10 @@ def cmd_export_rails(args) -> None:
         # Stations + lodging count via LATERAL spatial join.
         if lodging_radius_m > 0:
             cur.execute(
-                "SELECT s.gtfs_id, s.name, s.n_routes, s.country, "
+                "SELECT s.gtfs_id, s.name, s.n_routes, "
+                "       COALESCE(s.n_routes_rail, s.n_routes), "
+                "       COALESCE(s.n_routes_bus, 0), "
+                "       s.country, "
                 "       ST_X(s.geom), ST_Y(s.geom), nl.n_lodging "
                 "FROM rail_stations s "
                 "JOIN LATERAL (SELECT COUNT(*) AS n_lodging FROM lodging l "
@@ -285,8 +288,10 @@ def cmd_export_rails(args) -> None:
             )
         else:
             cur.execute(
-                "SELECT gtfs_id, name, n_routes, country, "
-                "       ST_X(geom), ST_Y(geom), 0 "
+                "SELECT gtfs_id, name, n_routes, "
+                "       COALESCE(n_routes_rail, n_routes), "
+                "       COALESCE(n_routes_bus, 0), "
+                "       country, ST_X(geom), ST_Y(geom), 0 "
                 "FROM rail_stations WHERE country = ANY(%s) "
                 "ORDER BY n_routes DESC",
                 (countries,),
@@ -297,11 +302,15 @@ def cmd_export_rails(args) -> None:
                 "geometry": {"type": "Point", "coordinates": [lon, lat]},
                 "properties": {
                     "gtfs_id": gtfs_id, "name": name,
-                    "n_routes": n_routes, "country": country,
+                    "n_routes": n_routes,
+                    "n_routes_rail": n_routes_rail,
+                    "n_routes_bus": n_routes_bus,
+                    "country": country,
                     "n_lodging": int(n_lodging),
                 },
             }
-            for gtfs_id, name, n_routes, country, lon, lat, n_lodging in cur
+            for gtfs_id, name, n_routes, n_routes_rail, n_routes_bus,
+                country, lon, lat, n_lodging in cur
         ]
         # Lines
         cur.execute(

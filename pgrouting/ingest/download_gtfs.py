@@ -56,6 +56,13 @@ _FEEDS: dict[str, object] = {
     # republic GitHub repo. We stitch them into a single zip because the
     # ingest expects a zipped GTFS. PID alone would miss Brno; this
     # covers the whole corridor.
+    # CZ national feed. This tangero aggregation ALREADY includes
+    # České dráhy (agency AG_213) — intercity trains show up in
+    # routes.txt with route_type=2. We do NOT need a separate ČD
+    # feed. The historical data-quality issue was mislabelled
+    # regional-bus routes in this same feed getting route_type=2;
+    # OSM cross-check + n_routes_rail vs n_routes_bus split
+    # (task #78) handles that on the ingest side.
     "czech-republic": {"assemble": [
         (f"https://raw.githubusercontent.com/tangero/jizdni-rady-czech-republic/main/data/merged/{n}", n)
         for n in ("agency.txt", "calendar_dates.txt", "routes.txt",
@@ -65,6 +72,15 @@ _FEEDS: dict[str, object] = {
          "stop_times.txt"),  # gunzip on the way in
     ]},
 }
+
+
+def feeds_for(country: str) -> list[str]:
+    """Return the ordered list of feed keys backing `country`. All
+    countries are single-feed today. Kept as a function for a
+    potential future multi-feed CZ (national + Prague PID for urban
+    density), but that's not needed for the corridor questions we
+    care about now."""
+    return [country]
 
 
 def feed_path(country: str) -> Path:

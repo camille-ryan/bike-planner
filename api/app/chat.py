@@ -100,15 +100,19 @@ TOOLS = [
     {
         "name": "stations_near",
         "description": (
-            "List rail stations within `radius_km` of (lon, lat). Sorted by "
-            "distance ascending. Each result includes name, n_routes "
-            "(rail lines serving it), n_lodging (lodging within 1 km), and "
-            "distance_km. Use this to find where a partner could arrive/"
-            "depart by train near a day's overnight. Coverage: Austria "
-            "(ÖBB), Germany (DB + regional), Denmark (Rejseplanen), and "
-            "Czech Republic (national aggregate — Prague/Brno urban "
-            "systems included, so n_routes for a city-center anchor can "
-            "reach the hundreds)."
+            "List rail stations within `radius_km` of (lon, lat). Sorted "
+            "by distance ascending. Each result includes name, "
+            "n_routes_rail (rail-classified routes serving the stop), "
+            "n_routes_bus (bus-classified routes at the same stop — some "
+            "national feeds mis-label a subset of bus routes as rail, "
+            "so a stop with n_routes_rail >> n_routes_bus is a much "
+            "more confident 'real train station' signal than raw "
+            "n_routes alone), n_routes (total, kept for backwards "
+            "compat), and distance_km. Use to find where a partner could "
+            "arrive/depart by train near a day's overnight. Coverage: "
+            "Austria (ÖBB), Germany (DB + regional), Denmark "
+            "(Rejseplanen), Czech Republic (tangero national aggregate). "
+            "PREFER `n_routes_rail >= 2` as the rail-accessible threshold."
         ),
         "input_schema": {
             "type": "object",
@@ -171,6 +175,48 @@ TOOLS = [
                 "limit": {"type": "integer", "default": 30, "minimum": 1, "maximum": 200},
             },
             "required": ["from_ref", "to_ref", "category"],
+        },
+    },
+    {
+        "name": "stations_along_route",
+        "description": (
+            "Rail-accessible ANCHOR CITIES along the last-computed "
+            "route's polyline. Each result: anchor `ref`, `name`, "
+            "`lon`, `lat`, `km_along_route` (cumulative km from route "
+            "start to the anchor's closest polyline vertex), and "
+            "`stations` (top rail stations within `station_radius_km` "
+            "of that anchor, each with n_routes_rail / n_routes_bus / "
+            "distance_km). Only anchors that have at least one station "
+            "with n_routes_rail >= `min_routes_rail` (default 2) are "
+            "returned. Reads the cached polyline from the last matching "
+            "`route(from_ref, to_ref, via_refs)` call. Use this INSTEAD "
+            "of calling `stations_near` per candidate town when you "
+            "need to pick rail-accessible overnights across a "
+            "multi-day plan — one call replaces N * stations_near "
+            "round-trips."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "from_ref": {"type": "string"},
+                "to_ref":   {"type": "string"},
+                "via_refs": {
+                    "type": "array", "items": {"type": "string"},
+                },
+                "station_radius_km": {
+                    "type": "number", "default": 5, "minimum": 0.5, "maximum": 25,
+                },
+                "min_routes_rail": {
+                    "type": "integer", "default": 2, "minimum": 1, "maximum": 50,
+                    "description": "Minimum n_routes_rail on the best-served station near each anchor. 2 is a solid 'has actual train service' threshold given the per-mode split from task #78.",
+                },
+                "corridor_km": {
+                    "type": "number", "default": 8, "minimum": 1, "maximum": 30,
+                    "description": "Only consider anchors within this many km of the polyline (avoids picking cities that share the corridor but aren't actually near it).",
+                },
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+            },
+            "required": ["from_ref", "to_ref"],
         },
     },
     {
@@ -375,6 +421,27 @@ def _tool_route(inp: dict) -> dict:
     }
 
 
+def _stations_kdtree():
+    """Cached scipy.spatial.cKDTree over station lon/lat, plus the
+    parallel list of station dicts. Both are None if no stations
+    are loaded yet or if scipy isn't available.
+    Returns (tree, stations_list) — both indexed the same way."""
+    if not hasattr(_stations_kdtree, "_cache"):
+        stations = _load_stations_cache()
+        if not stations:
+            _stations_kdtree._cache = (None, [])
+        else:
+            try:
+                import numpy as np
+                from scipy.spatial import cKDTree
+                arr = np.array([(s["lon"], s["lat"]) for s in stations],
+                               dtype=np.float64)
+                _stations_kdtree._cache = (cKDTree(arr), stations)
+            except ImportError:
+                _stations_kdtree._cache = (None, stations)
+    return _stations_kdtree._cache
+
+
 def _load_stations_cache() -> list[dict]:
     if not STATIONS_PATH.exists():
         return []
@@ -383,8 +450,16 @@ def _load_stations_cache() -> list[dict]:
         _load_stations_cache._cache = [
             {
                 "name": f["properties"].get("name"),
-                "n_routes": f["properties"].get("n_routes", 0),
-                "n_lodging": f["properties"].get("n_lodging", 0),
+                # Keep n_routes for backwards compat, but the model
+                # should prefer n_routes_rail (rail-only) for the
+                # rail-accessible overnight decision — task #78
+                # exposed this split after the tangero feed was found
+                # to conflate suburban bus routes into rail counts.
+                "n_routes":      f["properties"].get("n_routes", 0),
+                "n_routes_rail": f["properties"].get("n_routes_rail",
+                                                    f["properties"].get("n_routes", 0)),
+                "n_routes_bus":  f["properties"].get("n_routes_bus", 0),
+                "n_lodging":     f["properties"].get("n_lodging", 0),
                 "lon": f["geometry"]["coordinates"][0],
                 "lat": f["geometry"]["coordinates"][1],
             }
@@ -612,13 +687,156 @@ def _tool_pois_along_route(inp: dict) -> dict:
     return {"pois": hits[:limit], "n_matched_full_buffer": len(hits)}
 
 
+def _tool_stations_along_route(inp: dict) -> dict:
+    """Batched 'which chain anchors along this route are rail-served?'
+    lookup. Replaces the runaway N × stations_near loop where the model
+    interrogates each candidate overnight one at a time — one call
+    returns the full ranked corridor.
+
+    Algorithm:
+      1. Pull the cached polyline for (from_ref, to_ref, via_refs).
+      2. Precompute cumulative km along the polyline.
+      3. For each ANCHOR in the profile: skip if > corridor_km from
+         the nearest polyline vertex.
+      4. For each surviving anchor: find the top rail stations within
+         station_radius_km using the cached stations list.
+      5. Drop anchors whose best station has n_routes_rail < min_routes_rail.
+      6. Sort remaining anchors by km_along_route ascending.
+    """
+    from_ref = inp.get("from_ref")
+    to_ref = inp.get("to_ref")
+    via_refs = tuple(inp.get("via_refs") or [])
+    station_radius_m = float(inp.get("station_radius_km", 5)) * 1000.0
+    min_routes_rail = int(inp.get("min_routes_rail", 2))
+    corridor_m = float(inp.get("corridor_km", 8)) * 1000.0
+    limit = int(inp.get("limit", 20))
+
+    poly = _ROUTE_CACHE.get((from_ref, to_ref, via_refs))
+    if not poly:
+        for (fr, tr, _via), coords in _ROUTE_CACHE.items():
+            if fr == from_ref and tr == to_ref:
+                poly = coords
+                break
+    if not poly:
+        route_result = _tool_route({
+            "from_ref": from_ref, "to_ref": to_ref,
+            "via_refs": list(via_refs) if via_refs else None,
+        })
+        poly = route_result.get("polyline") or []
+    if len(poly) < 2:
+        return {"error": "no cached route for that endpoint pair; call `route` first"}
+
+    # Cumulative km along the polyline (in meters, converted at the end).
+    cum_m = [0.0]
+    for i in range(1, len(poly)):
+        cum_m.append(cum_m[-1] + _hav_m(
+            poly[i-1][0], poly[i-1][1], poly[i][0], poly[i][1]))
+
+    # For each anchor, find the closest polyline vertex.
+    prof = trunk_router._load_profile(DEFAULT_PROFILE)
+    stree, stations = _stations_kdtree()
+
+    # Build a KDTree over polyline vertices for fast per-anchor lookup.
+    # Without this the per-anchor closest-vertex search is
+    # O(N_anchors × N_poly_verts) — ~2M ops per 1000-vert route.
+    try:
+        import numpy as np
+        from scipy.spatial import cKDTree as _CKD
+        poly_arr = np.array(poly, dtype=np.float64)
+        poly_tree = _CKD(poly_arr)
+    except ImportError:
+        poly_tree = None
+
+    # Rough deg→m at the route midpoint for KDTree radius params.
+    import math as _math
+    lat_mid = poly[len(poly)//2][1] if poly else 50.0
+    _MDEGLAT = 111_320.0
+    _MDEGLON = 111_320.0 * _math.cos(_math.radians(lat_mid))
+    _min_mdeg = min(_MDEGLAT, _MDEGLON)
+
+    def _closest_poly_km(alon, alat):
+        if poly_tree is not None:
+            d_deg, idx = poly_tree.query([alon, alat], k=1)
+            # deg → m upper bound (use smaller deg-per-m so a bounded
+            # radius in deg is safely ≤ meters at any orientation).
+            return d_deg * _min_mdeg, int(idx)
+        # Fallback: linear scan
+        best_d = float("inf"); best_i = 0
+        for i, (px, py) in enumerate(poly):
+            d = _hav_m(alon, alat, px, py)
+            if d < best_d: best_d = d; best_i = i
+        return best_d, best_i
+
+    def _stations_near_anchor(alon, alat):
+        if stree is None:
+            hits = []
+            for s in stations:
+                d = _hav_m(alon, alat, s["lon"], s["lat"])
+                if d <= station_radius_m:
+                    hits.append((d, s))
+            hits.sort(key=lambda h: h[0])
+            return hits
+        # KDTree returns indices within a deg-radius upper bound.
+        radius_deg = station_radius_m / _min_mdeg
+        idxs = stree.query_ball_point([alon, alat], r=radius_deg)
+        out = []
+        for i in idxs:
+            s = stations[i]
+            d = _hav_m(alon, alat, s["lon"], s["lat"])
+            if d <= station_radius_m:
+                out.append((d, s))
+        out.sort(key=lambda h: h[0])
+        return out
+
+    results = []
+    for c in prof.cities:
+        alon, alat = float(c.get("lon", 0)), float(c.get("lat", 0))
+        if alon == 0 and alat == 0:
+            continue
+        d_to_poly, best_i = _closest_poly_km(alon, alat)
+        if d_to_poly > corridor_m:
+            continue
+        # Find rail stations near this anchor.
+        st_hits = _stations_near_anchor(alon, alat)
+        if not st_hits:
+            continue
+        best_rail = max((s.get("n_routes_rail", 0) for _, s in st_hits), default=0)
+        if best_rail < min_routes_rail:
+            continue
+        results.append({
+            "ref": c.get("ref"),
+            "name": c.get("name"),
+            "population": c.get("population"),
+            "country": c.get("country"),
+            "lon": alon, "lat": alat,
+            "km_along_route": round(cum_m[best_i] / 1000.0, 1),
+            "dist_from_route_km": round(d_to_poly / 1000.0, 2),
+            "stations": [
+                {
+                    "name": s["name"],
+                    "n_routes_rail": s.get("n_routes_rail", 0),
+                    "n_routes_bus":  s.get("n_routes_bus", 0),
+                    "distance_km": round(d / 1000.0, 2),
+                }
+                for d, s in st_hits[:3]
+            ],
+        })
+    results.sort(key=lambda r: r["km_along_route"])
+    return {
+        "total_km": round(cum_m[-1] / 1000.0, 1),
+        "n_matched_anchors": len(results),
+        "anchors": results[:limit],
+    }
+
+
 TOOL_IMPLS = {
-    "search_anchors":    _tool_search_anchors,
-    "route":             _tool_route,
-    "stations_near":     _tool_stations_near,
-    "split_into_stages": _tool_split_into_stages,
-    "pois_near_anchor":  _tool_pois_near_anchor,
-    "pois_along_route":  _tool_pois_along_route,
+    "search_anchors":       _tool_search_anchors,
+    "route":                _tool_route,
+    "stations_near":        _tool_stations_near,
+    "stations_along_route": _tool_stations_along_route,
+    "split_into_stages":    _tool_split_into_stages,
+    "pois_near_anchor":     _tool_pois_near_anchor,
+    "pois_along_route":     _tool_pois_along_route,
 }
 
 
