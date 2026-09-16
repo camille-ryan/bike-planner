@@ -6,7 +6,7 @@
 > stages with nearby destinations. Every planning decision is a tool
 > call you can see.
 
-![Placeholder for a demo screenshot — Phase 7 will replace this](NOTES/demo.png)
+![Hero screenshot — see `NOTES/demo-script.md` for the capture prompt](NOTES/hero.png)
 
 ## What this is (portfolio version)
 
