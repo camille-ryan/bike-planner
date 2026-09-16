@@ -1,0 +1,19 @@
+# Make GitHub's language stats reflect what the human wrote, not what
+# the pipeline generated. Without this, a few large committed geojson
+# reference files can drown the actual Python + JS in the stats bar.
+
+*.geojson       linguist-generated=true
+*.geojsonseq    linguist-generated=true
+
+# Auto-detect the correct line-ending for text; ship shell scripts as
+# LF even on WSL where the checkout might otherwise pick up CRLF.
+*.sh            text eol=lf
+*.py            text eol=lf
+*.js            text eol=lf
+*.css           text eol=lf
+*.html          text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+Dockerfile      text eol=lf

@@ -1,9 +1,80 @@
-# Bike Routing — Graz → Copenhagen
+# Bike Routing — an AI-native tour planner
+
+> Ask a chat agent to plan a 4,000 km bike tour with rail-accessible
+> overnights, then watch the map paint the plan while the agent
+> compares routes, hunts for train stations, and enriches your daily
+> stages with nearby destinations. Every planning decision is a tool
+> call you can see.
+
+![Placeholder for a demo screenshot — Phase 7 will replace this](NOTES/demo.png)
+
+## What this is (portfolio version)
+
+I built this as a demonstration of the skills required for a data-
+scientist-to-AI-engineer transition. The routing engine is
+DS-flavoured — a custom paired-SPT preprocess over OpenStreetMap
+graphs of Austria, Czechia, Germany and Denmark — but the *product*
+around it is an agent: a Claude Sonnet–driven planner that uses a
+half-dozen tools to compose a bikeable multi-day itinerary.
+
+**What's demonstrated**
+
+- **Tool use as UX.** Custom tools (`route`, `stations_along_route`,
+  `pois_near_anchor`, `split_into_stages`, …) designed to *steer* the
+  model to good decisions in few round-trips instead of running away
+  in a per-candidate loop. See `NOTES/tool-design.md` for the
+  before/after story.
+- **Streaming SSE + robust API integration** — the agent's plan
+  arrives incrementally, tool call by tool call, with client-side
+  offline detection, per-request timeout, and idle-watchdog abort.
+- **Prompt engineering as system design** — the system prompt
+  explicitly separates "compose a plan" from "reformat a plan
+  already produced" so a "make it a table" turn doesn't re-run the
+  route.
+- **MCP server** (Phase 3) — the same tools also expose over
+  Anthropic's Model Context Protocol so Claude Desktop can drive
+  the planner without the web UI.
+- **Multi-agent orchestration** (Phase 4) — a LangGraph fork with
+  a planner → router → per-stage enricher (parallel fan-out) →
+  composer → critic loop, benchmarked side-by-side with the native
+  single-agent SDK on the same prompt. Written up in
+  `NOTES/langchain-comparison.md`.
+- **Evaluation harness + observability dashboard** (Phases 5-6) —
+  gold prompt set, LLM-as-judge scoring, JSONL trace log, static
+  Chart.js dashboard for cost/latency/quality by backend.
+
+**What's underneath** — the routing engine itself is described in
+`NOTES/routing-engine.md`: multi-source Dijkstra chain graphs,
+proximity-based detour filtering, per-anchor SPT polygon bounds,
+paired-trunk SQLite blobs. Sub-second query time for 1,500 km routes.
+
+---
+
+## Live demo prompts
+
+Once you're at the running app (see quickstart below), try:
+
+```
+Route Graz to Vienna, split into 3-day stages, ~80 km/day. Enrich
+each riding day with 2-3 viewpoints within 2 km of the route.
+```
+
+```
+30 days Graz → Copenhagen, 2-3 days in major cities, ~50 mi/day,
+rail-accessible overnights.
+```
+
+Watch the map fill in as the agent iterates. Toggle "Show route data"
+in the left overlays panel to see the paired-SPT polygons the router
+walked underneath.
+
+---
+
+## Original project name
 
 A self-supported bike-tour planner for the Graz → Copenhagen corridor.
 OpenStreetMap data + a Postgres/pgRouting-backed SPT preprocess + scenic
-POI overlays (vistas, lodging, food, protected areas, EuroVelo / national
-bike networks). Dockerized.
+POI overlays. Dockerized.
 
 ## Architecture
 
@@ -227,14 +298,11 @@ bike/
     └── spt/      <profile>/(cities.json, city_graph.json, spt/*.npz)
 ```
 
-## Remote access
+## Port bindings
 
-This stack is designed to run on `desktop-nk6flc3.tail9115a7.ts.net`
-(over Tailscale) and be hit from a laptop. Port bindings use `0.0.0.0`
-so they're reachable on any interface.
+Port bindings use `0.0.0.0` so they're reachable on any interface.
 
 | Port  | Service              |
 |-------|----------------------|
-| 5432  | Postgres             |
 | 8001  | FastAPI (8000 in container) |
 | 8080  | Web UI               |

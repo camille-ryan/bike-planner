@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Cancel superseded runs on the same branch. GitHub's default is to
+# run everything sequentially, which wastes CI minutes on WIP branches.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Cheap static checks: parse every Python and JavaScript file the
+  # api/ and web/public/ dirs ship. If a script contains a syntax
+  # error we know immediately without spinning up docker.
+  syntax:
+    name: Syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python syntax check (api + pgrouting)
+        run: |
+          find api pgrouting -name '*.py' -print0 \
+            | xargs -0 -n 32 python -m py_compile
+      - name: Set up Node for JS syntax check
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: JS syntax check (web/public)
+        run: |
+          for f in web/public/*.js; do
+            node --check "$f"
+          done
+
+  # Import smoke test — makes sure the FastAPI app actually loads with
+  # its dependencies, so a bad import lands in CI, not on the first
+  # deploy. We stub ANTHROPIC_API_KEY so the module-level import path
+  # doesn't fail at construct time (the client is lazy-initialized).
+  api-import:
+    name: FastAPI import smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install api dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r api/requirements.txt
+      - name: Import the FastAPI app
+        env:
+          ANTHROPIC_API_KEY: "sk-ci-stub"
+          # Point away from Docker-only paths so `settings.py` resolves.
+          DATA_DIR: "${{ github.workspace }}/data"
+        run: |
+          mkdir -p "$DATA_DIR"
+          cd api
+          python -c "from app import main; print('import OK:', main.app.title)"
+
+  # Docker build — the deployable artifact. Verifies the Dockerfiles
+  # aren't broken. Skips a full docker compose up (which would need
+  # the full data volume and a running postgres).
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build api image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          push: false
+          load: true
+          tags: bike-api:ci
+      - name: Build pgrouting image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./pgrouting
+          push: false
+          load: true
+          tags: bike-pgrouting:ci
