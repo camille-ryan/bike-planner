@@ -482,63 +482,6 @@ def _snap_coord_to_spt(profile: str, city_idx: int,
     return int(ng[int(idx)])
 
 
-def spur_to_anchor_center(profile: str, city_idx: int,
-                          from_lon: float, from_lat: float) -> dict:
-    """Walk `city_idx`'s SPT parent chain inward from the vertex
-    nearest (from_lon, from_lat), stopping when we hit a seed
-    (parent == -9999). Seeds are within `SEED_BBOX_RADIUS_M` (1 km)
-    of the anchor's OSM center per `compute_spts_polygon.py`.
-
-    Returns:
-      polyline:            [[lon, lat], ...] from outside → seed
-                            (empty if the SPT isn't loadable)
-      added_km:            cumulative haversine distance along it
-      terminated_at_seed:  True if the walk actually reached a seed
-      seed_lonlat:         the walk's final coord, ~= city center
-
-    Zero pathfinding — this is a linked-list traversal on data
-    `_load_anchor_spt` already keeps hot in the LRU. Cost is O(walk
-    length), usually a few hundred vertices.
-    """
-    loaded = _load_anchor_spt_coords(profile, city_idx)
-    if loaded is None:
-        return {"polyline": [], "added_km": 0.0,
-                "terminated_at_seed": False, "seed_lonlat": None}
-    _ng_coords, coords, tree = loaded
-    _ng_par, par = _load_anchor_spt(profile, city_idx)
-    if len(coords) == 0:
-        return {"polyline": [], "added_km": 0.0,
-                "terminated_at_seed": False, "seed_lonlat": None}
-    _, start_idx = tree.query([from_lon, from_lat], k=1)
-    start_idx = int(start_idx)
-    # Follow parent pointers to a seed. -9999 marks a seed; any p<0
-    # is treated as "root reached." Cycle-guard + hop cap in case
-    # the SPT's parent array is malformed.
-    path_idx = [start_idx]
-    seen = {start_idx}
-    for _ in range(200_000):
-        p = int(par[path_idx[-1]])
-        if p < 0:
-            break
-        if p in seen:
-            return {"polyline": [], "added_km": 0.0,
-                    "terminated_at_seed": False, "seed_lonlat": None}
-        path_idx.append(p)
-        seen.add(p)
-    terminated = int(par[path_idx[-1]]) == -9999
-    poly = [[float(coords[i][0]), float(coords[i][1])] for i in path_idx]
-    added_m = 0.0
-    for i in range(1, len(poly)):
-        added_m += _haversine_m(poly[i-1][0], poly[i-1][1],
-                                 poly[i][0], poly[i][1])
-    return {
-        "polyline": poly,
-        "added_km": round(added_m / 1000.0, 2),
-        "terminated_at_seed": terminated,
-        "seed_lonlat": poly[-1] if poly else None,
-    }
-
-
 def _fetch_vertex_coords(
     conn: psycopg.Connection, vids: list[int],
 ) -> dict[int, tuple[float, float]]:
