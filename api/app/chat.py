@@ -59,8 +59,19 @@ def _strip_bulk_for_llm(name: str, result: dict) -> dict:
             "polyline_verts": len(result.get("polyline") or []),
         }
     if name == "split_into_stages":
-        # Stages themselves are small (a dozen items × 6 fields) — keep.
-        return result
+        # Stages are small metadata, but each stage now carries
+        # `spur_start` + `spur_end` polylines (50–200 vertices each)
+        # so the frontend can draw the last-mile-to-center. The LLM
+        # doesn't need those — it plans off `slice_km`/`spur_km`/`km`.
+        return {
+            "total_km": result.get("total_km"),
+            "n_days":   result.get("n_days"),
+            "stages": [
+                {k: v for k, v in st.items()
+                 if k not in ("spur_start", "spur_end")}
+                for st in result.get("stages") or []
+            ],
+        }
     return result
 
 

@@ -256,11 +256,23 @@ TOOLS = [
             "Split a route into daily stages of roughly `target_km_per_day`. "
             "Each stage ends at the anchor nearest the km-target on the "
             "polyline (so the tour terminates at real towns, not arbitrary "
-            "coordinates). Returns a list of stages: "
-            "[{day, from_ref, to_ref, km, from_lonlat, to_lonlat}]. "
-            "Pass the same from_ref/to_ref you used with `route`; this tool "
-            "reads the last-computed polyline internally so you never need "
-            "to carry it around."
+            "coordinates). Returns a list of stages: `[{day, from_ref, "
+            "to_ref, from_lonlat, to_lonlat, slice_km, spur_km, km}]`.\n\n"
+            "Field semantics:\n"
+            "* `slice_km` — corridor-only distance for the day. This is "
+            "what the tool used against `target_km_per_day` when picking "
+            "cuts; treat it as the PLANNING quantity.\n"
+            "* `spur_km` — extra distance to reach the day's terminal "
+            "anchor's actual city center (bike-friendly corridor routing "
+            "bypasses city cores; overnight stops need to actually reach "
+            "downtown). Includes both the morning departure from the "
+            "PREVIOUS overnight and the evening arrival at THIS overnight.\n"
+            "* `km` — DISPLAY quantity: `slice_km + spur_km`. Total "
+            "distance the rider will actually pedal that day. Use this "
+            "in the itinerary you show the user.\n\n"
+            "Pass the same from_ref/to_ref you used with `route`; this "
+            "tool reads the last-computed polyline internally so you "
+            "never need to carry it around."
         ),
         "input_schema": {
             "type": "object",
@@ -635,16 +647,44 @@ def _tool_split_into_stages(inp: dict) -> dict:
                 best_d = d; best_i = i
         return cum[best_i] / 1000.0
 
+    def _closest_polyline_point(alon, alat) -> tuple[float, float]:
+        """Vertex (lon, lat) on the corridor polyline nearest to (alon,
+        alat). Used as the start point of the evening spur into a
+        day's terminal anchor."""
+        best_i = 0; best_d = float("inf")
+        for i, (px, py) in enumerate(poly):
+            d = (px - alon) ** 2 + (py - alat) ** 2
+            if d < best_d:
+                best_d = d; best_i = i
+        return poly[best_i][0], poly[best_i][1]
+
     stages = []
     prev_anchor = _nearest_anchor(poly[0][0], poly[0][1])
     prev_km_actual = _km_at_nearest_polyline_vertex(prev_anchor[2], prev_anchor[3]) \
                      if prev_anchor else 0.0
+    # Record the cut point on the polyline where each day ends. The
+    # cut points are NOT the anchor centers — they're where the bike
+    # corridor was that day (may be 1–5 km off-center for anchors on
+    # bypasses). Used below for the "spur into city center" pass.
+    cut_pts: list[tuple[float, float]] = []
     for day, km_at in enumerate(cut_km + [total_km], start=1):
         target_pt = _point_at_km(km_at)
         cur_anchor = _nearest_anchor(*target_pt)
         cur_km_actual = _km_at_nearest_polyline_vertex(cur_anchor[2], cur_anchor[3]) \
                         if cur_anchor else km_at
-        leg_km = max(0.0, cur_km_actual - prev_km_actual)
+        # `slice_km` = corridor-only distance for the day. Kept as the
+        # planning quantity (matches what `target_km_per_day` was
+        # measured against). `km` below is the DISPLAY quantity —
+        # includes morning + evening spurs so the user's "50 mi/day"
+        # target reflects what they'll actually pedal.
+        slice_km = max(0.0, cur_km_actual - prev_km_actual)
+        # The polyline point nearest the day's terminal anchor — this
+        # is where the corridor is when it passes the anchor, and the
+        # start of the evening spur into the anchor's center.
+        cur_cut = None
+        if cur_anchor is not None:
+            cur_cut = _closest_polyline_point(cur_anchor[2], cur_anchor[3])
+        cut_pts.append(cur_cut)
         stages.append({
             "day": day,
             "from_ref": prev_anchor[1] if prev_anchor else None,
@@ -653,10 +693,53 @@ def _tool_split_into_stages(inp: dict) -> dict:
             "to_ref": cur_anchor[1] if cur_anchor else None,
             "to_name": cur_anchor[0] if cur_anchor else None,
             "to_lonlat": [cur_anchor[2], cur_anchor[3]] if cur_anchor else list(target_pt),
-            "km": round(leg_km, 1),
+            "slice_km": round(slice_km, 1),
         })
         prev_anchor = cur_anchor
         prev_km_actual = cur_km_actual
+
+    # Second pass: attach evening spurs (this day's corridor →
+    # this day's `to_ref` city center) and morning spurs (previous
+    # day's `to_ref` city center → today's polyline entry). The
+    # morning spur is just the previous day's evening spur reversed,
+    # so we only compute the SPT walk once per intermediate overnight.
+    #
+    # First and last stages skip their outer spur because the whole-
+    # trip polyline naturally starts and ends at the origin/dest
+    # anchor's snap_vertex (~= city center already).
+    evening_spurs: list[dict] = []
+    for i, stage in enumerate(stages):
+        is_last = (i == len(stages) - 1)
+        cut = cut_pts[i]
+        to_ref = stage["to_ref"]
+        if is_last or to_ref is None or cut is None:
+            evening_spurs.append({"polyline": [], "added_km": 0.0})
+            continue
+        ci = prof.city_idx_by_ref.get(to_ref)
+        if ci is None:
+            evening_spurs.append({"polyline": [], "added_km": 0.0})
+            continue
+        spur = trunk_router.spur_to_anchor_center(
+            DEFAULT_PROFILE, int(ci), cut[0], cut[1])
+        evening_spurs.append({
+            "polyline": spur["polyline"],
+            "added_km": spur["added_km"],
+        })
+    for i, stage in enumerate(stages):
+        evening = evening_spurs[i]
+        # Morning spur = previous day's evening spur, reversed.
+        if i == 0:
+            morning = {"polyline": [], "added_km": 0.0}
+        else:
+            prev_ev = evening_spurs[i - 1]
+            morning = {
+                "polyline": list(reversed(prev_ev["polyline"])),
+                "added_km": prev_ev["added_km"],
+            }
+        stage["spur_start"] = morning["polyline"]
+        stage["spur_end"]   = evening["polyline"]
+        stage["spur_km"]    = round(morning["added_km"] + evening["added_km"], 1)
+        stage["km"]         = round(stage["slice_km"] + stage["spur_km"], 1)
     return {"total_km": round(total_km, 1), "n_days": n_days, "stages": stages}
 
 
