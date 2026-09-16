@@ -802,6 +802,10 @@ def route(
             arr_ab, next_idx_ab = trunk_ab
             trunk_vids = arr_ab["vid"]
             stitched = False
+            # Best salvage candidate across stitch_city attempts,
+            # in case the primary parent walk fails for every one.
+            # Used only if no stitch_city succeeded via primary walk.
+            best_salvage: dict | None = None
             for stitch_city in (int(a1), int(chain[0])):
                 fm_start_vid = _snap_coord_to_spt(
                     profile, stitch_city, start[0], start[1],
@@ -837,10 +841,46 @@ def route(
                         break
                     i = p
                 if trunk_entry_vid < 0:
+                    # Primary parent walk terminated at an SPT seed
+                    # without hitting the target trunk. Compute a
+                    # salvage candidate for this stitch_city: the
+                    # trunk vertex geographically closest to where
+                    # the walk ended. Track it in `best_salvage` but
+                    # don't apply yet — we want the MINIMUM bridge
+                    # across all stitch_city attempts (some anchor's
+                    # SPT might overlap the trunk far better than
+                    # another's). Falls through to `continue` for
+                    # this stitch_city, then the salvage is applied
+                    # after the loop if no primary walk succeeded.
+                    end_coord = spt_coords_arr[i]
+                    lat_a = math.radians(float(end_coord[1]))
+                    lat_v = np.radians(arr_ab["lat"].astype(np.float64))
+                    lon_d = np.radians(
+                        arr_ab["lon"].astype(np.float64)
+                        - float(end_coord[0])
+                    )
+                    hav = (np.sin((lat_v - lat_a) / 2) ** 2
+                           + math.cos(lat_a) * np.cos(lat_v)
+                           * np.sin(lon_d / 2) ** 2)
+                    best = int(np.argmin(hav))
+                    salvage_bridge_m = float(
+                        2 * 6_371_000.0 * np.arcsin(np.sqrt(hav[best])))
+                    if (best_salvage is None
+                            or salvage_bridge_m < best_salvage["bridge_m"]):
+                        best_salvage = {
+                            "bridge_m":         salvage_bridge_m,
+                            "trunk_vid":        int(arr_ab["vid"][best]),
+                            "trunk_pos":        best,
+                            "stitch_positions": list(stitch_positions),
+                            "spt_coords":       spt_coords_arr,
+                        }
                     continue
                 # Emit stitch coords (parent walk up to the trunk entry).
                 # Drop the final one because the trunk walk emits it as
-                # its first vertex — avoid duplicate.
+                # its first vertex — avoid duplicate. For salvage, the
+                # last SPT vertex isn't the trunk entry, so we lose
+                # its coord in the polyline but the missing point is
+                # < 500 m from the trunk entry — invisible at map scale.
                 for spos in stitch_positions[:-1]:
                     c = spt_coords_arr[spos]
                     coords.append([float(c[0]), float(c[1])])
@@ -851,6 +891,29 @@ def route(
                 )
                 stitched = True
                 break
+
+            if not stitched and best_salvage is not None:
+                # No primary walk succeeded for either stitch_city.
+                # Use the minimum-bridge salvage candidate we recorded.
+                # ~500 m keeps the polyline visually continuous;
+                # anything up to ~30 km is still WAY better than the
+                # `_last_mile` LCA overshoot which produced 92 km
+                # backward loops. Above 30 km we punt to `_last_mile`
+                # (which historically has produced non-catastrophic
+                # small loops rather than headline-worthy ones).
+                SALVAGE_MAX_BRIDGE_M = 30_000.0
+                if best_salvage["bridge_m"] <= SALVAGE_MAX_BRIDGE_M:
+                    for spos in best_salvage["stitch_positions"][:-1]:
+                        c = best_salvage["spt_coords"][spos]
+                        coords.append([float(c[0]), float(c[1])])
+                    trunk_entry_vid = best_salvage["trunk_vid"]
+                    trunk_entry_pos = best_salvage["trunk_pos"]
+                    chain_terminus_vid = trunk_entry_vid
+                    chain_terminus_coord = (
+                        float(arr_ab["lat"][trunk_entry_pos]),
+                        float(arr_ab["lon"][trunk_entry_pos]),
+                    )
+                    stitched = True
 
             if not stitched:
                 # Fallback to the prior bidirectional-LCA stitch. Can
