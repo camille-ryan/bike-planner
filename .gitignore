@@ -18,6 +18,11 @@
 /pgrouting/leithagebirge_breakdown.py
 /pgrouting/test_seeding.py
 
+# Eval outputs — regenerate with eval/run_eval.py + eval/judge.py.
+# Committing the JSONLs would bloat diffs (each run is ~a MB of text)
+# and would tempt readers to interpret one stale run as authoritative.
+/analysis/data/
+
 # Python
 __pycache__/
 *.pyc

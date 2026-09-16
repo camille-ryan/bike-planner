@@ -26,9 +26,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Python syntax check (api + pgrouting)
+      - name: Python syntax check (api + pgrouting + eval + mcp)
         run: |
-          find api pgrouting -name '*.py' -print0 \
+          find api pgrouting eval mcp_server -name '*.py' -print0 \
             | xargs -0 -n 32 python -m py_compile
       - name: Set up Node for JS syntax check
         uses: actions/setup-node@v4

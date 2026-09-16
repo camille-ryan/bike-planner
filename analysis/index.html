@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Bike-planner eval dashboard</title>
+<link rel="stylesheet" href="style.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>Bike-planner LLM eval</h1>
+  <p>
+    Gold-prompt suite → SSE chat replays → Sonnet-judged rubric scores.
+    All data is static; regenerate with
+    <code>python3 eval/run_eval.py</code> then
+    <code>python3 eval/judge.py</code>.
+  </p>
+  <p class="counts" id="counts"></p>
+</header>
+
+<section>
+  <h2>Rubric scores per prompt (0–5)</h2>
+  <p class="hint">
+    Mean across repeats. Empty axes mean the judge couldn't score
+    (typically a transport error).
+  </p>
+  <div class="chart-wrap"><canvas id="chart-rubric"></canvas></div>
+</section>
+
+<section>
+  <h2>Wall-clock time and tool-call count</h2>
+  <p class="hint">
+    Per prompt, mean across repeats. Not all prompts should use the
+    same number of tools — the small ones test specific tools; the
+    flagship exercises the full loop.
+  </p>
+  <div class="chart-wrap"><canvas id="chart-wall"></canvas></div>
+  <div class="chart-wrap"><canvas id="chart-tools"></canvas></div>
+</section>
+
+<section>
+  <h2>Per-run details</h2>
+  <p class="hint">Click a row to expand the rubric-axis breakdown.</p>
+  <table id="runs">
+    <thead>
+      <tr><th>Prompt</th><th>Run</th><th>Wall (s)</th><th>Tools</th>
+          <th>Mean score</th><th>Error?</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<footer>
+  <p>Source data: <code>analysis/data/traces.jsonl</code> and
+    <code>analysis/data/scores.jsonl</code>.
+    Charts rendered client-side via Chart.js.</p>
+</footer>
+
+<script src="dashboard.js"></script>
+</body>
+</html>

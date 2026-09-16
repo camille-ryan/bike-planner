@@ -1,0 +1,103 @@
+# Benchmark suite for the bike-planner /chat endpoint.
+#
+# `flagship`: one large open-ended plan modelled on the user's real
+# Graz→Copenhagen tour. This is the hero prompt — every capability
+# (routing, corridor stations, direct-rail verification, staged
+# itinerary) has to land or the plan fails as a whole.
+#
+# `fast`: 6 smaller prompts that isolate one capability each. Cheap to
+# repeat, useful for regression detection.
+#
+# `repeats` per prompt: how many independent runs to record. Small
+# prompts get 3× for variance; the flagship gets 1× because it's
+# expensive and highly deterministic on the tool-call skeleton (the
+# variance is in the narrative around it, which the judge weighs less).
+#
+# `judge_rubric` is scored 0–5 on each axis by a Sonnet judge; see
+# `judge.py`. A judge cannot see any tool internals — it only sees the
+# user prompt, the final assistant text, and a short tool-call summary.
+
+flagship:
+  - id: graz_to_cph_50d
+    repeats: 1
+    prompt: |
+      Plan a bike tour from Graz to Copenhagen over 50 days. Every
+      overnight must be reachable by non-transfer train (a direct train
+      from either Graz or Copenhagen, or a major hub on the corridor).
+      Ride 50 miles/day preferred, up to 80 miles if necessary. Detour
+      to nearby major cities and spend 2-3 days in each.
+    judge_rubric:
+      - axis: coverage
+        prompt: Does the plan cover roughly 50 days end-to-end (Graz through to Copenhagen)?
+      - axis: rail_accessibility
+        prompt: For each overnight, is direct-train reachability explicitly established (either from Graz, from Copenhagen, or from a named corridor hub)? Vague claims of "trains run nearby" without a hub don't count.
+      - axis: distance_discipline
+        prompt: Do daily distances stay near the 50-mile target and never exceed the 80-mile cap? Occasional 55–70 mile days are fine; 90+ isn't.
+      - axis: interest
+        prompt: Does the plan detour to nearby major cities and allocate 2–3 days in each, rather than sprinting between random villages?
+      - axis: grounding
+        prompt: Does the plan cite specific anchor names, real distances, and station names that come from tools, or does it invent places that don't sound like real GTFS entries?
+
+fast:
+  - id: graz_wien_route
+    repeats: 3
+    prompt: Give me a bike route from Graz to Wien. Just the route — no daily stages.
+    judge_rubric:
+      - axis: correctness
+        prompt: Are the two endpoints resolved to Graz and Wien anchors, and is a total km distance reported?
+      - axis: brevity
+        prompt: Is the answer scoped to just the route (no daily breakdown, no station-hunting, no unrequested planning)?
+
+  - id: prague_rail_partner_plan
+    repeats: 3
+    prompt: |
+      I'm biking Praha → Wien over 5 days, ~80 km/day. My partner
+      meets me each evening by train. Which overnights are best?
+    judge_rubric:
+      - axis: rail_accessibility
+        prompt: Does every proposed overnight get associated with a rail-served station and enough context to trust the meet (n_routes_rail or named station)?
+      - axis: distance_discipline
+        prompt: Do daily stages average ~80 km without wild swings?
+      - axis: grounding
+        prompt: Are the anchor and station names real (not invented)?
+
+  - id: direct_train_check
+    repeats: 3
+    prompt: |
+      Is there a direct train from Graz to Salzburg? If yes, roughly
+      how many. If no, what's the closest transfer point?
+    judge_rubric:
+      - axis: uses_direct_rail_tool
+        prompt: Does the assistant explicitly check direct rail service (not just claim knowledge), or does it hallucinate the answer from world knowledge?
+      - axis: correctness
+        prompt: Given that ÖBB Railjet and IC services run Graz↔Salzburg via Bruck an der Mur (with an on-train mode of "direct" that our tool may or may not detect), does the answer align with what the tool actually returned?
+
+  - id: hamburg_berlin_pois
+    repeats: 3
+    prompt: |
+      Route Hamburg → Berlin by bike. Along the way, list 6–8 water
+      or viewpoint POIs I could stop at.
+    judge_rubric:
+      - axis: route_computed
+        prompt: Is a Hamburg→Berlin bike route computed with a total km distance?
+      - axis: pois_along_route
+        prompt: Are 6–8 POIs listed that come from `pois_along_route` (not `pois_near_anchor`, which would only cover the two endpoints)?
+
+  - id: reformat_no_retool
+    repeats: 3
+    prompt: |
+      For this hypothetical plan you just made — reformat as a
+      markdown table with columns Day, From, To, Km, Overnight.
+      (Assume the last turn already produced a 5-day plan Graz→Wien
+      with overnights Bruck, Semmering, Wr. Neustadt, Mödling, Wien.)
+    judge_rubric:
+      - axis: no_tool_replay
+        prompt: Does the assistant reformat without calling routing/station tools again? Calling zero tools is the win condition; calling any tool is a fail.
+
+  - id: unreachable_endpoint
+    repeats: 3
+    prompt: |
+      Route from Reykjavik to Tallinn by bike, 7 days.
+    judge_rubric:
+      - axis: honest_failure
+        prompt: Does the assistant recognize both endpoints are outside coverage (Austria, Czechia, Germany, Denmark) and say so, rather than pretending to route?

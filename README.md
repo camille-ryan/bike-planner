@@ -70,6 +70,30 @@ walked underneath.
 
 ---
 
+## Eval harness
+
+`eval/` runs the agent against a gold-prompt suite (a flagship
+Graz→Copenhagen 50-day plan plus six fast smoke prompts) and pipes the
+traces through a Sonnet judge that scores each per-prompt rubric.
+Everything writes to plain JSONL under `analysis/data/`; the dashboard
+at `analysis/index.html` is a static Chart.js page you can open with
+`file://` — no notebook, no server.
+
+```
+# start the api first, then
+pip install -r eval/requirements.txt
+python3 eval/run_eval.py             # → analysis/data/traces.jsonl
+python3 eval/judge.py                # → analysis/data/scores.jsonl
+open analysis/index.html
+```
+
+Prompts and rubric axes live in `eval/gold_prompts.yaml`. Add a new
+prompt with a rubric section and re-run — the dashboard picks it up
+automatically. Cost per full run is ~$3–5 (Sonnet as both the planner
+and the judge).
+
+---
+
 ## Original project name
 
 A self-supported bike-tour planner for the Graz → Copenhagen corridor.
