@@ -44,6 +44,7 @@ import psycopg
 from scipy.spatial import cKDTree
 
 from . import db as db_mod
+from .local_dijkstra import local_dijkstra_to_targets
 from .settings import SPT_DIR
 
 
@@ -893,14 +894,15 @@ def route(
                 break
 
             if not stitched and best_salvage is not None:
-                # No primary walk succeeded for either stitch_city.
-                # Use the minimum-bridge salvage candidate we recorded.
-                # ~500 m keeps the polyline visually continuous;
-                # anything up to ~30 km is still WAY better than the
-                # `_last_mile` LCA overshoot which produced 92 km
-                # backward loops. Above 30 km we punt to `_last_mile`
-                # (which historically has produced non-catastrophic
-                # small loops rather than headline-worthy ones).
+                # Primary: min-bridge salvage across stitch_city
+                # attempts (empirically picks a trunk vertex with a
+                # clean `succ`-chain toward the frontier). Local
+                # Dijkstra was tried but for trunks built around
+                # wetland detours (Vetschau→Lübbenau round the
+                # Spreewald) it picks the cheapest-to-reach trunk
+                # vertex, whose succ chain then loops back through
+                # the source area. Straight-line salvage bridges up
+                # to 30 km — visible but bounded — win here.
                 SALVAGE_MAX_BRIDGE_M = 30_000.0
                 if best_salvage["bridge_m"] <= SALVAGE_MAX_BRIDGE_M:
                     for spos in best_salvage["stitch_positions"][:-1]:
@@ -914,6 +916,36 @@ def route(
                         float(arr_ab["lon"][trunk_entry_pos]),
                     )
                     stitched = True
+
+            if not stitched:
+                # Salvage wasn't available or its bridge exceeded 30 km.
+                # Fall back to the runtime bounded local Dijkstra on
+                # the road-graph CSR — the "unpruned-CSR local-Dijkstra
+                # bridge" the module docstring TODO'd. Loads per-1°
+                # cell edge files at query time; no straight-line
+                # stitches. Not the primary because for some pruned
+                # trunks it picks a shortest-to-reach entry whose
+                # succ-chain loops back through source.
+                dijk = local_dijkstra_to_targets(
+                    profile,
+                    float(start[0]), float(start[1]),
+                    int(start_vid),
+                    arr_ab["vid"],
+                    max_cost=20_000.0,
+                )
+                if dijk is not None:
+                    dijk_poly, reached_vid = dijk
+                    for c in dijk_poly[1:-1]:
+                        coords.append([float(c[0]), float(c[1])])
+                    tpos = int(np.searchsorted(arr_ab["vid"], reached_vid))
+                    if (tpos < len(arr_ab)
+                            and int(arr_ab["vid"][tpos]) == reached_vid):
+                        chain_terminus_vid = reached_vid
+                        chain_terminus_coord = (
+                            float(arr_ab["lat"][tpos]),
+                            float(arr_ab["lon"][tpos]),
+                        )
+                        stitched = True
 
             if not stitched:
                 # Fallback to the prior bidirectional-LCA stitch. Can
