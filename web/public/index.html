@@ -12,64 +12,39 @@
     <aside id="sidebar">
       <header>
         <h1>Bike Routing</h1>
-        <p class="subtitle">Graz → Copenhagen tour planner</p>
+        <p class="subtitle">Graz → Copenhagen tour planner · AI-native</p>
+        <p class="hint">Ask the planner on the right. This panel toggles debug &amp; inspection overlays for what the router sees under the hood.</p>
       </header>
 
-      <section id="instructions">
-        <p>Type <strong>a city name</strong> (autocomplete) or <strong>lon,lat</strong> or click <strong>📍</strong> then a map point. <em>Press Enter or click Route. Add midpoints to plan through specific places — a single server-side chain-Dijkstra handles the whole tour.</em></p>
-      </section>
-
-      <section id="controls">
-        <div class="waypoint-row" data-role="start">
-          <span class="wp-label start">S</span>
-          <input type="text" class="wp-input" placeholder="lon,lat" />
-          <button class="wp-pick" title="Pick from map">📍</button>
-        </div>
-        <div id="midpoints"></div>
-        <div class="waypoint-row" data-role="end">
-          <span class="wp-label end">E</span>
-          <input type="text" class="wp-input" placeholder="lon,lat" />
-          <button class="wp-pick" title="Pick from map">📍</button>
-        </div>
-        <div class="row">
-          <button id="add-midpoint" class="secondary">+ Midpoint</button>
-        </div>
-        <div class="row">
-          <button id="route-btn" disabled>Route</button>
-          <button id="clear-btn">Clear</button>
-        </div>
-        <p class="hint">Routing runs all profiles in parallel and overlays the result. Profiles: <span style="color:#888">direct</span>, <span style="color:#d4623a">views</span>.</p>
-      </section>
-
       <section id="layers">
-        <h2>POI overlays</h2>
+        <h2>Overlays</h2>
+        <p class="hint" style="margin-bottom:0.4rem;">Points of interest — lazy-loaded as you pan (max 500 in view).</p>
         <label class="checkbox"><input type="checkbox" data-cat="viewpoint" />Viewpoints</label>
         <label class="checkbox"><input type="checkbox" data-cat="lodging" />Lodging</label>
         <label class="checkbox"><input type="checkbox" data-cat="food" />Food</label>
         <label class="checkbox"><input type="checkbox" data-cat="bike_service" />Bike service</label>
         <label class="checkbox"><input type="checkbox" data-cat="water" />Drinking water</label>
-        <p class="hint">POIs load while you pan / zoom (max 500 in view).</p>
       </section>
 
       <section id="biome-section">
-        <h2>Map overlays</h2>
+        <h2>Map layers</h2>
         <label class="checkbox"><input type="checkbox" id="show-biome" />Biome / ecoregion (Resolve 2017)</label>
-        <label class="checkbox"><input type="checkbox" id="show-rail-lines" />Passenger rail: lines (OSM track geometry, filtered to served by GTFS)</label>
-        <label class="checkbox"><input type="checkbox" id="show-rail-stations" />Passenger rail: stations (GTFS-served only)</label>
-        <label class="checkbox"><input type="checkbox" id="show-hillshade" />Terrain hillshade (AWS Open Data, terrarium-encoded)</label>
-        <p class="hint">Biome: ecoregion polygons coloured by biome. Click for ecoregion name.</p>
+        <label class="checkbox"><input type="checkbox" id="show-rail-lines" />Passenger rail: lines</label>
+        <label class="checkbox"><input type="checkbox" id="show-rail-stations" />Passenger rail: stations</label>
+        <label class="checkbox"><input type="checkbox" id="show-hillshade" />Terrain hillshade</label>
+        <p class="hint">Biome: click a polygon for its ecoregion name. Rail: GTFS-served stations cross-checked against OSM railway=rail geometry (see task&nbsp;#78).</p>
       </section>
 
       <section id="debug-section">
-        <h2>Debug overlays</h2>
+        <h2>Router internals</h2>
         <label class="checkbox">
           <input type="checkbox" id="show-city-graph" />
-          Show city graph (chain edges + anchors; click anchor → its polygon)
+          Show city graph <span class="hint" style="margin-left:0.4em;">chain edges + anchors; click for polygon</span>
           <span id="city-graph-status" class="hint" style="margin-left:0.5em;"></span>
         </label>
         <label class="checkbox">
           <input type="checkbox" id="show-route-data" />
-          Show route data (per-anchor polygons + walked paired trunks)
+          Show route data <span class="hint" style="margin-left:0.4em;">SPT polygons + walked paired trunks for the current chat plan</span>
           <span id="route-data-status" class="hint" style="margin-left:0.5em;"></span>
         </label>
         <label class="checkbox" style="margin-left:1.5em;">
@@ -91,14 +66,13 @@
             <option value="2000000">2M (all)</option>
           </select>
         </label>
-        <p class="hint">City graph: shows the chain backbone across every anchor (not just the route). Anchor click surfaces that anchor's polygon. Route data: for the current route only — outlines every route anchor's polygon and overlays the paired trunks the router walked, so you can see whether trunk vertices track the corridor.</p>
       </section>
 
       <!-- Hidden legacy inputs kept so existing JS event listeners
            (show-way-graph-edges, show-way-graph-nodes,
            show-way-graph-polygons, show-route-spts, show-route-trunks,
            trunk-viz-mode) find their targets. Wired programmatically by
-           the new consolidated toggles above. -->
+           the consolidated toggles above. -->
       <div style="display:none">
         <input type="checkbox" id="show-way-graph-edges" />
         <input type="checkbox" id="show-way-graph-nodes" />
@@ -114,17 +88,11 @@
 
       <section id="scenicness-section">
         <h2>Scenicness signals</h2>
-        <p class="hint">Per-edge rasters produced by <code>scenicness-bake</code>. Each layer is a single PNG image overlay covering the bbox (currently the Graz↔Wien corridor). Toggle on demand — PNGs are tens of MB. Families:</p>
-        <ul class="hint">
-          <li><strong>Forest</strong> (green): <code>forest_local</code> 200 m disc, <code>forest_wide</code> 2 km disc.</li>
-          <li><strong>Terrain</strong>: <code>local_relief</code> 500 m σ, <code>regional_relief</code> 10 km σ, <code>distance_to_drama</code> meters to nearest cell with local_relief ≥ 80 m, <code>view_dominance</code> = DEM − 2 km Gaussian (ridge prominence; ±).</li>
-          <li><strong>Water</strong> (blue): <code>water_local</code> / <code>water_wide</code> = lakes &amp; wide-river polygons. <code>sea_local</code> / <code>sea_wide</code> = ocean/sea (separated so the cost function can weight ocean vistas above lake vistas). <code>waterway_local</code> = 200 m disc of buffered river/canal/stream lines. <code>waterway_along_edge</code> = fraction of <em>this edge</em> that literally runs inside a 10 m-buffered waterway polygon — the "Mur cycle path" detector.</li>
-          <li><strong>Wetland</strong> (teal): <code>wetland_local</code> = 200 m disc of <code>natural=wetland</code> polygons (marsh, reedbed, bog, saltmarsh, …).</li>
-        </ul>
+        <p class="hint">Per-edge rasters from <code>scenicness-bake</code>. One PNG image overlay per signal covering the current bbox (Graz↔Wien corridor). Toggle on demand — PNGs are tens of MB.</p>
         <div id="scenicness-toggles"><em class="hint">Loading manifest…</em></div>
       </section>
 
-      <section id="results"></section>
+      <div id="status-hint" class="hint" style="min-height:1.2em;"></div>
 
       <footer>
         <p class="hint">api at <code>/api/</code> · routing via <code>/api/trunk/route</code></p>
@@ -133,7 +101,6 @@
 
     <main>
       <div id="map"></div>
-      <div id="elevation"></div>
     </main>
 
     <aside id="chat">
@@ -160,7 +127,7 @@
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <!-- marked.js: markdown → HTML renderer for assistant messages in chat pane -->
   <script src="https://cdn.jsdelivr.net/npm/marked@14.1.3/marked.min.js"></script>
-  <script src="app.js?v=20260916a"></script>
+  <script src="app.js?v=20260916b"></script>
   <script src="chat.js?v=20260916a"></script>
 </body>
 </html>

@@ -1,23 +1,17 @@
-// Bike-routing front-end. Single-file JS, vanilla (no framework).
-// Talks to the FastAPI service via the /api/ prefix proxied by nginx.
+// Bike-routing front-end. AI-native: the chat pane on the right is the
+// only route-entry surface. This file owns the map + debug/inspection
+// overlays; chat.js talks to the same map instance via window.map and
+// synthesizes route state into window.sidebarState so the debug viz
+// keeps working after a chat-driven plan.
 
 const API = "/api";
-
-const PROFILES = ["views"];
-const PROFILE_COLORS = {
-  views: "#d4623a",
-};
 
 // --- map setup ---------------------------------------------------------
 
 const map = new maplibregl.Map({
   container: "map",
-  // OpenFreeMap "positron" — free, no API key, no auth, hosted
-  // vector tiles based on planet OSM. Replaces the previous CartoDB
-  // raster tiles (some networks were seeing "api key required"
-  // errors from Carto's CDN). Positron is the light neutral style
-  // designed for data overlays; alternatives are "bright" and
-  // "liberty". See https://openfreemap.org for style previews.
+  // OpenFreeMap "positron" — free, no API key, hosted vector tiles
+  // based on planet OSM. See https://openfreemap.org.
   style: "https://tiles.openfreemap.org/styles/positron",
   center: [13.5, 51],
   zoom: 5,
@@ -25,113 +19,23 @@ const map = new maplibregl.Map({
 });
 map.addControl(new maplibregl.NavigationControl(), "top-right");
 map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "bottom-left");
-// Expose the map instance so companion scripts (chat.js) can add
+// Expose the map so chat.js (a separate script) can add its own
 // overlay sources/layers. Top-level `const` in a plain <script> is
 // NOT attached to window automatically.
 window.map = map;
-// Chat.js piggybacks on the sidebar's route-shape so paired-SPT viz
-// works after a chat-driven route too (task-#1 phase 1a). Anything
-// chat.js needs to poke into is exposed here.
+// Chat.js writes route state here so the paired-SPT debug viz
+// (`Show route data`) keeps working after a chat-driven route.
 Object.defineProperty(window, "sidebarState", { get: () => state });
 
 // --- state -------------------------------------------------------------
 
 const state = {
-  // Each waypoint: { role: 'start'|'mid'|'end', coord: [lon, lat]|null,
-  //                  input: HTMLInputElement, row: HTMLElement }
-  // Routes pairwise; midpoints chain N legs.
-  waypoints: [],
-  pickArmed: null,    // waypoint expecting next map click, or null
-  // routesByProfile: { profile: GeoJSON Feature } — one merged
-  // multi-leg route per profile. Cleared on Clear; populated by
-  // routeNow with the parallel /trunk/route results.
+  // routesByProfile: { profile: GeoJSON Feature } — populated by
+  // chat.js after every `route` tool call. Read by loadRouteSpts /
+  // loadRouteTrunks in the debug overlays below.
   routesByProfile: {},
-  routeReqId: 0,      // increments per routeNow; stale responses are discarded
   poiMarkers: { viewpoint: [], lodging: [], food: [], bike_service: [], water: [] },
-  waypointMarkers: [],
 };
-
-// --- map sources / layers (initialized once map loads) -----------------
-
-map.on("load", () => {
-  // tolerance: 0 disables MapLibre's Douglas-Peucker simplification of
-  // the route geometry at low zoom — the default 0.375 px tolerance
-  // drops vertices aggressively at zoom <10, which makes a long
-  // multi-leg route look like a series of disjoint segments. The route
-  // is at most ~10k points; the memory cost of keeping every vertex at
-  // every zoom is negligible.
-  map.addSource("routes-multi", {
-    type: "geojson", data: emptyFC(), tolerance: 0,
-  });
-  map.addLayer({
-    id: "routes-multi-line",
-    type: "line",
-    source: "routes-multi",
-    paint: {
-      "line-color": [
-        "match", ["get", "profile"],
-        "views",  PROFILE_COLORS.views,
-        "#aaa",
-      ],
-      "line-width": 4,
-      "line-opacity": 0.85,
-    },
-  });
-
-  // Bridges: any consecutive-coord segment > BRIDGE_MIN_M is drawn as
-  // a dashed cyan line on top of the route so gaps in trunk coverage
-  // are visually obvious. Detected client-side by scanning the
-  // returned polyline (server-side `bridges` gives distances but not
-  // coords).
-  // Ferry legs are legitimate route segments (the ferry crossing
-  // itself) — render as a solid cyan line, treated visually as part of
-  // the route.  Routing gaps are chain-handoff failures the paired
-  // trunk should have covered — render red, dashed, thick, with red
-  // circles at the endpoints so they jump out on the map as bugs.
-  map.addSource("route-bridges-ferry", {
-    type: "geojson", data: emptyFC(), tolerance: 0,
-  });
-  map.addLayer({
-    id: "route-bridges-ferry-line",
-    type: "line",
-    source: "route-bridges-ferry",
-    paint: {
-      "line-color": "#22d3ee",
-      "line-width": 4,
-      "line-opacity": 0.95,
-    },
-  });
-  map.addSource("route-bridges-gap", {
-    type: "geojson", data: emptyFC(), tolerance: 0,
-  });
-  map.addLayer({
-    id: "route-bridges-gap-line",
-    type: "line",
-    source: "route-bridges-gap",
-    paint: {
-      "line-color": "#ef4444",
-      "line-width": 6,
-      "line-opacity": 1.0,
-      "line-dasharray": [2, 2],
-    },
-  });
-  // Endpoint markers on gaps so they're impossible to miss even
-  // when the dashed line runs over a busy basemap.
-  map.addSource("route-bridges-gap-pts", {
-    type: "geojson", data: emptyFC(), tolerance: 0,
-  });
-  map.addLayer({
-    id: "route-bridges-gap-pts-circle",
-    type: "circle",
-    source: "route-bridges-gap-pts",
-    paint: {
-      "circle-radius": 6,
-      "circle-color": "#ef4444",
-      "circle-stroke-color": "#fff",
-      "circle-stroke-width": 2,
-    },
-  });
-});
 
 // --- helpers -----------------------------------------------------------
 
@@ -148,508 +52,6 @@ async function api(path, params) {
   return r.json();
 }
 
-// --- waypoint inputs --------------------------------------------------
-//
-// Inputs are the source of truth. Map click only fires when a 📍 button
-// has been "armed" — otherwise clicks just hit the basemap and do
-// nothing for routing (anchor markers still handle their own clicks).
-
-function parseLonLat(s) {
-  const m = (s || "").trim().match(/^(-?\d+(?:\.\d+)?)[ ,;\t]+(-?\d+(?:\.\d+)?)$/);
-  if (!m) return null;
-  const a = +m[1], b = +m[2];
-  if (!isFinite(a) || !isFinite(b)) return null;
-  return [a, b];
-}
-
-function bindWaypoint(row, role) {
-  const wp = {
-    role,
-    coord: null,
-    // If set, this waypoint uses an anchor by ref instead of a raw
-    // lat/lon snap. Assigned by clicking an anchor while pick mode is
-    // armed; cleared as soon as the user types a coord into the input.
-    ref: null,
-    name: null,
-    input: row.querySelector(".wp-input"),
-    pickBtn: row.querySelector(".wp-pick"),
-    row,
-    // Autocomplete dropdown (task #48). Filled on typing.
-    dropdown: null,
-    dropdownTimer: null,
-    activeItem: -1,
-  };
-  wp.input.setAttribute("placeholder", "city name or lon,lat");
-  wp.input.setAttribute("autocomplete", "off");
-
-  // Dropdown container, absolutely-positioned under the input.
-  const dd = document.createElement("div");
-  dd.className = "wp-dropdown";
-  dd.style.display = "none";
-  row.appendChild(dd);
-  wp.dropdown = dd;
-
-  wp.input.addEventListener("input", () => {
-    // Typing a lat/lon overrides any picked-anchor ref for this slot.
-    const val = wp.input.value.trim();
-    const parsed = parseLonLat(val);
-    if (parsed) {
-      wp.ref = null;
-      wp.name = null;
-      wp.coord = parsed;
-      hideDropdown(wp);
-      refreshWaypointMarkers();
-      updateRouteButton();
-      return;
-    }
-    // Otherwise: fuzzy-search anchors and show dropdown.
-    wp.ref = null;
-    wp.name = null;
-    wp.coord = null;
-    updateRouteButton();
-    if (wp.dropdownTimer) clearTimeout(wp.dropdownTimer);
-    if (!val) { hideDropdown(wp); return; }
-    wp.dropdownTimer = setTimeout(() => fetchAndShowDropdown(wp, val), 120);
-  });
-  wp.input.addEventListener("keydown", (e) => {
-    const items = wp.dropdown.querySelectorAll(".wp-dd-item");
-    if (e.key === "Enter") {
-      if (wp.activeItem >= 0 && items[wp.activeItem]) {
-        e.preventDefault();
-        items[wp.activeItem].click();
-        return;
-      }
-      if (!document.getElementById("route-btn").disabled) {
-        routeNow();
-      }
-    } else if (e.key === "ArrowDown" && items.length) {
-      e.preventDefault();
-      wp.activeItem = (wp.activeItem + 1) % items.length;
-      renderDropdownHighlight(wp);
-    } else if (e.key === "ArrowUp" && items.length) {
-      e.preventDefault();
-      wp.activeItem = (wp.activeItem - 1 + items.length) % items.length;
-      renderDropdownHighlight(wp);
-    } else if (e.key === "Escape") {
-      hideDropdown(wp);
-    }
-  });
-  wp.input.addEventListener("blur", () => {
-    // Slight delay so a click on a dropdown item can register before hide.
-    setTimeout(() => hideDropdown(wp), 200);
-  });
-  wp.pickBtn.addEventListener("click", () => armPick(wp));
-  return wp;
-}
-
-async function fetchAndShowDropdown(wp, q) {
-  try {
-    const r = await fetch(`${API_BASE}/anchors/search?q=${encodeURIComponent(q)}&limit=10`);
-    if (!r.ok) { hideDropdown(wp); return; }
-    const d = await r.json();
-    renderDropdown(wp, d.results || []);
-  } catch (e) {
-    hideDropdown(wp);
-  }
-}
-
-function renderDropdown(wp, results) {
-  if (!results.length) { hideDropdown(wp); return; }
-  wp.dropdown.innerHTML = "";
-  wp.activeItem = -1;
-  for (const c of results) {
-    const item = document.createElement("div");
-    item.className = "wp-dd-item";
-    const country = c.country ? ` <span class="wp-dd-country">${c.country}</span>` : "";
-    const pop = c.population ? ` <span class="wp-dd-pop">${c.population.toLocaleString()}</span>` : "";
-    item.innerHTML = `<span class="wp-dd-name">${escapeHtml(c.name || "?")}</span>${country}${pop}`;
-    item.addEventListener("mousedown", (e) => {
-      // mousedown fires before input's blur; prevents hide race.
-      e.preventDefault();
-      pickDropdownItem(wp, c);
-    });
-    wp.dropdown.appendChild(item);
-  }
-  wp.dropdown.style.display = "block";
-}
-
-function renderDropdownHighlight(wp) {
-  const items = wp.dropdown.querySelectorAll(".wp-dd-item");
-  items.forEach((el, i) => el.classList.toggle("active", i === wp.activeItem));
-  if (wp.activeItem >= 0 && items[wp.activeItem]) {
-    items[wp.activeItem].scrollIntoView({ block: "nearest" });
-  }
-}
-
-function pickDropdownItem(wp, c) {
-  wp.ref = c.ref;
-  wp.name = c.name;
-  wp.coord = [c.lon, c.lat];
-  wp.input.value = c.name;
-  hideDropdown(wp);
-  refreshWaypointMarkers();
-  updateRouteButton();
-}
-
-function hideDropdown(wp) {
-  wp.dropdown.style.display = "none";
-  wp.dropdown.innerHTML = "";
-  wp.activeItem = -1;
-}
-
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, c => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
-}
-
-function armPick(wp) {
-  // Toggle off if same waypoint is clicked again.
-  for (const w of state.waypoints) w.pickBtn.classList.remove("armed");
-  if (state.pickArmed === wp) {
-    state.pickArmed = null;
-    map.getCanvas().style.cursor = "";
-    return;
-  }
-  state.pickArmed = wp;
-  wp.pickBtn.classList.add("armed");
-  map.getCanvas().style.cursor = "crosshair";
-}
-
-function disarmPick() {
-  if (!state.pickArmed) return;
-  state.pickArmed.pickBtn.classList.remove("armed");
-  state.pickArmed = null;
-  map.getCanvas().style.cursor = "";
-}
-
-map.on("click", (e) => {
-  if (!state.pickArmed) return;
-  const wp = state.pickArmed;
-  const lon = e.lngLat.lng, lat = e.lngLat.lat;
-  wp.coord = [lon, lat];
-  wp.input.value = `${lon.toFixed(5)},${lat.toFixed(5)}`;
-  disarmPick();
-  refreshWaypointMarkers();
-  updateRouteButton();
-});
-
-function addMidpoint(coord = null) {
-  const endIdx = state.waypoints.findIndex(w => w.role === "end");
-  if (endIdx < 0) return null;
-  const row = document.createElement("div");
-  row.className = "waypoint-row";
-  row.dataset.role = "mid";
-  row.innerHTML = `
-    <span class="wp-label mid">·</span>
-    <input type="text" class="wp-input" placeholder="lon,lat" />
-    <button class="wp-pick" title="Pick from map">📍</button>
-    <button class="wp-remove" title="Remove midpoint">✕</button>
-  `;
-  document.getElementById("midpoints").appendChild(row);
-  const wp = bindWaypoint(row, "mid");
-  state.waypoints.splice(endIdx, 0, wp);
-  row.querySelector(".wp-remove").addEventListener("click", () => removeWp(wp));
-  if (coord) {
-    wp.coord = coord;
-    wp.input.value = `${coord[0].toFixed(5)},${coord[1].toFixed(5)}`;
-  }
-  renumberMidpoints();
-  refreshWaypointMarkers();
-  updateRouteButton();
-  return wp;
-}
-
-function removeWp(wp) {
-  const i = state.waypoints.indexOf(wp);
-  if (i < 0) return;
-  if (state.pickArmed === wp) disarmPick();
-  state.waypoints.splice(i, 1);
-  wp.row.remove();
-  renumberMidpoints();
-  refreshWaypointMarkers();
-  updateRouteButton();
-}
-
-function renumberMidpoints() {
-  state.waypoints
-    .filter(w => w.role === "mid")
-    .forEach((w, i) => {
-      w.row.querySelector(".wp-label").textContent = String(i + 1);
-    });
-}
-
-function updateRouteButton() {
-  const allValid = state.waypoints.length >= 2 &&
-                   state.waypoints.every(w => w.coord);
-  document.getElementById("route-btn").disabled = !allValid;
-}
-
-function refreshWaypointMarkers() {
-  state.waypointMarkers.forEach(m => m.remove());
-  state.waypointMarkers = [];
-  let midNum = 0;
-  state.waypoints.forEach((w) => {
-    if (!w.coord) return;
-    let color, label;
-    if (w.role === "start")    { color = "#2c5"; label = "S"; }
-    else if (w.role === "end") { color = "#c52"; label = "E"; }
-    else                       { color = "#888"; label = String(++midNum); }
-    const el = document.createElement("div");
-    el.style.cssText = `width:22px;height:22px;border-radius:50%;background:${color};color:white;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:13px;border:2px solid white;box-shadow:0 1px 3px rgba(0,0,0,0.3);`;
-    el.textContent = label;
-    const m = new maplibregl.Marker({ element: el }).setLngLat(w.coord).addTo(map);
-    state.waypointMarkers.push(m);
-  });
-}
-
-document.getElementById("clear-btn").addEventListener("click", clearAll);
-document.getElementById("add-midpoint").addEventListener("click", () => addMidpoint());
-
-function clearAll() {
-  // Clear inputs but keep start/end rows; remove midpoints entirely.
-  for (const w of [...state.waypoints]) {
-    if (w.role === "mid") {
-      w.row.remove();
-    } else {
-      w.input.value = "";
-      w.coord = null;
-      w.ref = null;
-      w.name = null;
-    }
-  }
-  state.waypoints = state.waypoints.filter(w => w.role !== "mid");
-  disarmPick();
-  state.routesByProfile = {};
-  state.waypointMarkers.forEach(m => m.remove());
-  state.waypointMarkers = [];
-  if (map.getSource("routes-multi")) map.getSource("routes-multi").setData(emptyFC());
-  document.getElementById("results").innerHTML = "";
-  document.getElementById("elevation").innerHTML = "";
-  updateRouteButton();
-}
-
-// --- route ------------------------------------------------------------
-
-document.getElementById("route-btn").addEventListener("click", routeNow);
-
-async function routeNow() {
-  const valid = state.waypoints.filter(w => w.coord || w.ref);
-  if (valid.length < 2) return;
-  const legCount = valid.length - 1;
-  const myReqId = ++state.routeReqId;
-  setBusy(`Routing ${legCount} leg${legCount > 1 ? "s" : ""} × ${PROFILES.length} profiles…`);
-
-  // Multi-stop routing via task #48: ONE API call per profile passes
-  // all waypoints, with intermediates as `stops[]`. Server runs
-  // pairwise chain-Dijkstra internally and walks the merged chain
-  // end-to-end — a single first-mile stitch at start, single last-mile
-  // stitch at end, no per-waypoint bridges.
-  const first = valid[0], last = valid[valid.length - 1];
-  const intermediates = valid.slice(1, -1);
-  const results = await Promise.all(PROFILES.map(async (profile) => {
-    try {
-      const params = new URLSearchParams();
-      params.set("profile", profile);
-      if (first.ref) params.set("from_ref", first.ref);
-      else           params.set("from",     first.coord.join(","));
-      if (last.ref)  params.set("to_ref",   last.ref);
-      else           params.set("to",       last.coord.join(","));
-      for (const w of intermediates) {
-        // `stops` is a mixed list of refs and lon,lat strings preserving
-        // order — API detects lon,lat via the comma+float heuristic.
-        params.append("stops", w.ref || w.coord.join(","));
-      }
-      const r = await fetch(`${API_BASE}/trunk/route?${params.toString()}`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d = await r.json();
-      const route = d.route;
-      route.properties = route.properties || {};
-      route.properties.profile = profile;
-      return { profile, route };
-    } catch (e) {
-      return { profile, error: e.message };
-    }
-  }));
-  if (myReqId !== state.routeReqId) return;
-
-  state.routesByProfile = {};
-  for (const r of results) {
-    if (r.route) state.routesByProfile[r.profile] = r.route;
-  }
-  renderRoutes(results);
-}
-
-function mergeLegs(legs) {
-  // Concatenate coordinates; drop the first point of each leg after the
-  // first to avoid a duplicated vertex at the join. Sum gross_length_m
-  // and vertex_count; concat chain_names + chain_city_idx with dedup.
-  const coords = [];
-  let totalLen = 0;
-  let totalNodes = 0;
-  const cities = [];
-  const chainIdx = [];
-  const bridges = [];
-  for (const leg of legs) {
-    const lc = leg.geometry.coordinates;
-    if (coords.length > 0 && lc.length > 0) coords.push(...lc.slice(1));
-    else coords.push(...lc);
-    const lp = leg.properties || {};
-    totalLen += +lp.gross_length_m || 0;
-    totalNodes += +lp.vertex_count || 0;
-    const lcities = lp.chain_names || [];
-    const lidx    = lp.chain_city_idx || [];
-    for (let i = 0; i < lcities.length; i++) {
-      const c = lcities[i], ci = lidx[i];
-      if (cities[cities.length - 1] !== c) {
-        cities.push(c);
-        if (ci !== undefined) chainIdx.push(ci);
-      }
-    }
-    for (const b of (lp.bridges || [])) bridges.push(b);
-  }
-  return {
-    type: "Feature",
-    geometry: { type: "LineString", coordinates: coords },
-    properties: {
-      creator: "trunk-router",
-      chain_names: cities,
-      chain_city_idx: chainIdx,
-      gross_length_m: totalLen,
-      vertex_count: totalNodes,
-      leg_count: legs.length,
-      bridges,
-    },
-  };
-}
-
-// Minimum segment length (m) to classify a consecutive-coord jump
-// as a bridge. Trunk SPT vertex spacing varies wildly — dense-urban
-// stretches are ~10-30 m apart but long straight rural segments can
-// be 500-1000 m. Real corridor bridges (chain-pair joins, ferries,
-// first/last mile) are >2 km. 2000 m is above road jitter.
-const BRIDGE_MIN_M = 2000;
-
-function _hav(a, b) {
-  const R = 6_371_000;
-  const p1 = a[1] * Math.PI / 180, p2 = b[1] * Math.PI / 180;
-  const dp = (b[1] - a[1]) * Math.PI / 180;
-  const dl = (b[0] - a[0]) * Math.PI / 180;
-  const s = Math.sin(dp/2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl/2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(s));
-}
-
-function extractBridges(features) {
-  // Server tells us per-bridge kind + coords. Split into ferry_leg
-  // (legitimate ferry crossings — cyan) vs gap (routing failures the
-  // paired trunk should have covered — red). Fall back to a coord scan
-  // for older API responses that don't include from_lonlat/to_lonlat.
-  const ferry = [], gap = [];
-  for (const f of features) {
-    const bridges = f.properties?.bridges || [];
-    for (const b of bridges) {
-      if (b.skipped) continue;
-      const kind = b.kind || "gap";
-      const bin = kind === "ferry_leg" ? ferry : gap;
-      if (b.from_lonlat && b.to_lonlat) {
-        bin.push({
-          type: "Feature",
-          geometry: {
-            type: "LineString",
-            coordinates: [b.from_lonlat, b.to_lonlat],
-          },
-          properties: { distance_m: b.distance_m, kind, leg: b.leg,
-                        profile: f.properties?.profile },
-        });
-      }
-    }
-    if (!bridges.length || bridges.every(b => !b.from_lonlat)) {
-      // fallback: consecutive-coord scan (no ferry/gap info)
-      const coords = f.geometry.coordinates || [];
-      for (let i = 1; i < coords.length; i++) {
-        const d = _hav(coords[i-1], coords[i]);
-        if (d > BRIDGE_MIN_M) {
-          gap.push({
-            type: "Feature",
-            geometry: { type: "LineString",
-                        coordinates: [coords[i-1], coords[i]] },
-            properties: { distance_m: d, kind: "gap",
-                          profile: f.properties?.profile },
-          });
-        }
-      }
-    }
-  }
-  return { ferry, gap };
-}
-
-function renderRoutes(results) {
-  // results: [{profile, route?, error?}, …] in PROFILES order.
-  const features = PROFILES
-    .map(p => state.routesByProfile[p])
-    .filter(Boolean);
-  map.getSource("routes-multi").setData({
-    type: "FeatureCollection",
-    features,
-  });
-  const brs = extractBridges(features);
-  map.getSource("route-bridges-ferry").setData({
-    type: "FeatureCollection", features: brs.ferry,
-  });
-  map.getSource("route-bridges-gap").setData({
-    type: "FeatureCollection", features: brs.gap,
-  });
-
-  // Fit to the union bbox of every successful profile's geometry.
-  if (features.length > 0) {
-    let n = -90, s = 90, e = -180, w = 180;
-    for (const f of features) {
-      for (const c of f.geometry.coordinates) {
-        if (c[0] < w) w = c[0]; if (c[0] > e) e = c[0];
-        if (c[1] < s) s = c[1]; if (c[1] > n) n = c[1];
-      }
-    }
-    map.fitBounds([[w, s], [e, n]], { padding: 60, maxZoom: 13 });
-  }
-
-  // One result card per profile. Border color = profile color so the
-  // sidebar reads like a legend of the map lines.
-  const html = (results || []).map((r) => {
-    const color = PROFILE_COLORS[r.profile] || "#888";
-    if (r.error) {
-      return `<div class="route-card" style="border-left:4px solid ${color}">` +
-        `<div class="name" style="color:${color}">${r.profile}</div>` +
-        `<div class="stat" style="color:#a52"><span>error</span><span>${r.error}</span></div>` +
-        `</div>`;
-    }
-    const p = r.route.properties || {};
-    const km = fmtKm(+p.gross_length_m || 0);
-    const cities = (p.chain_names || []).join(" → ");
-    const brs = (p.bridges || []).filter(b => !b.skipped);
-    const nFerry = brs.filter(b => b.kind === "ferry_leg").length;
-    const nGap   = brs.filter(b => (b.kind || "gap") === "gap").length;
-    return `<div class="route-card" style="border-left:4px solid ${color}">
-      <div class="name" style="color:${color}">${r.profile}</div>
-      <div class="stat"><span>distance</span><span>${km}</span></div>
-      <div class="stat"><span>nodes</span><span>${(+p.vertex_count || 0).toLocaleString()}</span></div>
-      ${nFerry ? `<div class="stat"><span>ferry legs</span><span style="color:#22d3ee">${nFerry}</span></div>` : ""}
-      ${nGap   ? `<div class="stat"><span>gaps</span><span style="color:#ef4444">${nGap}</span></div>` : ""}
-      ${cities ? `<div class="stat" style="grid-template-columns: 1fr;"><span><em>${cities}</em></span></div>` : ""}
-    </div>`;
-  }).join("");
-  document.getElementById("results").innerHTML = html;
-}
-
-function lineBbox(coords) {
-  let n = 90, s = -90, e = -180, w = 180;
-  for (const c of coords) {
-    if (c[0] < w) w = c[0];
-    if (c[0] > e) e = c[0];
-    if (c[1] < n) n = c[1];
-    if (c[1] > s) s = c[1];
-  }
-  return [[w, n], [e, s]];
-}
 
 // --- POI overlay -------------------------------------------------------
 
@@ -719,7 +121,7 @@ async function ensureBiomeLayers() {
         "fill-color": ["get", "COLOR_BIO"],
         "fill-opacity": 0.30,
       },
-    }, "routes-multi-line");
+    });
     map.addLayer({
       id: "ecoregions-outline",
       type: "line",
@@ -729,7 +131,7 @@ async function ensureBiomeLayers() {
         "line-width": 0.6,
         "line-opacity": 0.8,
       },
-    }, "routes-multi-line");
+    });
     map.on("click", "ecoregions-fill", (e) => {
       const f = e.features?.[0];
       if (!f) return;
@@ -920,8 +322,9 @@ function ensureHillshade() {
       "hillshade-accent-color": "#666",
     },
   });
-  // Keep the multi-profile route lines on top of the shading.
-  if (map.getLayer("routes-multi-line")) map.moveLayer("routes-multi-line");
+  // Keep the chat route on top of the shading so plans stay visible
+  // when the terrain layer is on.
+  if (map.getLayer("chat-route-line")) map.moveLayer("chat-route-line");
   hillshadeLoaded = true;
 }
 
@@ -1110,24 +513,10 @@ async function ensureWayGraphNodes() {
     map.on("click", "way-graph-nodes-circles", async (e) => {
       const p = e.features[0].properties;
       const ref = p.ref;
-      // Anchor-as-endpoint (task #38): if a waypoint's pick button is
-      // armed, clicking this anchor assigns it to that waypoint
-      // instead of loading the SPT viz. Disarm before the map-click
-      // handler runs so the basemap fallback becomes a no-op.
-      if (state.pickArmed) {
-        const wp = state.pickArmed;
-        wp.ref = ref;
-        wp.name = p.name;
-        // Also stash coord for map marker + local distance calcs.
-        wp.coord = e.features[0].geometry
-          ? e.features[0].geometry.coordinates
-          : [e.lngLat.lng, e.lngLat.lat];
-        wp.input.value = p.name || ref;
-        disarmPick();
-        refreshWaypointMarkers();
-        updateRouteButton();
-        return;
-      }
+      // Anchor-as-endpoint pick-mode used to live here for the old
+      // sidebar route form. Removed with the AI-native refactor:
+      // routing is chat-only now, so anchor clicks always fall through
+      // to the debug/inspection paths (paired-trunk compare, SPT viz).
       const cityIdx = (sptStatus.idxByRef && sptStatus.idxByRef.get(ref)) ?? -1;
       // Paired-trunk compare mode: first click = A, second click = B,
       // then fetch (A, B) from both v1 and v2 and overlay.
@@ -1896,13 +1285,21 @@ document.getElementById("show-way-graph-nodes").addEventListener("change", async
 });
 
 // --- status helpers ---------------------------------------------------
+//
+// Both write to the small #status-hint slot at the bottom of the
+// overlay sidebar (replaces the removed #results panel). Null-safe so
+// script order / missing element doesn't crash callers.
 
 function setBusy(msg) {
-  document.getElementById("results").innerHTML = `<div class="route-card"><em>${msg}</em></div>`;
+  const el = document.getElementById("status-hint");
+  if (el) el.textContent = msg;
+  else console.info("[busy]", msg);
 }
 
 function setError(msg) {
-  document.getElementById("results").innerHTML = `<div class="route-card" style="border-color:#c52;"><strong>Error</strong><div class="stat">${msg}</div></div>`;
+  console.error("[err]", msg);
+  const el = document.getElementById("status-hint");
+  if (el) el.innerHTML = `<span style="color:#c33">${msg}</span>`;
 }
 
 // --- Scenicness raster overlays ---------------------------------------
@@ -2009,18 +1406,6 @@ function toggleScenicness(column, on) {
 // --- bootstrap ---------------------------------------------------------
 
 map.on("load", () => {
-  // Bind the start/end input rows from the DOM into state.waypoints.
-  // Inputs start empty; user enters coords (or clicks 📍 to pick from
-  // the map) and presses Enter or clicks Route. No default route runs
-  // on load.
-  const startRow = document.querySelector('.waypoint-row[data-role="start"]');
-  const endRow   = document.querySelector('.waypoint-row[data-role="end"]');
-  state.waypoints = [
-    bindWaypoint(startRow, "start"),
-    bindWaypoint(endRow,   "end"),
-  ];
-  refreshWaypointMarkers();
-  updateRouteButton();
   initScenicnessOverlays();
 });
 
