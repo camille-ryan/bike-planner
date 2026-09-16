@@ -17,6 +17,68 @@ graphs of Austria, Czechia, Germany and Denmark — but the *product*
 around it is an agent: a Claude Sonnet–driven planner that uses a
 half-dozen tools to compose a bikeable multi-day itinerary.
 
+### Architecture
+
+```mermaid
+flowchart TD
+    U([User])
+    subgraph Frontends
+      Web[Web chat<br/>MapLibre + SSE client]
+      Desktop[Claude Desktop<br/>MCP client]
+    end
+    U --> Web
+    U --> Desktop
+
+    Web -->|POST /chat SSE| Chat[FastAPI /chat<br/>tool-loop orchestrator]
+    Desktop -->|stdio JSON-RPC| MCP[bike-planner-mcp<br/>region dispatcher]
+
+    Chat -->|calls| Tools[Shared tools module<br/>api.app.tools]
+    MCP -->|dispatches| Tools
+
+    Tools --> Anchors[(cities.json<br/>anchor kdtree)]
+    Tools --> Trunks[(paired_trunks.db<br/>lazy LRU cache)]
+    Tools --> Stations[(rail_stations.geojson<br/>+ route-id sidecar)]
+    Tools --> POIs[(pois.db<br/>SpatiaLite)]
+
+    Chat -.->|Anthropic API| Sonnet[Claude Sonnet 5]
+    Sonnet -.->|tool_use| Chat
+
+    Chat -->|structured JSONL| Traces[Trace logs<br/>docker logs]
+    Traces --> Viewer[scripts/trace_view.py]
+
+    Eval[eval/run_eval.py] -->|POST /chat| Chat
+    Eval --> TraceJSONL[analysis/data/traces.jsonl]
+    TraceJSONL --> Judge[eval/judge.py<br/>Sonnet as judge]
+    Judge --> Scores[analysis/data/scores.jsonl]
+    Scores --> Dashboard[analysis/index.html<br/>static Chart.js]
+```
+
+### Skills demonstrated (DS → AI engineer)
+
+| Competency | Where in this repo |
+|---|---|
+| **LLM tool design** | `api/app/tools.py` — 8 tools with input schemas + description patterns tuned via eval (see the "USE THIS whenever…" hint in `direct_rail_service` which fixed a real 2 → 4 rubric jump). |
+| **Prompt engineering as system design** | `api/app/chat.py::SYSTEM_PROMPT` — workflow rules, reformat/recall handling, and an anti-fabrication rule that produced a measurable grounding fix. |
+| **Agent-loop orchestration** | The tool-use loop in `_run_chat_inner` — streams SSE, injects tool_results back into the messages array, strips thinking blocks (they don't round-trip), caps rounds. |
+| **Streaming SSE + robust integration** | Client-side offline detection, per-request timeout, mid-stream error surfaces without crashing the socket. |
+| **Model Context Protocol (MCP)** | `mcp_server/` — stdio JSON-RPC server exposing the same 8 tools to Claude Desktop, with a `Dispatcher` designed for future geographic sharding via `REGION_AWARE_TOOLS`. |
+| **LangGraph comparison** | `experiment/langchain-chat` branch — same tool set as a `StateGraph` with Send-based fan-out and per-node reducers; writeup in `NOTES/langchain-comparison.md`. |
+| **Eval-driven development** | `eval/` + `analysis/` — a gold-prompt suite, an LLM-as-judge scoring loop, and a static Chart.js dashboard. Bugs #5 and #6 were both fixed by re-running the eval and reading the judge rationales. |
+| **Observability** | `api/app/tracing.py` + `scripts/trace_view.py` — structured JSONL events with per-round `usage.input_tokens`, per-tool latency; docker-logs is the transport, no new sink. |
+| **Production readiness patterns** | Lazy-load with an LRU cache (`trunk_router._TrunkStore`) for the 5 GB → 300 MB reduction that made the flagship runnable on a laptop; CI syntax check + FastAPI import smoke + Docker build + MCP dispatcher tests. |
+| **Data engineering underneath** | Custom OSM PBF ingest, paired-SPT preprocess with per-anchor kdtree slicing, GTFS multi-feed dedup with sibling-platform clustering, station-line proximity filter that recovered Denmark's ingest after a broken feed. |
+
+### Deployment note
+
+The bike-api container's steady-state RSS is now ~300 MB (down from
+~5 GB — see `f2fa513`). A 1 vCPU / 2 GB VM will run the app fine
+including postgres + the paired-trunk lazy cache. What DOESN'T fit
+in a small VM is the preprocess pipeline — the four-country OSM PBF
+ingest peaks at ~10 GB working set and takes ~3 hours on a beefy
+box. Ship the DB artifacts (`data/spt/…/paired_trunks.db`,
+`data/rail_stations.geojson`, etc.) to the small VM and let it
+serve.
+
 **What's demonstrated**
 
 - **Tool use as UX.** Custom tools (`route`, `stations_along_route`,
@@ -132,28 +194,35 @@ A self-supported bike-tour planner for the Graz → Copenhagen corridor.
 OpenStreetMap data + a Postgres/pgRouting-backed SPT preprocess + scenic
 POI overlays. Dockerized.
 
-## Architecture
+## Services
 
-| Service     | Stack                                       | Notes                                |
-|-------------|---------------------------------------------|--------------------------------------|
-| ingest      | Python + osmium + SpatiaLite                | One-shot PBF + POI download          |
-| postgres    | PostGIS + pgRouting (16-3.5-3.7.3)          | Persistent road graph store          |
-| pgrouting   | Python + psycopg + pyosmium                 | SPT preprocess (multi-source SQL B-F)|
-| api         | Python + FastAPI + numpy/scipy + SpatiaLite | Serves SPT routes + POI lookups      |
-| web         | nginx + MapLibre GL JS                      | Static SPA                           |
+| Service     | Stack                                       | Notes                                                 |
+|-------------|---------------------------------------------|-------------------------------------------------------|
+| ingest      | Python + osmium + SpatiaLite                | One-shot PBF + POI + GTFS download                    |
+| postgres    | PostGIS + pgRouting (16-3.5-3.7.3)          | Road graph + landcover + railways during preprocess   |
+| pgrouting   | Python + psycopg + pyosmium                 | Paired-SPT preprocess + GTFS route-id sidecar         |
+| api         | Python + FastAPI + Anthropic SDK            | /chat SSE tool loop, /tools/*, /trunk/route, /pois    |
+| web         | nginx + MapLibre GL JS                      | Chat UI + map + debug overlays                        |
+| mcp_server  | Python + `mcp` SDK                          | stdio JSON-RPC for Claude Desktop; region dispatcher  |
 
 The routing pipeline is two-stage:
 - **Preprocess** (pgrouting service): stream PBFs into Postgres, snap
-  `place=city|town` anchors to graph vertices, run a multi-source
-  Bellman-Ford wave relaxation until every reachable node is labeled
-  with its nearest anchor + parent pointer toward it. Output is
-  per-city SPTs on disk plus a small city-graph adjacency.
-- **Query** (api service): plan a city sequence on the small city graph,
-  walk per-cell gradient pointers across the SPTs to assemble the path.
-  Sub-second on any distance once the preprocess has run.
+  `place=city|town` anchors to graph vertices, run a paired-SPT walk
+  per anchor pair (chainless, 30 km uniform SPTs with `is_frontier`
+  byproduct; ferry chain edges added as a post-step). Output is a
+  SQLite `paired_trunks.db` blob store keyed by `(src_city, dst_city)`,
+  plus `cities.json` and `city_graph.json` for the small chain graph.
+- **Query** (api service): given start/end anchors, plan a city
+  sequence via Dijkstra on the chain graph, then walk each edge's
+  trunk from `paired_trunks.db` (lazy-loaded via LRU — see
+  `trunk_router._TrunkStore`). Warm queries ~100 ms; a novel corridor
+  pays a one-time 3–5 s mmap page-in on first hit.
 
-The corridor data comes from **Geofabrik** country PBFs (Austria, Czech
-Republic, Germany, Denmark).
+The corridor data comes from **Geofabrik** country PBFs (Austria,
+Czech Republic, Germany, Denmark). GTFS feeds come from the
+respective national aggregators; only the rail portion is kept
+(bus routes at rail-served stations are recorded as `n_routes_bus`
+context but never used for routing).
 
 ## Prerequisites
 
@@ -342,16 +411,42 @@ bike/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── app/
-│       ├── main.py        # /health, /trunk/route, /way-graph/*, /pois
+│       ├── main.py        # /health, /trunk/route, /pois, /tools/*, mounts /chat
+│       ├── chat.py        # /chat SSE tool-loop orchestrator
+│       ├── tools.py       # TOOLS + TOOL_IMPLS (shared with mcp_server)
+│       ├── tracing.py     # structured [chat-trace] JSONL events
 │       ├── settings.py
 │       ├── geo.py
 │       ├── pois.py        # SpatiaLite POI lookups
-│       └── trunk_router.py  # paired-trunk lookup
+│       └── trunk_router.py  # paired-trunk lookup + lazy TrunkStore LRU
+├── mcp_server/            # stdio MCP server for Claude Desktop
+│   ├── mcp_bike_planner/
+│   │   ├── server.py      # stdio entry
+│   │   ├── dispatcher.py  # Backend protocol + region routing
+│   │   └── regions.toml
+│   └── tests/test_dispatcher.py
+├── eval/                  # gold-prompt suite + LLM-as-judge
+│   ├── gold_prompts.yaml
+│   ├── run_eval.py
+│   └── judge.py
+├── analysis/              # static Chart.js dashboard for eval results
+│   ├── index.html
+│   ├── dashboard.js
+│   └── style.css
+├── scripts/
+│   └── trace_view.py      # renders one /chat request's timeline
+├── NOTES/
+│   ├── demo-script.md     # 5-prompt walkthrough + screenshot checklist
+│   ├── deferred.md        # sidebar features archived pre-portfolio pivot
+│   └── langchain-comparison.md  # experiment/langchain-chat writeup
 ├── web/                   # Phase 4 — static SPA + nginx proxy
 └── data/                  # populated by ingest + preprocess (gitignored)
     ├── osm/      *.osm.pbf
     ├── pois/     *.osm.pbf, pois.sqlite
-    └── spt/      <profile>/(cities.json, city_graph.json, spt/*.npz)
+    ├── gtfs/     *-gtfs.zip
+    ├── rail_stations.geojson
+    ├── rail_station_routes.json   # route-id sidecar for direct_rail_service
+    └── spt/      <profile>/(cities.json, city_graph.json, paired_trunks.db)
 ```
 
 ## Port bindings

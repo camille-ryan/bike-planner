@@ -132,21 +132,18 @@ Claude Code reads `.claude/mcp.json` at the repo root. Add:
 - `ANTHROPIC_API_KEY` — **not needed here**. The MCP server never
   talks to Anthropic directly; it only responds to a host that does.
 
-## First tool call is slow (lazy preload)
+## First tool call is slow (lazy import + lazy trunk load)
 
 The LocalPython backend imports `api.app.tools` lazily on the first
-call. That import loads the paired-trunks SQLite blob (~5 GB) into
-memory in `trunk_router.preload()`. Expect ~30-60 s on the first
-`route` call after a fresh server start; every call after that is
-sub-second.
+call. That import wires up `trunk_router`, which now uses an
+LRU-bounded lazy cache (`TrunkStore`) instead of preloading every
+trunk. Boot cost is ~15 s; the FIRST tool call for a novel corridor
+pays another 3–5 s while SQLite pages the needed blobs into memory.
+Steady-state RSS is ~300 MB (was ~5 GB before the lazy-load
+refactor — see commit `f2fa513`).
 
-If you want the preload to happen at server-start instead:
-
-```bash
-BIKE_PLANNER_MCP_EAGER=1 bike-planner-mcp
-```
-
-(Not yet implemented — placeholder for a future config knob.)
+Tune with `TRUNK_CACHE_MAX_ENTRIES` (default 512) — higher keeps
+more corridors hot in RAM at the cost of steady-state memory.
 
 ## Tests
 
