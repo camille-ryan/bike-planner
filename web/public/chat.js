@@ -179,6 +179,14 @@ function ensureStagePinsLayer() {
       "circle-opacity": 0.95,
     },
   });
+  // MapLibre's default text-font stack is
+  // `["Open Sans Regular","Arial Unicode MS Regular"]`, which the
+  // OpenFreeMap positron tile server DOESN'T ship — a request for
+  // that font's glyph range returns 404. That 404 doesn't just kill
+  // the symbol layer's text; empirically it also tanks the sibling
+  // circle layer's WebGL draw call. Setting an explicit font that
+  // IS in the OpenFreeMap glyph pack (Noto Sans Bold + Regular) both
+  // makes the text render AND unblocks the circles.
   map.addLayer({
     id: "chat-stages-daynum",
     type: "symbol",
@@ -186,10 +194,7 @@ function ensureStagePinsLayer() {
     layout: {
       "text-field": ["to-string", ["get", "day"]],
       "text-size": 14,
-      // No text-font override — inherit the style's default. Some
-      // MapLibre glyph packs (OpenFreeMap positron included) don't
-      // ship the Bold weight, and a missing font silently drops the
-      // whole symbol layer.
+      "text-font": ["Noto Sans Bold"],
       "text-anchor": "center",
       "text-allow-overlap": true,
       "text-ignore-placement": true,
@@ -205,6 +210,7 @@ function ensureStagePinsLayer() {
     layout: {
       "text-field": ["get", "label"],
       "text-size": 12,
+      "text-font": ["Noto Sans Regular"],
       "text-offset": [0, 1.6],
       "text-anchor": "top",
     },

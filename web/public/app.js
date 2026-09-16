@@ -42,6 +42,17 @@ const state = {
 function emptyFC() { return { type: "FeatureCollection", features: [] }; }
 function fmtKm(m) { return (m / 1000).toFixed(1) + " km"; }
 
+// The old sidebar's `#results` panel was removed in the AI-native
+// refactor, but a dozen overlay-load and click-to-inspect handlers
+// still wrote to it. Null-op when the element is gone so those
+// handlers don't throw mid-load — a mid-load throw was masking
+// successful layer additions as "overlay X load failed" and making
+// the toggle look like it did nothing.
+function setResults(html) {
+  const el = document.getElementById("results");
+  if (el) el.innerHTML = html;
+}
+
 async function api(path, params) {
   const u = new URL(API + path, location.origin);
   for (const [k, v] of Object.entries(params || {})) {
@@ -147,7 +158,7 @@ async function ensureBiomeLayers() {
     map.on("mouseenter", "ecoregions-fill", () => map.getCanvas().style.cursor = "crosshair");
     map.on("mouseleave", "ecoregions-fill", () => map.getCanvas().style.cursor = "");
     biomeLoaded = true;
-    document.getElementById("results").innerHTML = "";
+    setResults("");
   } catch (e) {
     setError(`biome load failed: ${e.message}`);
     throw e;
@@ -205,7 +216,7 @@ async function ensureRailLinesLayer() {
       },
     });
     railLinesLoaded = true;
-    document.getElementById("results").innerHTML = "";
+    setResults("");
   } catch (e) {
     setError(`rail_lines load failed: ${e.message}`);
     throw e;
@@ -258,7 +269,7 @@ async function ensureRailStationsLayer() {
       },
     });
     railStationsLoaded = true;
-    document.getElementById("results").innerHTML = "";
+    setResults("");
   } catch (e) {
     setError(`rail_stations load failed: ${e.message}`);
     throw e;
@@ -459,16 +470,17 @@ async function ensureWayGraphEdges() {
     });
     map.on("click", "way-graph-edges-line", (e) => {
       const p = e.features[0].properties;
-      document.getElementById("results").innerHTML =
+      setResults(
         `<div class="route-card"><strong>${p.a_name} ↔ ${p.b_name}</strong>` +
         `<div class="stat"><span>cost</span><span>${p.cost_km} km</span></div>` +
         `<div class="stat"><span>a</span><span>${p.a}</span></div>` +
-        `<div class="stat"><span>b</span><span>${p.b}</span></div></div>`;
+        `<div class="stat"><span>b</span><span>${p.b}</span></div></div>`
+      );
     });
     map.on("mouseenter", "way-graph-edges-line", () => map.getCanvas().style.cursor = "pointer");
     map.on("mouseleave", "way-graph-edges-line", () => map.getCanvas().style.cursor = "");
     wayGraphEdgesLoaded = true;
-    document.getElementById("results").innerHTML = "";
+    setResults("");
   } catch (e) {
     setError(`way_city_graph load failed: ${e.message}`);
     throw e;
@@ -542,19 +554,20 @@ async function ensureWayGraphNodes() {
         if (map.getSource("way-graph-spt")) {
           map.getSource("way-graph-spt").setData({ type: "FeatureCollection", features: [] });
         }
-        document.getElementById("results").innerHTML =
+        setResults(
           `<div class="route-card"><strong>${p.name}</strong>` +
           `<div class="stat"><span>ref</span><span>${ref}</span></div>` +
           `<div class="stat"><span>kind</span><span>${p.kind} / ${p.place}</span></div>` +
           `<div class="stat"><span>population</span><span>${p.population ?? "—"}</span></div>` +
           `<div class="stat"><span>in chain graph</span><span>${p.in_graph}</span></div>` +
-          `<div class="stat"><span>SPT</span><span>pending</span></div></div>`;
+          `<div class="stat"><span>SPT</span><span>pending</span></div></div>`
+        );
       }
     });
     map.on("mouseenter", "way-graph-nodes-circles", () => map.getCanvas().style.cursor = "pointer");
     map.on("mouseleave", "way-graph-nodes-circles", () => map.getCanvas().style.cursor = "");
     wayGraphNodesLoaded = true;
-    document.getElementById("results").innerHTML = "";
+    setResults("");
   } catch (e) {
     setError(`way_city_anchors load failed: ${e.message}`);
     throw e;
@@ -591,7 +604,7 @@ async function ensureWayGraphPolygons() {
       paint: { "line-color": "#16a34a", "line-width": 2.5 },
     });
     wayGraphPolygonsLoaded = true;
-    document.getElementById("results").innerHTML = "";
+    setResults("");
   } catch (e) {
     setError(`spt polygons load failed: ${e.message}`);
     throw e;
@@ -689,11 +702,12 @@ async function loadSptForCityIdx(city_idx, label) {
     if (!r.ok) throw new Error(`spt: ${r.status}`);
     const fc = await r.json();
     map.getSource("way-graph-spt").setData(fc);
-    document.getElementById("results").innerHTML =
+    setResults(
       `<div class="route-card"><strong>${label}</strong> SPT` +
       `<div class="stat"><span>edges shown</span><span>${fc.kept_count.toLocaleString()}</span></div>` +
       `<div class="stat"><span>total visited</span><span>${fc.total_visited.toLocaleString()}</span></div>` +
-      `<div class="stat"><span>cost range</span><span>${(fc.cost_min/1000).toFixed(1)} – ${(fc.cost_max/1000).toFixed(1)} km</span></div></div>`;
+      `<div class="stat"><span>cost range</span><span>${(fc.cost_min/1000).toFixed(1)} – ${(fc.cost_max/1000).toFixed(1)} km</span></div></div>`
+    );
   } catch (e) {
     setError(`SPT load failed: ${e.message}`);
   }
