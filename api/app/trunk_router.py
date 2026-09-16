@@ -1,5 +1,5 @@
-"""Paired-trunk router. Loads the entire trunk DB (blob schema) into
-memory at startup, then serves routing requests as in-memory walks.
+"""Paired-trunk router. Serves routing requests as in-memory walks,
+lazy-loading trunk blobs from the paired_trunks.db on first access.
 
 Architecture:
   1. Snap user's start/end (lon, lat) to road graph vertices (postgres).
@@ -16,17 +16,24 @@ Architecture:
   6. Materialize the route polyline from the lat/lon embedded in each
      trunk row — no postgres roundtrip required.
 
-Preload memory: ~5.7 GB of blobs as numpy arrays + ~1.9 GB of next_idx
-arrays = ~7.5 GB resident. Fits comfortably alongside postgres on a
-16 GB host. Startup load is ~30-60 s warm (one cold pass through the
-DB file).
+Memory model (lazy):
+  Startup preloads only the SET of valid (src_city, dst_city) keys
+  (~14k rows × 16 B = ~240 KB) plus cities.json + city_graph.json.
+  Trunk blobs are decoded on first `.get()` and held in an LRU
+  bounded by `_TRUNK_CACHE_MAX_ENTRIES` (default 512, override via
+  env var TRUNK_CACHE_MAX_ENTRIES). Steady-state RSS scales with
+  the cache, not the DB size. A cold trunk fetch is ~1 SQLite row
+  read + ~10-50 ms of next_idx precompute; warm queries touch the
+  cached entry with no I/O.
 """
 from __future__ import annotations
 
 import heapq
 import json
 import math
+import os
 import sqlite3
+import threading
 import time
 from collections import defaultdict
 from functools import lru_cache
@@ -49,6 +56,108 @@ TRUNK_DTYPE = np.dtype([
 NULL_SENTINEL = np.int64(-1)
 
 _MAX_WALK_STEPS = 200_000
+
+# How many decoded trunks to keep resident. Each entry is one
+# corridor's (vid, succ, lat, lon) blob view + a parallel int64
+# next_idx array — very roughly 100-500 KB per common pair, with a
+# long tail up to a few MB for very long corridors. A cache of 512
+# entries budgets ~250 MB in the worst case and easily covers the
+# working set of any single multi-leg route.
+_TRUNK_CACHE_MAX_ENTRIES = int(os.environ.get("TRUNK_CACHE_MAX_ENTRIES", "512"))
+
+
+def _decode_trunk_blob(blob: bytes) -> tuple[np.ndarray, np.ndarray]:
+    """Decode one trunk-DB blob into (arr, next_idx). The blob layout
+    matches TRUNK_DTYPE; next_idx maps each row to its successor's
+    index in the same array (or -1 if the row is a trunk root)."""
+    arr = np.frombuffer(blob, dtype=TRUNK_DTYPE)
+    pos = np.searchsorted(arr["vid"], arr["succ"])
+    in_range = pos < len(arr)
+    pos_c = np.clip(pos, 0, len(arr) - 1)
+    matched = in_range & (arr["vid"][pos_c] == arr["succ"])
+    is_root = arr["succ"] == NULL_SENTINEL
+    next_idx = np.where(matched & ~is_root, pos, -1).astype(np.int64)
+    return arr, next_idx
+
+
+class _TrunkStore:
+    """Lazy in-memory cache over the paired_trunks.db.
+
+    On construction, materializes only the set of valid (src, dst)
+    keys — the SELECT is ~50 ms for 14k rows and lets callers filter
+    the city_graph and short-circuit misses without SQL.
+
+    `.get((src, dst))` returns the decoded (arr, next_idx) pair on
+    demand, keeping the last `_TRUNK_CACHE_MAX_ENTRIES` entries
+    resident under an LRU. Cold hits are a single SQL row read plus
+    the numpy next_idx precompute.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        # sqlite3.Connection isn't safe for concurrent use from more
+        # than one thread. FastAPI runs sync endpoints in a threadpool,
+        # so two overlapping requests could race the same connection.
+        # Serialize DB touches through a lock.
+        self._conn_lock = threading.Lock()
+        rows = conn.execute("SELECT src_city, dst_city FROM trunk_blobs")
+        self.pairs: frozenset[tuple[int, int]] = frozenset(
+            (int(a), int(b)) for a, b in rows
+        )
+        # Statistics for the /trunk/cache-stats endpoint / logs — the
+        # LRU is otherwise a black box.
+        self._hits = 0
+        self._misses = 0
+        # Bind the lru_cache to the instance without leaking `self`
+        # into the cache key (functools.lru_cache would keep every
+        # `self` alive forever).
+        self._cached_fetch = lru_cache(maxsize=_TRUNK_CACHE_MAX_ENTRIES)(
+            self._fetch_uncached
+        )
+
+    def _fetch_uncached(self, key: tuple[int, int]
+                        ) -> tuple[np.ndarray, np.ndarray] | None:
+        with self._conn_lock:
+            row = self._conn.execute(
+                "SELECT blob FROM trunk_blobs "
+                "WHERE src_city=? AND dst_city=?",
+                key,
+            ).fetchone()
+        if row is None:
+            return None
+        return _decode_trunk_blob(row[0])
+
+    def get(self, key: tuple[int, int]
+            ) -> tuple[np.ndarray, np.ndarray] | None:
+        # Cheap presence check before touching the LRU — a chain-graph
+        # miss is common (Dijkstra probes non-existent edges) and we
+        # don't want those cluttering the cache.
+        if key not in self.pairs:
+            return None
+        info = self._cached_fetch.cache_info()
+        result = self._cached_fetch(key)
+        info2 = self._cached_fetch.cache_info()
+        if info2.hits > info.hits:
+            self._hits += 1
+        elif info2.misses > info.misses:
+            self._misses += 1
+        return result
+
+    def __contains__(self, key: tuple[int, int]) -> bool:
+        return key in self.pairs
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def cache_stats(self) -> dict:
+        info = self._cached_fetch.cache_info()
+        return {
+            "n_pairs":     len(self.pairs),
+            "resident":    info.currsize,
+            "max_size":    info.maxsize,
+            "hits":        self._hits,
+            "misses":      self._misses,
+        }
 
 
 class _ProfileData:
@@ -95,36 +204,22 @@ class _ProfileData:
             if c.get("ref")
         }
 
-        # Preload all trunk blobs into a dict. `immutable=1` skips WAL/
-        # SHM file creation (which the :ro mount blocks) and tells SQLite
-        # the DB won't change — fine since we read everything upfront and
-        # never re-query at runtime. CAVEAT: if a paired rebuild is
-        # writing to the SAME DB file concurrently, immutable=1's
-        # change-detection skip will surface as "database disk image is
-        # malformed". Restart the API only when no rebuild is in flight,
-        # or wait for each per-profile rebuild to finish before requesting
-        # routes for that profile.
+        # Open the trunk DB once and keep the connection open for the
+        # life of the profile. `immutable=1` skips WAL/SHM creation
+        # (blocked by the :ro mount) and tells SQLite the file won't
+        # change — required for the lazy-load fast path. CAVEAT: if a
+        # paired rebuild is writing to the SAME DB file concurrently,
+        # immutable=1's change-detection skip will surface as
+        # "database disk image is malformed". Restart the API only
+        # when no rebuild is in flight, or wait for each per-profile
+        # rebuild to finish before requesting routes for that profile.
         conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro&immutable=1", uri=True,
+            f"file:{db_path}?mode=ro&immutable=1",
+            uri=True,
+            check_same_thread=False,
         )
         conn.execute("PRAGMA mmap_size = 8589934592")  # 8 GB mmap window
-        self.trunks: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
-        n_total_rows = 0
-        for src, dst, n, blob in conn.execute(
-            "SELECT src_city, dst_city, n_rows, blob FROM trunk_blobs"
-        ):
-            arr = np.frombuffer(blob, dtype=TRUNK_DTYPE)
-            # Precompute next_idx for each row (successor's index in the
-            # same array, or -1 if it's a trunk root / orphan).
-            pos = np.searchsorted(arr["vid"], arr["succ"])
-            in_range = pos < len(arr)
-            pos_c = np.clip(pos, 0, len(arr) - 1)
-            matched = in_range & (arr["vid"][pos_c] == arr["succ"])
-            is_root = arr["succ"] == NULL_SENTINEL
-            next_idx = np.where(matched & ~is_root, pos, -1).astype(np.int64)
-            self.trunks[(int(src), int(dst))] = (arr, next_idx)
-            n_total_rows += n
-        conn.close()
+        self.trunks = _TrunkStore(conn)
 
         # Filter the city_graph to pairs we actually have trunks for.
         # The remaining `chain_adj` edges are guaranteed to be walkable.
@@ -142,10 +237,11 @@ class _ProfileData:
 
         elapsed = time.time() - t0
         print(
-            f"[trunk_router] preloaded profile '{profile}': "
-            f"{len(self.trunks):,} trunks, {n_total_rows:,} vertices, "
-            f"city_graph kept {n_kept:,} edges (dropped {n_dropped:,} "
-            f"degenerate) in {elapsed:.1f}s",
+            f"[trunk_router] indexed profile '{profile}': "
+            f"{len(self.trunks):,} trunk pairs (lazy; cache_max="
+            f"{_TRUNK_CACHE_MAX_ENTRIES}), city_graph kept "
+            f"{n_kept:,} edges (dropped {n_dropped:,} degenerate) "
+            f"in {elapsed:.1f}s",
             flush=True,
         )
 
