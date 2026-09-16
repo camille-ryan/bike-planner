@@ -78,6 +78,14 @@ def _merge_enrichments(a: dict[int, StageEnrichment],
     return out
 
 
+def _append_events(a: list[dict], b: list[dict]) -> list[dict]:
+    """Reducer for `stream_events`. Concurrent nodes (the parallel
+    enrichers under Send fan-out) each contribute their event lists;
+    without a reducer LangGraph raises InvalidUpdateError. Append
+    preserves the order of node completion."""
+    return (a or []) + (b or [])
+
+
 class PlanState(TypedDict, total=False):
     # Immutable per turn.
     user_prompt: str
@@ -108,7 +116,19 @@ class PlanState(TypedDict, total=False):
 
     # Streaming events. Each node appends its tool calls / status
     # messages; the SSE bridge drains this list between graph steps.
-    stream_events: list[dict]
+    # Annotated with the append reducer so concurrent nodes (the
+    # parallel enrichers) don't conflict.
+    stream_events: Annotated[list[dict], _append_events]
+
+    # Per-worker payload fields. Only populated inside an enricher
+    # worker; None elsewhere. LangGraph's Send delivers by merging
+    # the send payload into the target node's state view, so these
+    # keys must exist on the state schema for the node to see them.
+    stage: Optional[dict]
+    stage_categories: Optional[list[str]]
+    stage_from_ref_root: Optional[str]
+    stage_to_ref_root: Optional[str]
+    stage_via_refs_root: Optional[list[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -179,11 +199,12 @@ async def _planner_node(state: PlanState) -> PlanState:
         results = res.get("results", [])
         return results[0]["ref"] if results else None
 
-    events = list(state.get("stream_events", []))
-    events.append({"event": "text", "delta": f"🧭 Planning route from {plan.from_hint} to {plan.to_hint}"
-                                              + (f" via {', '.join(plan.via_hints)}" if plan.via_hints else "")
-                                              + (f", {plan.target_km_per_day:.0f} km/day" if plan.target_km_per_day else "")
-                                              + "…\n\n"})
+    # Emit only the delta — the append reducer merges with existing events.
+    new_events = [{"event": "text", "delta":
+        f"🧭 Planning route from {plan.from_hint} to {plan.to_hint}"
+        + (f" via {', '.join(plan.via_hints)}" if plan.via_hints else "")
+        + (f", {plan.target_km_per_day:.0f} km/day" if plan.target_km_per_day else "")
+        + "…\n\n"}]
 
     from_ref = _resolve(plan.from_hint)
     to_ref   = _resolve(plan.to_hint)
@@ -197,7 +218,7 @@ async def _planner_node(state: PlanState) -> PlanState:
         "need_stages": plan.need_stages,
         "need_enrichment": plan.need_enrichment,
         "enrichment_categories": plan.enrichment_categories,
-        "stream_events": events,
+        "stream_events": new_events,
     }
 
 
@@ -205,12 +226,12 @@ async def _planner_node(state: PlanState) -> PlanState:
 # Node: router (deterministic)
 
 async def _router_node(state: PlanState) -> PlanState:
-    events = list(state.get("stream_events", []))
+    new_events: list[dict] = []
 
     if not state.get("from_ref") or not state.get("to_ref"):
-        events.append({"event": "error",
-                       "message": "Planner could not resolve start/end refs."})
-        return {"stream_events": events}
+        new_events.append({"event": "error",
+                           "message": "Planner could not resolve start/end refs."})
+        return {"stream_events": new_events}
 
     route_args = {
         "from_ref": state["from_ref"],
@@ -218,8 +239,8 @@ async def _router_node(state: PlanState) -> PlanState:
         "via_refs": state.get("via_refs") or None,
     }
     route_result = call_tool("route", route_args)
-    events.append({"event": "tool_call",
-                   "name": "route", "input": route_args, "output": route_result})
+    new_events.append({"event": "tool_call",
+                       "name": "route", "input": route_args, "output": route_result})
 
     stages = []
     if state.get("need_stages") and state.get("target_km_per_day"):
@@ -230,15 +251,15 @@ async def _router_node(state: PlanState) -> PlanState:
             "target_km_per_day": state["target_km_per_day"],
         }
         stage_result = call_tool("split_into_stages", stage_args)
-        events.append({"event": "tool_call",
-                       "name": "split_into_stages",
-                       "input": stage_args, "output": stage_result})
+        new_events.append({"event": "tool_call",
+                           "name": "split_into_stages",
+                           "input": stage_args, "output": stage_result})
         stages = stage_result.get("stages", [])
 
     return {
         "route_result": route_result,
         "stages": stages,
-        "stream_events": events,
+        "stream_events": new_events,
     }
 
 
@@ -251,36 +272,32 @@ async def _router_node(state: PlanState) -> PlanState:
 
 def _enrich_map(state: PlanState) -> list[Send]:
     """Router → enricher_map: emit one Send per stage. Returns a list
-    of Send objects, one per parallel worker."""
+    of Send objects, one per parallel worker. Fields ("stage",
+    "stage_categories", ...) become state overrides in each Send's
+    target-node invocation."""
     if not state.get("need_enrichment") or not state.get("stages"):
         return []
     cats = state.get("enrichment_categories") or ["viewpoint"]
     return [
         Send("enrich_stage", {
             "stage": stage,
-            "categories": cats,
-            "from_ref_root": state.get("from_ref"),
-            "to_ref_root":   state.get("to_ref"),
-            "via_refs_root": state.get("via_refs") or [],
+            "stage_categories": cats,
+            "stage_from_ref_root": state.get("from_ref"),
+            "stage_to_ref_root":   state.get("to_ref"),
+            "stage_via_refs_root": state.get("via_refs") or [],
         })
         for stage in state["stages"]
     ]
 
 
-class EnrichStageInput(TypedDict):
-    stage: dict
-    categories: list[str]
-    from_ref_root: str
-    to_ref_root: str
-    via_refs_root: list[str]
-
-
-async def _enrich_stage_node(payload: EnrichStageInput) -> PlanState:
+async def _enrich_stage_node(state: PlanState) -> PlanState:
     """Per-stage enrichment worker. Runs in parallel with siblings.
-    Reads only its own payload; writes into `enrichments[day]` via
-    the reducer."""
-    stage = payload["stage"]
-    day = stage["day"]
+    Reads only the Send-delivered `stage*` keys; writes into
+    `enrichments[day]` (reducer-merged) and `stream_events`."""
+    stage = state.get("stage") or {}
+    if not stage:
+        return {}   # nothing to do — Send never fired
+    day = stage.get("day", 0)
 
     enrichment: StageEnrichment = {
         "day": day,
@@ -292,29 +309,28 @@ async def _enrich_stage_node(payload: EnrichStageInput) -> PlanState:
     }
     events: list[dict] = []
 
-    # Nearby rail stations at the overnight anchor (from_ref of next
-    # stage = to_ref of this one).
-    if stage.get("to_ref"):
+    # Nearby rail stations at the overnight anchor.
+    if stage.get("to_lonlat"):
         st_args = {
-            "lon": stage["to_lonlat"][0] if stage.get("to_lonlat") else None,
-            "lat": stage["to_lonlat"][1] if stage.get("to_lonlat") else None,
+            "lon": stage["to_lonlat"][0],
+            "lat": stage["to_lonlat"][1],
             "radius_km": 5, "limit": 3,
         }
-        if st_args["lon"] is not None:
-            st = call_tool("stations_near", st_args)
-            events.append({"event": "tool_call",
-                           "name": f"stations_near[day{day}]",
-                           "input": st_args, "output": st})
-            enrichment["stations"] = st.get("stations", [])
+        st = call_tool("stations_near", st_args)
+        events.append({"event": "tool_call",
+                       "name": f"stations_near[day{day}]",
+                       "input": st_args, "output": st})
+        enrichment["stations"] = st.get("stations", [])
 
-    # POIs along the stage's slice of the route. We use the ROOT
-    # from/to/via so the cached polyline lookup hits. Per-stage
-    # slicing happens client-side (or via a future tool).
-    for cat in payload["categories"]:
+    # POIs along the full route (cache-hits via the ROOT refs). Per-
+    # stage slicing happens client-side; the model gets the whole
+    # POI list and picks per-day.
+    cats = state.get("stage_categories") or ["viewpoint"]
+    for cat in cats:
         args = {
-            "from_ref": payload["from_ref_root"],
-            "to_ref":   payload["to_ref_root"],
-            "via_refs": payload["via_refs_root"] or None,
+            "from_ref": state.get("stage_from_ref_root"),
+            "to_ref":   state.get("stage_to_ref_root"),
+            "via_refs": state.get("stage_via_refs_root") or None,
             "category": cat,
             "buffer_km": 2,
             "limit": 5,
@@ -393,9 +409,8 @@ async def _composer_node(state: PlanState) -> PlanState:
     ])
     text = _extract_text(reply.content).strip()
 
-    events = list(state.get("stream_events", []))
-    events.append({"event": "text", "delta": text})
-    return {"itinerary_md": text, "stream_events": events}
+    return {"itinerary_md": text,
+            "stream_events": [{"event": "text", "delta": text}]}
 
 
 # ---------------------------------------------------------------------------
@@ -422,15 +437,14 @@ async def _critic_node(state: PlanState) -> PlanState:
         ("human", f"User request:\n{state.get('user_prompt')}\n\n"
                   f"Composed itinerary:\n{state.get('itinerary_md')}"),
     ])
-    events = list(state.get("stream_events", []))
-    events.append({"event": "text",
+    new_events = [{"event": "text",
                    "delta": ("\n\n_✓ critic approved_\n" if verdict.approved
-                             else f"\n\n_⚠ critic revising: {verdict.feedback}_\n")})
+                             else f"\n\n_⚠ critic revising: {verdict.feedback}_\n")}]
     return {
         "approved": verdict.approved,
         "critic_feedback": verdict.feedback,
         "iteration": state.get("iteration", 0) + 1,
-        "stream_events": events,
+        "stream_events": new_events,
     }
 
 
@@ -443,6 +457,18 @@ def _after_critic(state: PlanState) -> Literal["planner", "end"]:
 # ---------------------------------------------------------------------------
 # Graph assembly
 
+def _route_after_router(state: PlanState):
+    """One conditional edge from router: return either a list of
+    `Send` objects (fan-out to per-stage enrich_stage workers) OR
+    the string name of the next node. Merging these two behaviours
+    into one function is the LangGraph pattern for conditional
+    fan-out — two separate `add_conditional_edges` from the same
+    node lead to nondeterministic routing bugs."""
+    if state.get("need_enrichment") and state.get("stages"):
+        return _enrich_map(state)   # list[Send]
+    return "composer"
+
+
 def _build_graph():
     g: StateGraph = StateGraph(PlanState)
     g.add_node("planner", _planner_node)
@@ -453,21 +479,16 @@ def _build_graph():
 
     g.add_edge(START, "planner")
     g.add_edge("planner", "router")
-    # Router → conditional Send fan-out. If no stages, skip enrichment.
     g.add_conditional_edges(
-        "router",
-        lambda s: "enrich_map" if s.get("need_enrichment") and s.get("stages") else "compose",
-        {"enrich_map": "enrich_stage", "compose": "composer"},
+        "router", _route_after_router,
+        ["enrich_stage", "composer"],
     )
-    # enrich_stage's fan-out targets funnel back to composer.
     g.add_edge("enrich_stage", "composer")
     g.add_edge("composer", "critic")
     g.add_conditional_edges(
         "critic", _after_critic,
         {"planner": "planner", "end": END},
     )
-    # Send() wiring for the fan-out mapper.
-    g.add_conditional_edges("router", _enrich_map, ["enrich_stage"])  # type: ignore[arg-type]
     return g.compile()
 
 
@@ -521,20 +542,18 @@ async def _run_graph_sse(req: ChatRequest):
         "enrichments": {},
     }
 
-    # Track which stream_events we've already emitted so per-node
-    # writes don't double-emit.
-    emitted = 0
+    # graph.astream(stream_mode="updates") yields per-super-step
+    # dicts of {node_name: node_return_delta}. Each node's delta
+    # already contains only its OWN new events (nodes return only
+    # deltas; the reducer merges into state). So we just drain the
+    # events out of every yielded delta.
     try:
         async for step in graph.astream(state, {"recursion_limit": 25}):
-            # `step` is { node_name: state_delta } after each node run.
             for _node, delta in step.items():
-                events = delta.get("stream_events") or []
-                # Emit the tail of this node's stream_events.
-                for ev in events[emitted:]:
+                for ev in (delta.get("stream_events") or []):
                     kind = ev.get("event", "text")
                     payload = {k: v for k, v in ev.items() if k != "event"}
                     yield _sse(kind, payload)
-                emitted = len(events)
     except Exception as exc:
         yield _sse("error", {"message": f"graph failed: {type(exc).__name__}: {exc}"})
     finally:
