@@ -29,6 +29,10 @@ map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "
 // overlay sources/layers. Top-level `const` in a plain <script> is
 // NOT attached to window automatically.
 window.map = map;
+// Chat.js piggybacks on the sidebar's route-shape so paired-SPT viz
+// works after a chat-driven route too (task-#1 phase 1a). Anything
+// chat.js needs to poke into is exposed here.
+Object.defineProperty(window, "sidebarState", { get: () => state });
 
 // --- state -------------------------------------------------------------
 

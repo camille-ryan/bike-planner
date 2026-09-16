@@ -417,6 +417,12 @@ def _tool_route(inp: dict) -> dict:
         "total_km": round(total_km, 1),
         "polyline": coords,
         "chain_stops": chain_stops,
+        # Plain-list variants for the frontend's paired-SPT viz layer,
+        # which reuses the sidebar's route-shape (chain_names +
+        # chain_city_idx). Kept alongside `chain_stops` so the LLM
+        # keeps its rich per-stop metadata.
+        "chain_names":    props.get("chain_names", []),
+        "chain_city_idx": list(props.get("chain_city_idx", [])),
         "n_bridges": len(props.get("bridges", [])),
     }
 

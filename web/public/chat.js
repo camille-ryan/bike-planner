@@ -374,6 +374,31 @@ function handleToolResult(name, input, output) {
   addToolCall(name, input, output);
   if (name === "route" && output?.polyline?.length) {
     drawRouteOnMap(output.polyline);
+    // Also populate the sidebar's route state so the paired-SPT viz
+    // ("Show route data" toggle) works after a chat-driven plan.
+    // Before this, only sidebar-form routes populated state, and any
+    // demo that opened the chat then flipped the debug toggle just
+    // saw "plan a route first" — the interview regression.
+    // We synthesize the same GeoJSON Feature shape trunk_router.route
+    // returns for the sidebar, minimum fields the viz reads.
+    try {
+      const s = window.sidebarState;
+      if (s && Array.isArray(output.chain_city_idx) && output.chain_city_idx.length) {
+        s.routesByProfile = s.routesByProfile || {};
+        s.routesByProfile["views"] = {
+          type: "Feature",
+          geometry: { type: "LineString", coordinates: output.polyline },
+          properties: {
+            chain_city_idx: output.chain_city_idx,
+            chain_names:    output.chain_names || [],
+            gross_length_m: (output.total_km || 0) * 1000,
+            bridges: [],  // chat.route doesn't propagate the full bridges array
+          },
+        };
+      }
+    } catch (e) {
+      console.warn("[chat.js] sidebarState.routesByProfile sync failed:", e);
+    }
   }
   if (name === "split_into_stages" && output?.stages) {
     // Key stage pins by the (from_ref, to_ref) leg so a re-split of
