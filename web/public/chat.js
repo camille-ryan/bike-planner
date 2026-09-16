@@ -161,15 +161,41 @@ function ensureStagePinsLayer() {
     type: "geojson",
     data: { type: "FeatureCollection", features: [] },
   });
+  // Numbered overnight pins — three layers stacked:
+  //   1. outer circle (dark purple fill, white ring) — reads as "stop"
+  //      and is visually distinct from POI markers (amber viewpoints,
+  //      teal water) and rail stations (blue) already on the map
+  //   2. day number rendered white in the center of the circle
+  //   3. city + km label rendered below, matches other on-map labels
   map.addLayer({
     id: "chat-stages-circles",
     type: "circle",
     source: "chat-stages",
     paint: {
-      "circle-radius": 7,
-      "circle-color": "#f5a623",
-      "circle-stroke-width": 2,
+      "circle-radius": 14,
+      "circle-color": "#6d4aff",
+      "circle-stroke-width": 2.5,
       "circle-stroke-color": "#fff",
+      "circle-opacity": 0.95,
+    },
+  });
+  map.addLayer({
+    id: "chat-stages-daynum",
+    type: "symbol",
+    source: "chat-stages",
+    layout: {
+      "text-field": ["to-string", ["get", "day"]],
+      "text-size": 14,
+      // No text-font override — inherit the style's default. Some
+      // MapLibre glyph packs (OpenFreeMap positron included) don't
+      // ship the Bold weight, and a missing font silently drops the
+      // whole symbol layer.
+      "text-anchor": "center",
+      "text-allow-overlap": true,
+      "text-ignore-placement": true,
+    },
+    paint: {
+      "text-color": "#fff",
     },
   });
   map.addLayer({
@@ -179,11 +205,11 @@ function ensureStagePinsLayer() {
     layout: {
       "text-field": ["get", "label"],
       "text-size": 12,
-      "text-offset": [0, 1.3],
+      "text-offset": [0, 1.6],
       "text-anchor": "top",
     },
     paint: {
-      "text-color": "#333",
+      "text-color": "#222",
       "text-halo-color": "#fff",
       "text-halo-width": 2,
     },
@@ -211,7 +237,12 @@ function _stagesToFeatures() {
       feats.push({
         type: "Feature",
         geometry: { type: "Point", coordinates: s.to_lonlat },
-        properties: { label: `Day ${s.day}: ${s.to_name || "?"} (${s.km} km)` },
+        properties: {
+          // day number rendered inside the circle (chat-stages-daynum)
+          day: s.day,
+          // city + km label rendered below (chat-stages-labels)
+          label: `${s.to_name || "?"} · ${s.km} km`,
+        },
       });
     }
   }
