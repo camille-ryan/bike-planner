@@ -342,6 +342,42 @@ def cmd_export_rails(args) -> None:
     print(f"[main] wrote {len(lines_features):,} lines → {lines_path}")
 
 
+def cmd_export_rail_routes(args) -> None:
+    """Emit a per-station route-id sidecar for the `direct_rail_service`
+    tool. Reruns just the GTFS parse (no postgres, no OSM), and writes
+    one flat JSON file keyed by `<country>:<gtfs_id>`.
+
+    Output: <data-dir>/rail_station_routes.json
+    """
+    import json
+    from ingest import ingest_railways, download_gtfs
+    countries = [c.strip() for c in args.countries.split(",") if c.strip()]
+    out_path = Path(args.out) if args.out else (
+        config.DATA_DIR / "rail_station_routes.json"
+    )
+    print(f"[main] export-rail-routes countries={countries} → {out_path}")
+    combined: dict[str, list[str]] = {}
+    for c in countries:
+        gtfs_zip = download_gtfs.feed_path(c)
+        if not gtfs_zip.exists():
+            raise SystemExit(
+                f"missing GTFS zip for {c}: {gtfs_zip}. "
+                f"Run gtfs-download first."
+            )
+        stations = ingest_railways._parse_gtfs([gtfs_zip], c)
+        for s in stations:
+            key = f"{c}:{s['gtfs_id']}"
+            combined[key] = s.get("route_ids_rail", [])
+        print(f"[main]   {c}: {len(stations):,} stations "
+              f"({sum(1 for s in stations if s.get('route_ids_rail')):,} "
+              f"with ≥1 rail route)")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(combined))
+    size_mb = out_path.stat().st_size / 1e6
+    print(f"[main] wrote {len(combined):,} station-route entries → "
+          f"{out_path} ({size_mb:.1f} MB)")
+
+
 def cmd_waterway_ingest(args) -> None:
     """Stream full country PBFs for waterway lines, buffer to ~10m
     polygons, insert as class='waterway'. Requires the landcover table
@@ -631,6 +667,7 @@ def main() -> None:
         ("railway-ingest", cmd_railway_ingest),
         ("lodging-ingest", cmd_lodging_ingest),
         ("export-rails", cmd_export_rails),
+        ("export-rail-routes", cmd_export_rail_routes),
         ("route-city-pairs", cmd_route_city_pairs),
         ("canopy-compute", cmd_canopy_compute),
         ("canopy-compute-raster", cmd_canopy_compute_raster),

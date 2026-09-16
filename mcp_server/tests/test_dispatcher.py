@@ -124,6 +124,21 @@ def test_route_with_ref_args_resolves_to_region():
     assert len(eu.calls) == 1
 
 
+def test_direct_rail_service_uses_from_ref_to_pick_region():
+    # Graz in EU, Copenhagen in EU: both refs should hit EU backend
+    # (only from_ref is resolved — first hit wins).
+    def resolver(ref):
+        return {"db:66":  (15.44, 47.07),   # Graz
+                "db:823": (12.57, 55.69)    # København
+                }.get(ref)
+    d = _mk_dispatcher(with_regions=True, coord_resolver=resolver)
+    _run(d.call("direct_rail_service",
+                {"from_ref": "db:66", "to_ref": "db:823"}))
+    eu = next(r.backend for r in d.regions if r.name == "eu")
+    assert len(eu.calls) == 1
+    assert eu.calls[0][0] == "direct_rail_service"
+
+
 def test_route_with_unknown_ref_falls_back():
     def resolver(ref):
         return None  # unknown

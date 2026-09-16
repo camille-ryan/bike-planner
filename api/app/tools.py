@@ -202,6 +202,44 @@ TOOLS = [
         },
     },
     {
+        "name": "direct_rail_service",
+        "description": (
+            "Check whether a direct (non-transfer) rail route serves both "
+            "anchors. Finds the closest rail station to each anchor's "
+            "center (within `max_station_dist_km`) that has at least "
+            "`min_routes_rail` GTFS rail routes, and intersects their "
+            "route_id sets. Returns `direct_service` (bool), "
+            "`n_shared_routes`, the two matched stations, and up to 20 "
+            "shared route_ids. Use this to verify a candidate overnight "
+            "is reachable by one-seat train from a corridor anchor (Graz, "
+            "Copenhagen, or a major hub) — required for tours where the "
+            "user's partner will meet by direct train each night. "
+            "Coverage: same 4 national GTFS feeds as `stations_near` "
+            "(Austria, Germany, Denmark, Czech Republic). Note: only "
+            "detects direct service that both operates in the same GTFS "
+            "feed AND uses the same route_id — a train physically running "
+            "through both stops but sold as two route_ids will not be "
+            "flagged; treat a False as 'probably needs a transfer' rather "
+            "than a hard proof."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "from_ref": {"type": "string", "description": "First anchor ref"},
+                "to_ref":   {"type": "string", "description": "Second anchor ref"},
+                "max_station_dist_km": {
+                    "type": "number", "default": 5, "minimum": 0.5, "maximum": 25,
+                    "description": "Only consider a station reachable from the anchor if it's within this many km.",
+                },
+                "min_routes_rail": {
+                    "type": "integer", "default": 1, "minimum": 1, "maximum": 50,
+                    "description": "Skip stops with fewer than this many rail routes. 1 keeps the check permissive (any rail service); raise to 2+ to require a busier station.",
+                },
+            },
+            "required": ["from_ref", "to_ref"],
+        },
+    },
+    {
         "name": "split_into_stages",
         "description": (
             "Split a route into daily stages of roughly `target_km_per_day`. "
@@ -440,12 +478,73 @@ def _load_stations_cache() -> list[dict]:
                                                     f["properties"].get("n_routes", 0)),
                 "n_routes_bus":  f["properties"].get("n_routes_bus", 0),
                 "n_lodging":     f["properties"].get("n_lodging", 0),
+                # country + gtfs_id are the join keys into the route-list
+                # sidecar (`rail_station_routes.json`) used by the
+                # `direct_rail_service` tool.
+                "country":       f["properties"].get("country"),
+                "gtfs_id":       f["properties"].get("gtfs_id"),
                 "lon": f["geometry"]["coordinates"][0],
                 "lat": f["geometry"]["coordinates"][1],
             }
             for f in fc.get("features", [])
         ]
     return _load_stations_cache._cache
+
+
+STATION_ROUTES_PATH = Path(DATA_DIR) / "rail_station_routes.json"
+
+
+def _load_station_routes_cache() -> dict[str, set[str]]:
+    """Load the per-station rail-route-id sidecar emitted by
+    `pgrouting/main.py export-rail-routes`. Keys are
+    `<country>:<gtfs_id>`; values are sets of GTFS route_ids serving
+    that station. Empty dict if the sidecar hasn't been produced yet."""
+    if not hasattr(_load_station_routes_cache, "_cache"):
+        if not STATION_ROUTES_PATH.exists():
+            _load_station_routes_cache._cache = {}
+        else:
+            data = json.loads(STATION_ROUTES_PATH.read_text())
+            _load_station_routes_cache._cache = {
+                k: set(v) for k, v in data.items()
+            }
+    return _load_station_routes_cache._cache
+
+
+def _stations_for_anchor(alon: float, alat: float,
+                          max_dist_m: float,
+                          min_routes_rail: int) -> list[tuple[float, dict]]:
+    """All rail stations near (alon, alat) meeting `min_routes_rail`,
+    within `max_dist_m`, sorted by distance. Empty list if none.
+
+    We return ALL nearby stations (not just the closest) so callers
+    like `direct_rail_service` can union the route_id sets — GTFS feed
+    dedup often misses sibling platforms and multi-terminal cities
+    (Wien Hbf vs Wien Mitte vs Praterstern) that a passenger would
+    consider interchangeable for "is this reachable by direct train"
+    purposes."""
+    stree, stations = _stations_kdtree()
+    hits: list[tuple[float, dict]] = []
+    if stree is None:
+        for s in stations:
+            if s.get("n_routes_rail", 0) < min_routes_rail:
+                continue
+            d = _hav_m(alon, alat, s["lon"], s["lat"])
+            if d <= max_dist_m:
+                hits.append((d, s))
+    else:
+        _MDEGLAT = 111_320.0
+        _MDEGLON = 111_320.0 * math.cos(math.radians(alat))
+        _min_mdeg = min(_MDEGLAT, _MDEGLON)
+        radius_deg = max_dist_m / _min_mdeg
+        for i in stree.query_ball_point([alon, alat], r=radius_deg):
+            s = stations[i]
+            if s.get("n_routes_rail", 0) < min_routes_rail:
+                continue
+            d = _hav_m(alon, alat, s["lon"], s["lat"])
+            if d <= max_dist_m:
+                hits.append((d, s))
+    hits.sort(key=lambda h: h[0])
+    return hits
 
 
 def _tool_stations_near(inp: dict) -> dict:
@@ -757,11 +856,100 @@ def _tool_stations_along_route(inp: dict) -> dict:
     }
 
 
+def _tool_direct_rail_service(inp: dict) -> dict:
+    """Intersect the route_id sets of the stations closest to two
+    anchors. Returns `direct_service` = whether the intersection is
+    non-empty, plus the matched stations and (trimmed) shared route
+    list."""
+    from_ref = inp.get("from_ref")
+    to_ref = inp.get("to_ref")
+    if not from_ref or not to_ref:
+        return {"error": "from_ref and to_ref are required"}
+    max_dist_m = float(inp.get("max_station_dist_km", 5)) * 1000.0
+    min_routes_rail = int(inp.get("min_routes_rail", 1))
+
+    prof = trunk_router._load_profile(DEFAULT_PROFILE)
+    ci_a = prof.city_idx_by_ref.get(from_ref)
+    ci_b = prof.city_idx_by_ref.get(to_ref)
+    if ci_a is None:
+        return {"error": f"unknown anchor ref: {from_ref}"}
+    if ci_b is None:
+        return {"error": f"unknown anchor ref: {to_ref}"}
+    a = prof.cities[int(ci_a)]
+    b = prof.cities[int(ci_b)]
+    alon, alat = float(a["lon"]), float(a["lat"])
+    blon, blat = float(b["lon"]), float(b["lat"])
+
+    a_hits = _stations_for_anchor(alon, alat, max_dist_m, min_routes_rail)
+    b_hits = _stations_for_anchor(blon, blat, max_dist_m, min_routes_rail)
+    if not a_hits:
+        return {
+            "direct_service": False,
+            "reason": (f"no station with >= {min_routes_rail} rail routes "
+                       f"within {max_dist_m/1000:.1f} km of {a.get('name')}"),
+            "from_anchor": {"ref": from_ref, "name": a.get("name")},
+            "to_anchor":   {"ref": to_ref,   "name": b.get("name")},
+        }
+    if not b_hits:
+        return {
+            "direct_service": False,
+            "reason": (f"no station with >= {min_routes_rail} rail routes "
+                       f"within {max_dist_m/1000:.1f} km of {b.get('name')}"),
+            "from_anchor": {"ref": from_ref, "name": a.get("name")},
+            "to_anchor":   {"ref": to_ref,   "name": b.get("name")},
+        }
+
+    routes = _load_station_routes_cache()
+    if not routes:
+        return {
+            "error": (
+                "route-id sidecar not present. Run "
+                "`pgrouting/main.py export-rail-routes` and copy the "
+                "output to data/rail_station_routes.json."
+            ),
+        }
+
+    def _union_routes(hits: list[tuple[float, dict]]) -> set[str]:
+        acc: set[str] = set()
+        for _, s in hits:
+            key = f"{s.get('country')}:{s.get('gtfs_id')}"
+            acc |= routes.get(key, set())
+        return acc
+
+    a_routes = _union_routes(a_hits)
+    b_routes = _union_routes(b_hits)
+    shared = sorted(a_routes & b_routes)
+    # Report the highest-n_routes_rail hit at each end as the
+    # representative (best proxy for the "main station").
+    a_repr = max(a_hits, key=lambda h: h[1].get("n_routes_rail", 0))
+    b_repr = max(b_hits, key=lambda h: h[1].get("n_routes_rail", 0))
+    return {
+        "direct_service": bool(shared),
+        "n_shared_routes": len(shared),
+        "from_station": {
+            "name": a_repr[1].get("name"),
+            "country": a_repr[1].get("country"),
+            "distance_km": round(a_repr[0] / 1000.0, 2),
+            "n_routes_rail": a_repr[1].get("n_routes_rail", 0),
+        },
+        "to_station": {
+            "name": b_repr[1].get("name"),
+            "country": b_repr[1].get("country"),
+            "distance_km": round(b_repr[0] / 1000.0, 2),
+            "n_routes_rail": b_repr[1].get("n_routes_rail", 0),
+        },
+        "n_from_stations_considered": len(a_hits),
+        "n_to_stations_considered": len(b_hits),
+        "shared_routes": shared[:20],
+    }
+
+
 TOOL_IMPLS = {
     "search_anchors":       _tool_search_anchors,
     "route":                _tool_route,
     "stations_near":        _tool_stations_near,
     "stations_along_route": _tool_stations_along_route,
+    "direct_rail_service":  _tool_direct_rail_service,
     "split_into_stages":    _tool_split_into_stages,
     "pois_near_anchor":     _tool_pois_near_anchor,
     "pois_along_route":     _tool_pois_along_route,

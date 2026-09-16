@@ -347,6 +347,10 @@ def _parse_gtfs(zip_paths: list[Path], country: str) -> list[dict]:
             "n_routes":      n_rail + n_bus,
             "n_routes_rail": n_rail,
             "n_routes_bus":  n_bus,
+            # Kept alongside the counts so `export-rail-routes` can
+            # emit a sidecar without re-parsing GTFS; _ingest_stations
+            # ignores this key.
+            "route_ids_rail": sorted(union_rail),
         })
     n_collapsed = len(candidates) - len(stations)
     print(f"[railways] gtfs: deduped {len(candidates):,} stops "

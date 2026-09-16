@@ -51,6 +51,7 @@ REGION_AWARE_TOOLS: frozenset[str] = frozenset({
     "pois_along_route",
     "pois_near_anchor",
     "stations_near",
+    "direct_rail_service",
 })
 
 
