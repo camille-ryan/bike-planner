@@ -7,15 +7,24 @@ Endpoints:
 """
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import APIRouter, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import json
 from pathlib import Path
 
+import os
+
 from . import chat, db, pois, tools as tools_mod, trunk_router
 from .settings import DEFAULT_PROFILE, SPT_DIR
+
+# CHAT_BACKEND=langgraph swaps /chat to the LangGraph fork
+# (api.app.chat_langgraph). Default is the native single-agent
+# tool-loop in api.app.chat. Both share tool implementations via
+# api.app.tools and speak the same SSE wire format so the web client
+# doesn't know which backend it's talking to.
+CHAT_BACKEND = os.environ.get("CHAT_BACKEND", "native").lower()
 
 
 @asynccontextmanager
@@ -49,7 +58,38 @@ def _parse_lonlat(s: str, name: str) -> tuple[float, float]:
     return (lon, lat)
 
 
-app.include_router(chat.router)
+# Register the chat router selected by CHAT_BACKEND. We also always
+# mount the OTHER backend at /chat_native or /chat_langgraph so a
+# demo can hit either one directly for side-by-side comparison
+# without an api restart.
+if CHAT_BACKEND == "langgraph":
+    from . import chat_langgraph
+    # LangGraph is /chat AND also at /chat_langgraph.
+    langgraph_only = APIRouter()
+    langgraph_only.add_api_route(
+        "/chat", chat_langgraph.chat_langgraph, methods=["POST"],
+    )
+    app.include_router(langgraph_only)
+    app.include_router(chat_langgraph.router)  # /chat_langgraph
+    # Native still available at /chat_native for A/B comparison.
+    native_only = APIRouter()
+    native_only.add_api_route("/chat_native", chat.chat, methods=["POST"])
+    app.include_router(native_only)
+    print(f"[main] CHAT_BACKEND=langgraph (/chat → langgraph, "
+          f"/chat_native → native, /chat_langgraph → langgraph)",
+          flush=True)
+else:
+    app.include_router(chat.router)  # /chat
+    # LangGraph mounted at /chat_langgraph so it's always available
+    # for A/B comparison from the same api container.
+    try:
+        from . import chat_langgraph
+        app.include_router(chat_langgraph.router)  # /chat_langgraph
+        print(f"[main] CHAT_BACKEND=native (/chat → native, "
+              f"/chat_langgraph → langgraph fork)", flush=True)
+    except ImportError as exc:
+        print(f"[main] CHAT_BACKEND=native (/chat only; langgraph fork "
+              f"unavailable: {exc})", flush=True)
 
 
 # ---------------------------------------------------------------------------

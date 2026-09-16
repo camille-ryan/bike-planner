@@ -4,3 +4,8 @@ numpy==1.26.4
 scipy==1.13.1
 psycopg[binary]==3.2.3
 anthropic==0.42.0
+# LangGraph fork (experiment/langchain-chat branch). Selected at
+# runtime via CHAT_BACKEND=native|langgraph — see api/app/main.py.
+langgraph==0.2.60
+langchain-core==0.3.28
+langchain-anthropic==0.3.1
