@@ -94,6 +94,38 @@ and the judge).
 
 ---
 
+## Observability
+
+`/chat` emits a structured trace event per request/round/tool_call to
+stdout as `[chat-trace] {...json...}` lines. Docker captures them, so
+`docker logs bike-api` is the transport — no new sink to configure.
+
+Render one request's timeline as a tree:
+
+```
+docker logs bike-api 2>&1 | python3 scripts/trace_view.py --last
+```
+
+or pick a specific request by id:
+
+```
+docker logs bike-api 2>&1 | python3 scripts/trace_view.py --list
+docker logs bike-api 2>&1 | python3 scripts/trace_view.py \
+    --request-id a3f7b1c2
+```
+
+Each round line carries `latency_ms` + Anthropic-reported
+`usage.input_tokens`/`output_tokens`, so cost per request is a
+straight sum against Sonnet pricing. Tool_call lines carry per-call
+`latency_ms` too, which is how the "cold blob load takes 3–5 s on a
+novel corridor" claim in the lazy-load commit was measured.
+
+Event schema is stable — see `api/app/tracing.py`. Downstream sinks
+(OpenTelemetry, Langfuse) can hook in by adding another `_emit`
+target in that module.
+
+---
+
 ## Original project name
 
 A self-supported bike-tour planner for the Graz → Copenhagen corridor.

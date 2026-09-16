@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, Iterator
 
 import anthropic
@@ -20,6 +21,7 @@ from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
 from .tools import TOOLS, TOOL_IMPLS
+from .tracing import RequestTrace
 
 
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-sonnet-5")
@@ -133,19 +135,43 @@ def _friendly_error(exc: Exception) -> str:
     return f"Something broke internally ({name}). Try again, or hit Reset if it keeps failing."
 
 
+def _prompt_head(messages: list[dict]) -> str:
+    """First-user-message summary for trace correlation."""
+    for m in messages:
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        return b.get("text", "")
+    return ""
+
+
 def _run_chat(req: ChatRequest, client: anthropic.Anthropic) -> Iterator[bytes]:
     messages: list[dict] = [_msg_to_api(m) for m in req.messages]
 
-    try:
-        yield from _run_chat_inner(client, messages)
-    except Exception as exc:
-        # Never let a mid-stream exception crash the SSE with no signal
-        # to the client — emit a clean `event: error` and close cleanly.
-        yield _sse("error", {"message": _friendly_error(exc)})
+    with RequestTrace(model=CHAT_MODEL,
+                      prompt_head=_prompt_head(messages)) as tr:
+        try:
+            yield from _run_chat_inner(client, messages, tr)
+        except Exception as exc:
+            # Never let a mid-stream exception crash the SSE with no
+            # signal to the client — emit a clean `event: error` and
+            # close cleanly.
+            tr.set_error(f"{type(exc).__name__}: {exc}")
+            yield _sse("error", {"message": _friendly_error(exc)})
 
 
-def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict]) -> Iterator[bytes]:
+def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
+                    tr: RequestTrace) -> Iterator[bytes]:
     for round_i in range(CHAT_MAX_TOOL_ROUNDS):
+        tr.round_start(round_i, messages_len=len(messages))
+        # `time.monotonic()`, not `time.time()` — WSL2's wall clock
+        # can jump backward on VM resume, which produced negative
+        # latency_ms values on the first Phase 6 smoke run.
+        t_round = time.monotonic()
         with client.messages.stream(
             model=CHAT_MODEL,
             max_tokens=16384,
@@ -162,9 +188,25 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict]) -> Iterat
 
         n_text = sum(1 for b in final.content if b.type == "text")
         n_tool = sum(1 for b in final.content if b.type == "tool_use")
-        print(f"[chat] round {round_i+1}/{CHAT_MAX_TOOL_ROUNDS}  "
-              f"stop_reason={final.stop_reason}  "
-              f"text_blocks={n_text}  tool_uses={n_tool}",
+        round_ms = int((time.monotonic() - t_round) * 1000)
+        usage = getattr(final, "usage", None)
+        usage_dict = None
+        if usage is not None:
+            usage_dict = {
+                "input_tokens":  getattr(usage, "input_tokens", None),
+                "output_tokens": getattr(usage, "output_tokens", None),
+            }
+        tr.round_end(
+            round_i=round_i,
+            stop_reason=str(final.stop_reason),
+            n_text=n_text,
+            n_tool=n_tool,
+            latency_ms=round_ms,
+            usage=usage_dict,
+        )
+        print(f"[chat] {tr.request_id} round {round_i+1}/{CHAT_MAX_TOOL_ROUNDS}"
+              f" stop={final.stop_reason} text={n_text} tools={n_tool}"
+              f" {round_ms}ms",
               flush=True)
 
         # Thinking blocks are stripped: Sonnet 5's extended reasoning
@@ -185,12 +227,14 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict]) -> Iterat
                     "finishing the answer. Raise max_tokens in chat.py "
                     "or ask for a smaller scope."
                 )})
+            tr.set_stop_reason(str(final.stop_reason))
             yield _sse("done", {"stop_reason": final.stop_reason})
             return
 
         tool_uses = [b for b in final.content if b.type == "tool_use"]
         tool_results = []
         for tu in tool_uses:
+            t_tool = time.monotonic()
             impl = TOOL_IMPLS.get(tu.name)
             if impl is None:
                 result = {"error": f"unknown tool: {tu.name}"}
@@ -199,8 +243,13 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict]) -> Iterat
                     result = impl(tu.input)
                 except Exception as e:
                     result = {"error": f"{type(e).__name__}: {e}"}
+            tool_ms = int((time.monotonic() - t_tool) * 1000)
+            tr.tool_call(round_i=round_i, name=tu.name,
+                         input=dict(tu.input) if tu.input else {},
+                         output=result, latency_ms=tool_ms)
             summary_result = _strip_bulk_for_llm(tu.name, result)
-            print(f"[chat.tool] {tu.name}({tu.input}) → {summary_result}",
+            print(f"[chat.tool] {tr.request_id} {tu.name}({tu.input}) "
+                  f"→ {summary_result} {tool_ms}ms",
                   flush=True)
             # Stream the FULL tool call + result to the client so the
             # frontend can redraw the map; the LLM only sees the
@@ -216,8 +265,10 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict]) -> Iterat
             })
         messages.append({"role": "user", "content": tool_results})
 
-    print(f"[chat] hit CHAT_MAX_TOOL_ROUNDS={CHAT_MAX_TOOL_ROUNDS} "
-          f"without a final text response", flush=True)
+    tr.set_stop_reason("max_rounds")
+    print(f"[chat] {tr.request_id} hit CHAT_MAX_TOOL_ROUNDS="
+          f"{CHAT_MAX_TOOL_ROUNDS} without a final text response",
+          flush=True)
     yield _sse("error", {"message": (
         f"Ran out of tool-loop rounds ({CHAT_MAX_TOOL_ROUNDS}) before "
         f"finishing the plan. Try a narrower prompt, or raise "
