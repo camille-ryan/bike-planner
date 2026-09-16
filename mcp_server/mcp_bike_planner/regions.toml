@@ -1,0 +1,46 @@
+# Regional backend config for the MCP dispatcher.
+#
+# The MCP server routes each tool call to a backend based on:
+#   (a) whether the tool is region-aware (route, stations_along_route,
+#       pois_along_route, pois_near_anchor, stations_near) or
+#       region-agnostic (search_anchors, split_into_stages);
+#   (b) the coordinate the args resolve to (via anchor lookup or
+#       a raw lon/lat), matched against each region's bbox.
+#
+# Region-agnostic tools always go to `default`.
+# Region-aware tools go to the first region whose bbox contains the
+# tool's target coord; if no region matches, they fall back to `default`.
+
+default = "local"
+
+# In-process Python backend — imports api.app.tools directly. Fastest
+# per-call latency (no network hop), but requires the api/ package's
+# deps (numpy, scipy, psycopg, ...) to be installed alongside the MCP
+# server. Best when the MCP process is running on the same machine as
+# the data.
+[backends.local]
+kind = "local_python"
+
+# ---------------------------------------------------------------------
+# Example: a second regional shard (four-corners US states). Uncomment
+# and adjust when a US-southwest api container is up:
+#
+#   1. Ingest AZ/CO/NM/UT PBFs into a second postgres+api stack.
+#   2. Bring it up on http://us-southwest-api:8000 (docker network or
+#      a public URL — HttpForward doesn't care).
+#   3. Uncomment the block below, restart the MCP server.
+#
+# Nothing else changes. Tool schemas, LLM system prompts, chat client
+# code — all stay the same. That's the point of the dispatcher: tool
+# INTERFACE is decoupled from tool IMPLEMENTATION.
+# ---------------------------------------------------------------------
+
+# [backends.us_southwest]
+# kind = "http_forward"
+# url  = "http://us-southwest-api:8000"
+# bbox = [-114.0, 31.3, -102.0, 42.0]     # [min_lon, min_lat, max_lon, max_lat]
+
+# [backends.eu_central]
+# kind = "http_forward"
+# url  = "http://localhost:8001"           # or http://bike-api:8000 from within docker
+# bbox = [5.5, 47.1, 19.0, 55.2]           # AT + CZ + DE + DK bbox

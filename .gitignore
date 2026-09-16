@@ -36,3 +36,8 @@ __pycache__/
 # API secrets — ANTHROPIC_API_KEY etc. Ship api/.env.example for the
 # shape; keep the real values local.
 api/.env
+
+# MCP server build artifacts (from `pip install -e mcp_server`)
+mcp_server/*.egg-info/
+mcp_server/build/
+mcp_server/dist/

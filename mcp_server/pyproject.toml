@@ -1,0 +1,31 @@
+[project]
+name = "bike-planner-mcp"
+version = "0.1.0"
+description = "MCP server exposing bike-tour planning tools to Claude Desktop / Claude Code / any MCP client."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Ryan Brady" }]
+
+# Kept lean on purpose: mcp for the stdio protocol, httpx for the
+# HttpForward backend, tomllib is stdlib on 3.11+. When the LocalPython
+# backend is active it imports api.app.tools directly and pulls in the
+# api/ package's own deps (numpy, scipy, psycopg, ...) transitively.
+dependencies = [
+    "mcp>=1.2.0",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+bike-planner-mcp = "mcp_bike_planner.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcp_bike_planner*"]
+
+[tool.setuptools.package-data]
+mcp_bike_planner = ["regions.toml"]
