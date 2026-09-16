@@ -14,7 +14,7 @@ from pydantic import BaseModel
 import json
 from pathlib import Path
 
-from . import chat, db, pois, trunk_router
+from . import chat, db, pois, tools as tools_mod, trunk_router
 from .settings import DEFAULT_PROFILE, SPT_DIR
 
 
@@ -50,6 +50,39 @@ def _parse_lonlat(s: str, name: str) -> tuple[float, float]:
 
 
 app.include_router(chat.router)
+
+
+# ---------------------------------------------------------------------------
+# Tool endpoints — expose every entry in `tools.TOOL_IMPLS` as
+# `POST /tools/<name>` so external callers (the MCP server's
+# HttpForward backend, an eval harness, or any other agent) can invoke
+# them without going through the LLM-driven /chat SSE loop.
+#
+# JSON in, JSON out. Same shape as what the chat SSE emits inside a
+# tool_call event. Errors return {"error": ...} in the body with a
+# 200 (the tool itself failed, not the transport).
+
+
+class ToolCallRequest(BaseModel):
+    args: dict = {}
+
+
+@app.get("/tools")
+def list_tools() -> dict:
+    """Return the JSON-schema tool catalog. Same shape passed to
+    Anthropic messages.stream(tools=…) and consumed by MCP clients."""
+    return {"tools": tools_mod.TOOLS}
+
+
+@app.post("/tools/{name}")
+def call_tool(name: str, req: ToolCallRequest) -> dict:
+    """Invoke a named tool with `args`. Wraps `tools.call_tool` which
+    already normalizes exceptions into `{"error": ...}` — no separate
+    HTTP status for tool failures. 404 only when the tool NAME is
+    unknown at the transport level."""
+    if name not in tools_mod.TOOL_IMPLS:
+        raise HTTPException(404, f"unknown tool: {name}")
+    return tools_mod.call_tool(name, req.args or {})
 
 
 @app.get("/health")
