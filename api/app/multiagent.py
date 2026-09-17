@@ -406,6 +406,38 @@ async def run_multiagent_plan(
         "role": "merge", "status": "ok",
     }, agent_id=merge_id)
 
+    # ---- Stage 4: post-plan enrichment (lodging + transit) ----
+    # After the merge lands the final Markdown, fan out per-overnight
+    # LodgingAgents and per-consecutive-pair TransitAgents. These
+    # run in parallel using the same coordinator/queue pattern as
+    # the segment fan-out. If enrichment fails, the plan itself is
+    # still complete — enrichment cards just don't appear.
+    from . import enrichment, trunk_router
+    from .settings import DEFAULT_PROFILE
+    prof = trunk_router._load_profile(DEFAULT_PROFILE)
+    overnights: list[dict] = []
+    for hub in plan.corridor_hubs:
+        ref = hub.get("ref")
+        ci = prof.city_idx_by_ref.get(ref) if ref else None
+        if ci is None:
+            continue
+        c = prof.cities[int(ci)]
+        overnights.append({
+            "ref":    ref,
+            "name":   hub.get("name") or c.get("name"),
+            "day":    len(overnights),
+            "lonlat": f"{float(c['lon'])},{float(c['lat'])}",
+        })
+    try:
+        async for chunk in enrichment.run_enrichment_stage(
+            overnights, client, parent_trace,
+        ):
+            yield chunk
+    except Exception as exc:
+        yield _sse("error", {
+            "message": f"Enrichment stage failed: {type(exc).__name__}: {exc}",
+        })
+
     yield _sse("done", {"stop_reason": "end_turn"})
 
 

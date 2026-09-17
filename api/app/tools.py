@@ -179,6 +179,60 @@ TOOLS = [
         },
     },
     {
+        "name": "search_lodging",
+        "description": (
+            "Find lodging (hotels, hostels, guest houses, motels) "
+            "near a `lon,lat` from the OSM POI database. Returns each "
+            "with `name`, `subtype` (hotel/hostel/guest_house/motel), "
+            "`distance_m` from the query point, and — when OSM has "
+            "them tagged — `website`, `phone`, `stars`, `brand`. "
+            "Used by the post-plan enrichment sub-agent per "
+            "overnight; no external API keys required."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "lonlat": {"type": "string", "description": "'lon,lat'"},
+                "radius_km": {
+                    "type": "number", "default": 1.5, "minimum": 0.1, "maximum": 10,
+                    "description": "Search radius from the query point.",
+                },
+                "limit": {"type": "integer", "default": 12, "minimum": 1, "maximum": 50},
+                "subtypes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional whitelist: e.g. ['hotel','hostel']. Omit to include all lodging subtypes.",
+                },
+            },
+            "required": ["lonlat"],
+        },
+    },
+    {
+        "name": "train_booking_links",
+        "description": (
+            "Deep-link URLs into national rail-operator booking sites "
+            "for a `from_ref` → `to_ref` train, optionally on a "
+            "specific `date`. Returns 1-3 URLs ranked by operator "
+            "coverage for the country pair (ČD idos.cz for CZ-internal, "
+            "bahn.de for cross-border since DB has widest Europe "
+            "coverage, ÖBB / DSB for their internal legs). No prices, "
+            "no availability — just links the user can click to buy "
+            "the ticket themselves. Deterministic; no external API."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "from_ref": {"type": "string"},
+                "to_ref":   {"type": "string"},
+                "date": {
+                    "type": "string",
+                    "description": "ISO date YYYY-MM-DD (optional; some operators infer 'next available' if omitted).",
+                },
+            },
+            "required": ["from_ref", "to_ref"],
+        },
+    },
+    {
         "name": "stations_along_route",
         "description": (
             "Rail-accessible ANCHOR CITIES along the last-computed "
@@ -1440,6 +1494,166 @@ def _tool_rail_path(inp: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------
+# Post-plan enrichment tools (lodging + transit booking)
+
+_LODGING_SUBTYPES_DEFAULT = ("hotel", "hostel", "guest_house", "motel")
+
+
+def _tool_search_lodging(inp: dict) -> dict:
+    """Find OSM tourism=hotel/hostel/guest_house/motel within a radius
+    of the query point. Wraps `pois.query_bbox(category='lodging')`
+    with a subtype filter + haversine sort.
+    """
+    try:
+        lon, lat = (float(x) for x in (inp.get("lonlat") or "").split(","))
+    except (ValueError, AttributeError):
+        return {"error": "provide lonlat as 'lon,lat'"}
+    radius_km = float(inp.get("radius_km", 1.5))
+    limit = int(inp.get("limit", 12))
+    subtypes = tuple(inp.get("subtypes") or _LODGING_SUBTYPES_DEFAULT)
+
+    # Bbox for the SpatiaLite search (~1.5 km at central-EU lat ≈
+    # 0.014° lat, 0.02° lon).
+    _MDEGLAT = 111_320.0
+    _MDEGLON = 111_320.0 * math.cos(math.radians(lat))
+    d_lat = (radius_km * 1000.0) / _MDEGLAT
+    d_lon = (radius_km * 1000.0) / max(_MDEGLON, 1.0)
+    bbox = (lon - d_lon, lat - d_lat, lon + d_lon, lat + d_lat)
+
+    raw = pois.query_bbox(bbox, ["lodging"], max(limit * 4, 40))
+    out: list[dict] = []
+    for p in raw:
+        st = (p.get("subtype") or "").lower()
+        if subtypes and st and st not in subtypes:
+            continue
+        d = _hav_m(lon, lat, float(p["lon"]), float(p["lat"]))
+        if d > radius_km * 1000.0:
+            continue
+        tags = p.get("tags") or {}
+        out.append({
+            "name":        p.get("name"),
+            "subtype":     st or None,
+            "lon":         float(p["lon"]),
+            "lat":         float(p["lat"]),
+            "distance_m":  round(d, 0),
+            "website":     tags.get("website") or tags.get("contact:website"),
+            "phone":       tags.get("phone") or tags.get("contact:phone"),
+            "stars":       tags.get("stars"),
+            "brand":       tags.get("brand") or tags.get("operator"),
+        })
+    out.sort(key=lambda x: x["distance_m"])
+    return {"results": out[:limit], "n_total": len(out)}
+
+
+# Country → operator booking site. Each entry is a (label, url_fn)
+# where url_fn takes (from_name, to_name, date_iso_or_None). Trained
+# on stable public URLs; may need periodic refresh as operators
+# redesign their booking flows.
+def _url_bahn(from_name: str, to_name: str, date: str | None) -> str:
+    """bahn.de covers cross-border; accepts free-text station names."""
+    import urllib.parse as up
+    q = {
+        "sts": "true",
+        "so": from_name, "zo": to_name,  # start / end place-name
+    }
+    if date:
+        # bahn.de expects dd.mm.yyyy but the modern journey planner
+        # takes an ISO string in the `hd` param too; use plain search.
+        q["hd"] = date
+    return "https://reiseauskunft.bahn.de/bin/query.exe/dn?" + up.urlencode(q)
+
+
+def _url_idos(from_name: str, to_name: str, date: str | None) -> str:
+    """CZ national timetable — supports name-based queries."""
+    import urllib.parse as up
+    q = {"f": from_name, "t": to_name}
+    if date:
+        q["date"] = date
+    return "https://idos.cz/vlakyautobusymhdvse/spojeni/?" + up.urlencode(q)
+
+
+def _url_oebb(from_name: str, to_name: str, date: str | None) -> str:
+    import urllib.parse as up
+    q = {"from": from_name, "to": to_name}
+    if date:
+        q["date"] = date
+    return "https://tickets.oebb.at/en/ticket/tickets?" + up.urlencode(q)
+
+
+def _url_rejseplanen(from_name: str, to_name: str, date: str | None) -> str:
+    import urllib.parse as up
+    q = {"S": from_name, "Z": to_name}
+    if date:
+        q["date"] = date
+    return "https://www.rejseplanen.dk/webapp/index.html#!?" + up.urlencode(q)
+
+
+def _tool_train_booking_links(inp: dict) -> dict:
+    """Deterministic deep-links per country pair. Picks the operator
+    whose booking site best covers the (from_country, to_country)
+    pair: cross-border → DB (widest Europe coverage); same-country
+    → that country's operator."""
+    from_ref = inp.get("from_ref")
+    to_ref = inp.get("to_ref")
+    date = inp.get("date")
+    if not from_ref or not to_ref:
+        return {"error": "provide from_ref and to_ref"}
+    prof = trunk_router._load_profile(DEFAULT_PROFILE)
+    f_ci = prof.city_idx_by_ref.get(from_ref)
+    t_ci = prof.city_idx_by_ref.get(to_ref)
+    if f_ci is None:
+        return {"error": f"unknown from_ref: {from_ref}"}
+    if t_ci is None:
+        return {"error": f"unknown to_ref: {to_ref}"}
+    fc = prof.cities[f_ci]
+    tc = prof.cities[t_ci]
+    from_name = fc.get("name") or from_ref
+    to_name = tc.get("name") or to_ref
+    from_country = fc.get("country")
+    to_country = tc.get("country")
+
+    # Pick operator(s). Cross-border → DB (has widest coverage of
+    # foreign stations); same-country → national operator + DB as a
+    # cross-check.
+    urls: list[dict] = []
+    if from_country == to_country:
+        internal = {
+            "czech-republic": ("ČD (idos.cz)", _url_idos),
+            "austria":        ("ÖBB",           _url_oebb),
+            "germany":        ("DB (bahn.de)",  _url_bahn),
+            "denmark":        ("Rejseplanen",   _url_rejseplanen),
+        }.get(from_country)
+        if internal:
+            label, fn = internal
+            urls.append({"operator": label, "url": fn(from_name, to_name, date)})
+        # DB as fallback (works cross-border AND for CZ/AT with
+        # station name matching).
+        urls.append({"operator": "DB (bahn.de)",
+                     "url": _url_bahn(from_name, to_name, date)})
+    else:
+        # Cross-border — DB is the safest bet.
+        urls.append({"operator": "DB (bahn.de)",
+                     "url": _url_bahn(from_name, to_name, date)})
+        # And the origin country's operator for a per-country
+        # backup:
+        internal = {
+            "czech-republic": ("ČD (idos.cz)", _url_idos),
+            "austria":        ("ÖBB",           _url_oebb),
+            "denmark":        ("Rejseplanen",   _url_rejseplanen),
+        }.get(from_country)
+        if internal:
+            label, fn = internal
+            urls.append({"operator": label, "url": fn(from_name, to_name, date)})
+
+    return {
+        "from_ref":  from_ref, "to_ref":  to_ref,
+        "from_name": from_name, "to_name": to_name,
+        "from_country": from_country, "to_country": to_country,
+        "urls": urls,
+    }
+
+
 TOOL_IMPLS = {
     "search_anchors":       _tool_search_anchors,
     "route":                _tool_route,
@@ -1451,6 +1665,8 @@ TOOL_IMPLS = {
     "split_into_stages":    _tool_split_into_stages,
     "pois_near_anchor":     _tool_pois_near_anchor,
     "pois_along_route":     _tool_pois_along_route,
+    "search_lodging":       _tool_search_lodging,
+    "train_booking_links":  _tool_train_booking_links,
 }
 
 

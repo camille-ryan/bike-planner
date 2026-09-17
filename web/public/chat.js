@@ -106,6 +106,12 @@ function _agentBubbleTitle(role, data) {
     const to   = data.to_name   ?? "?";
     return `▸ Segment ${i}: ${from} → ${to}`;
   }
+  if (role === "lodging") {
+    return `▸ Lodging near ${data.overnight_name ?? "?"}…`;
+  }
+  if (role === "transit") {
+    return `▸ Train: ${data.from_name ?? "?"} → ${data.to_name ?? "?"}…`;
+  }
   return `▸ Agent ${data.agent_id || ""}`;
 }
 
@@ -119,6 +125,14 @@ function _agentBubbleDone(role, data) {
     const from = agentBubbles.get(`seg[${i}]`)?.headerData?.from_name ?? "?";
     const to   = agentBubbles.get(`seg[${i}]`)?.headerData?.to_name   ?? "?";
     return `${s} Segment ${i}: ${from} → ${to}${wall}`;
+  }
+  if (role === "lodging") {
+    const hd = agentBubbles.get(data.agent_id)?.headerData || {};
+    return `${s} Lodging near ${hd.overnight_name ?? "?"}${wall}`;
+  }
+  if (role === "transit") {
+    const hd = agentBubbles.get(data.agent_id)?.headerData || {};
+    return `${s} Train ${hd.from_name ?? "?"} → ${hd.to_name ?? "?"}${wall}`;
   }
   return `${s} Agent ${data.agent_id || ""}${wall}`;
 }
@@ -144,10 +158,14 @@ function handleAgentStart(data) {
     container, header, tools, textDiv,
     textBuf: "",
     headerData: {
-      segment_i: data.segment_i,
-      from_name: data.from_name,
-      to_name:   data.to_name,
-      role:      data.role,
+      segment_i:      data.segment_i,
+      from_name:      data.from_name,
+      to_name:        data.to_name,
+      role:           data.role,
+      overnight_i:    data.overnight_i,
+      overnight_ref:  data.overnight_ref,
+      overnight_name: data.overnight_name,
+      pair_i:         data.pair_i,
     },
   });
 }
@@ -173,6 +191,78 @@ function handleAgentEnd(data) {
 
 function clearAgentBubbles() {
   agentBubbles.clear();
+}
+
+// ---------- Enrichment renderers (lodging + transit) ----------
+
+function renderLodgingCards(bubble, input) {
+  const hotels = Array.isArray(input?.hotels) ? input.hotels : [];
+  const summary = input?.summary || "";
+  const wrap = document.createElement("div");
+  wrap.className = "lodging-cards";
+  if (summary) {
+    const s = document.createElement("div");
+    s.className = "lodging-summary";
+    s.textContent = summary;
+    wrap.appendChild(s);
+  }
+  if (!hotels.length) {
+    const empty = document.createElement("div");
+    empty.className = "lodging-empty";
+    empty.textContent = "No nearby lodging in the OSM dataset for this overnight.";
+    wrap.appendChild(empty);
+  }
+  for (const h of hotels) {
+    const card = document.createElement("div");
+    card.className = "lodging-card";
+    const title = h.website
+      ? `<a href="${escape(h.website)}" target="_blank" rel="noopener">${escape(h.name || "(unnamed)")}</a>`
+      : `<span>${escape(h.name || "(unnamed)")}</span>`;
+    const meta = [];
+    if (h.subtype)  meta.push(escape(h.subtype));
+    if (h.stars)    meta.push(`${escape(String(h.stars))}★`);
+    if (h.distance_m) meta.push(`${Math.round(h.distance_m)} m from stop`);
+    card.innerHTML =
+      `<div class="lodging-card-title">${title}</div>` +
+      (meta.length ? `<div class="lodging-card-meta">${meta.join(" · ")}</div>` : "");
+    wrap.appendChild(card);
+  }
+  bubble.textDiv.appendChild(wrap);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function renderTransitLinks(bubble, input) {
+  const wrap = document.createElement("div");
+  wrap.className = "transit-block";
+  if (typeof input?.direct_rail === "boolean") {
+    const badge = document.createElement("div");
+    badge.className = `transit-badge ${input.direct_rail ? "direct" : "transfer"}`;
+    badge.textContent = input.direct_rail
+      ? "✓ Direct-train available"
+      : "⚠ Transfer required — no direct train found";
+    wrap.appendChild(badge);
+  }
+  const summary = input?.summary || "";
+  if (summary) {
+    const s = document.createElement("div");
+    s.className = "transit-summary";
+    s.textContent = summary;
+    wrap.appendChild(s);
+  }
+  const urls = Array.isArray(input?.booking_urls) ? input.booking_urls : [];
+  if (urls.length) {
+    const ul = document.createElement("ul");
+    ul.className = "transit-links";
+    for (const u of urls) {
+      const li = document.createElement("li");
+      li.innerHTML =
+        `<a href="${escape(u.url)}" target="_blank" rel="noopener">Book on ${escape(u.operator || "operator")}</a>`;
+      ul.appendChild(li);
+    }
+    wrap.appendChild(ul);
+  }
+  bubble.textDiv.appendChild(wrap);
+  logEl.scrollTop = logEl.scrollHeight;
 }
 
 function escape(s) {
@@ -809,6 +899,26 @@ async function streamChat(userText) {
           addToolPending(ev.data.id, ev.data.name, ev.data.input, container);
           tickStatus();
         } else if (ev.event === "tool_call") {
+          // Enrichment terminal tools carry their user-facing payload
+          // in `input` (the sub-agent's submit_lodging / submit_transit
+          // args). Render them as cards inside the bubble's text area
+          // instead of a stock 🔧 tool row.
+          if (bubble && ev.data.name === "submit_lodging") {
+            renderLodgingCards(bubble, ev.data.input);
+            resolveToolPending(
+              ev.data.id, ev.data.name, ev.data.input, ev.data.output);
+            toolCount += 1;
+            tickStatus();
+            continue;
+          }
+          if (bubble && ev.data.name === "submit_transit") {
+            renderTransitLinks(bubble, ev.data.input);
+            resolveToolPending(
+              ev.data.id, ev.data.name, ev.data.input, ev.data.output);
+            toolCount += 1;
+            tickStatus();
+            continue;
+          }
           // If we already showed a "(running…)" pending row for this
           // id, mutate it in place; otherwise append a fresh bubble
           // in the right container.

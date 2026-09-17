@@ -189,3 +189,40 @@ footer code { background: #efefef; padding: 0 0.2rem; border-radius: 2px; }
 .chat-msg.tool.pending .running {
   color: #888; font-style: italic; margin-left: 0.3rem;
 }
+
+/* ---------- Lodging + transit enrichment ---------- */
+
+.chat-agent-bubble.role-lodging { border-color: #d9b177; background: #fbf7ee; }
+.chat-agent-bubble.role-transit { border-color: #77b4d9; background: #eef5fb; }
+
+.lodging-summary,
+.transit-summary {
+  font-size: 0.82rem;
+  color: #444;
+  margin: 0.3rem 0;
+  font-style: italic;
+}
+.lodging-empty {
+  font-size: 0.78rem; color: #888; margin: 0.3rem 0;
+}
+.lodging-cards { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.3rem; }
+.lodging-card {
+  background: #fff; border: 1px solid #e2d7bd; border-radius: 4px;
+  padding: 0.35rem 0.5rem; font-size: 0.83rem;
+}
+.lodging-card-title { font-weight: 600; }
+.lodging-card-title a { color: #2c5c8f; text-decoration: none; }
+.lodging-card-title a:hover { text-decoration: underline; }
+.lodging-card-meta { font-size: 0.75rem; color: #666; margin-top: 0.15rem; }
+
+.transit-block { margin-top: 0.3rem; }
+.transit-badge {
+  display: inline-block; padding: 0.15rem 0.45rem;
+  border-radius: 3px; font-size: 0.78rem; font-weight: 600;
+}
+.transit-badge.direct   { background: #dcefda; color: #2b5c22; }
+.transit-badge.transfer { background: #f7e3cf; color: #7a4a1a; }
+.transit-links { list-style: none; margin: 0.35rem 0 0; padding: 0; }
+.transit-links li { font-size: 0.82rem; margin: 0.15rem 0; }
+.transit-links a { color: #2c5c8f; text-decoration: none; }
+.transit-links a:hover { text-decoration: underline; }
