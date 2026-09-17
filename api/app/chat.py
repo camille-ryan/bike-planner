@@ -102,6 +102,7 @@ Workflow — do exactly what the user asked, no more. DO NOT stop mid-workflow f
 - **`split_into_stages` already returns per-stage km, from/to anchor names+refs, and full polylines.** After it returns, narrate the days directly from that result. DO NOT call `route` on each consecutive stage pair to "get the km" — you already have it. DO NOT call `route` and `split_into_stages` on the same segment; pick one. Only re-`route` a stage if the user explicitly asks for an alternate routing on that specific stage.
 - For a multi-leg tour (Graz→Wien→Praha→Berlin→Hamburg→CPH), one `split_into_stages` call covers the whole thing when you pass the intermediate hubs as `via_refs`. Don't call `split_into_stages` per-leg AND once for the whole trip — the whole-trip call is authoritative.
 - Budget: your tool loop is capped. A 50-day plan burns budget fast if you route each day individually. Prefer one whole-trip `split_into_stages` + one `direct_rail_service_batch` + one `stations_along_route` (if rail matters). Leave ≥30% of the budget for the final narrative response.
+- **Phase-stream your writeup, don't dump it at the end.** For a multi-hub plan (Graz→Wien→Praha→…), the user's UI renders your text tokens in real time. Write each phase's narrative in the SAME round that its tool results come back — heading, table, rail-check summary — THEN if you still need tool calls for later phases, emit them in the same response. The model API happily combines text output + tool_use in one round. Do NOT wait until every last tool call has returned to start writing. A plan that streams phase-by-phase feels dramatically faster than one that appears all at once at minute 11.
 - Call `stations_near` ONLY if the user asked about rail, train, meeting the partner, or station-accessible overnights.
 - When you need rail-accessible overnights across multiple candidate towns along a route, PREFER `stations_along_route` (one call, returns the ranked corridor) over N × `stations_near` calls.
 - If the user's prompt uses the words "direct train", "non-transfer", "one-seat", or "single change" (or asks that overnights be reachable by a direct train from a specific place / hub), you MUST verify direct rail service. `n_routes_rail` alone does not prove direct service — a station with 20 routes may still require a transfer to reach the hub the user cares about. Choose the tool by count:
@@ -179,10 +180,73 @@ def _run_chat(req: ChatRequest, client: anthropic.Anthropic) -> Iterator[bytes]:
             yield _sse("error", {"message": _friendly_error(exc)})
 
 
+def _cached_system() -> list[dict]:
+    """System prompt as a single cacheable block. Anthropic caches
+    the prefix up to and including the cache_control breakpoint;
+    since SYSTEM_PROMPT is stable, marking it once means every round
+    after the first pays a fraction of the input-token cost and
+    lands the tokens faster."""
+    return [{
+        "type": "text",
+        "text": SYSTEM_PROMPT,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+def _cached_tools() -> list[dict]:
+    """Tool schemas with a cache breakpoint at the last tool — that
+    caches the entire tool list. ~2.6k input tokens re-sent every
+    round; caching them collapses that."""
+    out = [dict(t) for t in TOOLS]
+    out[-1] = {**out[-1], "cache_control": {"type": "ephemeral"}}
+    return out
+
+
+def _shift_message_cache_breakpoint(messages: list[dict]) -> None:
+    """Anthropic allows at most 4 cache_control breakpoints per
+    request. We already spend 2 on system + tools. The remaining
+    budget goes to the growing conversation: mark the LAST content
+    block of the latest message as a breakpoint, and clear any
+    breakpoint on earlier messages so we don't blow the limit.
+
+    Effect: every round after the first, the whole prior
+    conversation is a cache hit — only the new turn is fresh input.
+    Since our messages grow by (assistant_turn + user_tool_results)
+    each round and earlier turns never mutate, the cached prefix
+    matches on each subsequent round.
+
+    Handles both string content (first user message) and block
+    content (all subsequent assistant/tool_results turns).
+    """
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and "cache_control" in block:
+                    del block["cache_control"]
+    if not messages:
+        return
+    last = messages[-1]
+    content = last.get("content")
+    if isinstance(content, str):
+        last["content"] = [{
+            "type": "text",
+            "text": content,
+            "cache_control": {"type": "ephemeral"},
+        }]
+    elif isinstance(content, list) and content:
+        block = content[-1]
+        if isinstance(block, dict):
+            block["cache_control"] = {"type": "ephemeral"}
+
+
 def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
                     tr: RequestTrace) -> Iterator[bytes]:
+    system_blocks = _cached_system()
+    tools_cached = _cached_tools()
     for round_i in range(CHAT_MAX_TOOL_ROUNDS):
         tr.round_start(round_i, messages_len=len(messages))
+        _shift_message_cache_breakpoint(messages)
         # `time.monotonic()`, not `time.time()` — WSL2's wall clock
         # can jump backward on VM resume, which produced negative
         # latency_ms values on the first Phase 6 smoke run.
@@ -190,8 +254,8 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
         with client.messages.stream(
             model=CHAT_MODEL,
             max_tokens=16384,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
+            system=system_blocks,
+            tools=tools_cached,
             messages=messages,
         ) as stream:
             for event in stream:
@@ -210,6 +274,8 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
             usage_dict = {
                 "input_tokens":  getattr(usage, "input_tokens", None),
                 "output_tokens": getattr(usage, "output_tokens", None),
+                "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", None),
+                "cache_read_input_tokens":     getattr(usage, "cache_read_input_tokens",     None),
             }
         tr.round_end(
             round_i=round_i,
