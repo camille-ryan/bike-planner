@@ -21,11 +21,11 @@ const saveBtn  = document.getElementById("chat-save");
 const loadSel  = document.getElementById("chat-load");
 
 // Abort the SSE if no bytes arrive for this many ms. Route planning
-// can take several minutes end-to-end; the API also emits `: tick`
-// comment heartbeats during long silent LLM phases (tool_use JSON
-// generation, extended thinking), so 90s of true silence signals a
-// real stall (Anthropic dropped us, WSL sleep, network drop).
-const CHAT_STREAM_IDLE_MS = 90_000;
+// can take several minutes end-to-end; the API emits `: tick` and
+// `: round_start` heartbeats and a `tool_start` event around each
+// potentially-silent phase, so any 180s gap really is a stall
+// (Anthropic dropped us, WSL sleep, network drop).
+const CHAT_STREAM_IDLE_MS = 180_000;
 
 console.log("[chat.js] loaded, elements:", {
   log: !!logEl, form: !!formEl, input: !!inputEl, send: !!sendBtn, reset: !!resetBtn,
@@ -56,6 +56,35 @@ function addToolCall(name, input, output) {
   div.innerHTML = `<span class="tool-name">🔧 ${escape(name)}</span> ${escape(summary)}`;
   logEl.appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
+}
+
+// Live "🔧 <name> (running…)" indicator that turns into the real
+// tool_call bubble when the result comes back. Keyed by tool_use_id
+// so `tool_start` and its matching `tool_call` line up even when
+// multiple tools run in one round.
+const pendingToolMsgs = new Map();
+
+function addToolPending(id, name, input) {
+  const div = document.createElement("div");
+  div.className = "chat-msg tool pending";
+  const argHint = summarizeTool(name, input, null);
+  div.innerHTML =
+    `<span class="tool-name">🔧 ${escape(name)}</span> ` +
+    `${escape(argHint)} <span class="running">(running…)</span>`;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+  pendingToolMsgs.set(id, div);
+}
+
+function resolveToolPending(id, name, input, output) {
+  const div = pendingToolMsgs.get(id);
+  if (!div) return false;
+  pendingToolMsgs.delete(id);
+  const summary = summarizeTool(name, input, output);
+  div.className = "chat-msg tool";
+  div.innerHTML =
+    `<span class="tool-name">🔧 ${escape(name)}</span> ${escape(summary)}`;
+  return true;
 }
 
 function escape(s) {
@@ -408,7 +437,9 @@ function downloadGpx(polyline) {
 }
 
 function handleToolResult(name, input, output) {
-  addToolCall(name, input, output);
+  // Chat-bubble rendering is now done by the tool_call caller so it
+  // can update the "(running…)" pending row in place. This function
+  // just handles the side effects (map draw, sidebar sync).
   if (name === "route" && output?.polyline?.length) {
     drawRouteOnMap(output.polyline);
     // Also populate the sidebar's route state so the paired-SPT viz
@@ -585,7 +616,16 @@ async function streamChat(userText) {
             asstDiv.textContent = asstText;
           }
           logEl.scrollTop = logEl.scrollHeight;
+        } else if (ev.event === "tool_start") {
+          addToolPending(ev.data.id, ev.data.name, ev.data.input);
+          tickStatus();
         } else if (ev.event === "tool_call") {
+          // If we already showed a "(running…)" pending row for this
+          // id, mutate it in place; otherwise append a fresh bubble.
+          if (!resolveToolPending(
+                ev.data.id, ev.data.name, ev.data.input, ev.data.output)) {
+            addToolCall(ev.data.name, ev.data.input, ev.data.output);
+          }
           handleToolResult(ev.data.name, ev.data.input, ev.data.output);
           toolCount += 1;
           tickStatus();

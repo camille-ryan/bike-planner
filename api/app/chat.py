@@ -106,6 +106,8 @@ Workflow — do exactly what the user asked, no more. DO NOT stop mid-workflow f
 - Call `stations_near` ONLY if the user asked about rail, train, meeting the partner, or station-accessible overnights.
 - When you need rail-accessible overnights across multiple candidate towns along a route, PREFER `stations_along_route` (one call, returns the ranked corridor) over N × `stations_near` calls.
 - **For rail-constrained plans, call `stations_along_route` BEFORE `split_into_stages`, not after.** The natural pipeline is: (a) `stations_along_route` returns every rail-served anchor along the corridor with its `km_along_route` — pick anchors ~one day's ride apart (from the km column), (b) pass those refs as `via_refs` to `split_into_stages` so overnights land at real rail-served cities by construction, (c) `direct_rail_service_batch` verifies direct-train connectivity in one round. Doing split-first and stations-after strands you with overnights in villages that have no station and forces re-planning.
+- **One `stations_along_route` call for the whole corridor, not one per segment.** Pass the full hub sequence in `via_refs` (e.g. `from_ref=Graz, to_ref=CPH, via_refs=[Wien, Brno, Praha, Dresden, Berlin, Hamburg]`) and you get every rail-served anchor for the whole trip in a single tool round. Splitting it into per-segment calls duplicates the same profile-load + polyline projection work per call.
+- **"Detour to nearby major cities" = ROUTE VIA that city, not visit it by separate train.** When the user asks to "detour to X and spend 2-3 days" or "include X on the way," pass X's ref in `via_refs` so the bike corridor goes through X. Two consequences: (a) the shortest bike route between two hubs (A, B) may not be the best corridor; if the direct rail line A↔B routes via intermediate hub C (Wien↔Praha via Brno; Praha↔Berlin via Dresden), pass C as a `via_ref` so bike and rail stay aligned — otherwise overnights between A and B are on the wrong side of the rail spine and won't have direct trains. (b) A pure "sightsee by train" side trip is only appropriate when the user explicitly says so (e.g. "day trip to X"), not for a detour they want to spend days at.
 - If the user's prompt uses the words "direct train", "non-transfer", "one-seat", or "single change" (or asks that overnights be reachable by a direct train from a specific place / hub), you MUST verify direct rail service. `n_routes_rail` alone does not prove direct service — a station with 20 routes may still require a transfer to reach the hub the user cares about. Choose the tool by count:
     - 1–2 pairs to check → call `direct_rail_service` per pair.
     - **3 or more pairs → call `direct_rail_service_batch` ONCE** with all pairs. It replaces N model rounds with 1, leaving budget for the actual day-by-day narrative.
@@ -248,6 +250,12 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
     for round_i in range(CHAT_MAX_TOOL_ROUNDS):
         tr.round_start(round_i, messages_len=len(messages))
         _shift_message_cache_breakpoint(messages)
+        # Explicit heartbeat before we enter `client.messages.stream`:
+        # for a big cached-context request, time-to-first-token can
+        # be several seconds, and no SDK event fires until then. An
+        # SSE comment right now resets the browser's idle timer so
+        # the wait doesn't look like a stall.
+        yield b": round_start\n\n"
         # `time.monotonic()`, not `time.time()` — WSL2's wall clock
         # can jump backward on VM resume, which produced negative
         # latency_ms values on the first Phase 6 smoke run.
@@ -324,6 +332,16 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
         tool_uses = [b for b in final.content if b.type == "tool_use"]
         tool_results = []
         for tu in tool_uses:
+            # Announce the tool start BEFORE running it, so the client
+            # can show a "🔧 <name> (running…)" indicator and its idle
+            # timer resets. A tool that takes 20-40s (split_into_stages
+            # on a big trip, stations_along_route that internally
+            # recomputes a route) would otherwise be a silent gap.
+            yield _sse("tool_start", {
+                "id":    tu.id,
+                "name":  tu.name,
+                "input": tu.input,
+            })
             t_tool = time.monotonic()
             impl = TOOL_IMPLS.get(tu.name)
             if impl is None:
