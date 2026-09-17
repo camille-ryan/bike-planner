@@ -208,6 +208,37 @@ function clearAgentBubbles() {
   agentBubbles.clear();
 }
 
+// Coordinator-committed segment: this is the sole source of truth
+// for what shows on the map after multi-agent planning. Each segment
+// commits ONCE with its final polyline + globally-numbered overnights.
+function handleSegmentCommit(data) {
+  const segKey = `seg[${data.segment_i}]`;
+  if (Array.isArray(data.polyline) && data.polyline.length > 1) {
+    drawRouteOnMap(data.polyline, segKey);
+  }
+  const overnights = Array.isArray(data.overnights) ? data.overnights : [];
+  if (overnights.length) {
+    // Build a stages-shaped array that `drawStagesOnMap` understands.
+    // Skip the first overnight (start-of-segment = end-of-previous)
+    // to avoid double-pinning the corridor hubs.
+    const stages = [];
+    for (let i = 1; i < overnights.length; i++) {
+      const prev = overnights[i - 1];
+      const cur  = overnights[i];
+      if (!Array.isArray(cur.lonlat) || cur.lonlat.length !== 2) continue;
+      stages.push({
+        day:         cur.day,
+        from_ref:    prev.ref,
+        from_name:   prev.name,
+        to_ref:      cur.ref,
+        to_name:     cur.name,
+        to_lonlat:   cur.lonlat,
+      });
+    }
+    if (stages.length) drawStagesOnMap(stages, segKey);
+  }
+}
+
 // ---------- Enrichment renderers (lodging + transit) ----------
 
 function renderLodgingCards(bubble, input) {
@@ -682,10 +713,21 @@ function downloadGpx(polyline) {
   URL.revokeObjectURL(url);
 }
 
-function handleToolResult(name, input, output) {
+function handleToolResult(name, input, output, agentId) {
   // Chat-bubble rendering is now done by the tool_call caller so it
   // can update the "(running…)" pending row in place. This function
   // just handles the side effects (map draw, sidebar sync).
+  //
+  // Multi-agent: SEGMENT agents call `route` / `split_into_stages`
+  // many times mid-planning (verify, revise, re-verify). Drawing
+  // every intermediate polyline creates "ghost loops" as the agent
+  // iterates. Filter out those calls here — the coordinator emits
+  // one `segment_committed` event per segment when its plan is
+  // finalized, and THAT is where the frontend renders the segment's
+  // final polyline + pins. Similarly filter supervisor / merge /
+  // enrichment agents — their tool calls (search_anchors, rail_path,
+  // direct_rail_service, search_lodging) don't need to touch the map.
+  if (agentId && agentId !== "main") return;
   if (name === "route" && output?.polyline?.length) {
     drawRouteOnMap(output.polyline, _routeKey(input));
     // Also populate the sidebar's route state so the paired-SPT viz
@@ -950,9 +992,15 @@ async function streamChat(userText) {
               `<span class="tool-name">🔧 ${escape(ev.data.name)}</span> ${escape(summary)}`;
             (container || logEl).appendChild(div);
           }
-          handleToolResult(ev.data.name, ev.data.input, ev.data.output);
+          handleToolResult(ev.data.name, ev.data.input, ev.data.output, agentId);
           toolCount += 1;
           tickStatus();
+        } else if (ev.event === "segment_committed") {
+          // Coordinator's per-segment commit: renumbered overnights +
+          // final polyline. This is the SINGLE place segment map
+          // state lands. Intermediate route/split calls from segment
+          // agents are filtered out in `handleToolResult`.
+          handleSegmentCommit(ev.data);
         } else if (ev.event === "error") {
           // Server-side friendly error mid-stream. Attach it to the
           // in-flight assistant bubble so the user sees the failure in

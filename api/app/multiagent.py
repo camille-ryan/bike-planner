@@ -49,7 +49,7 @@ from .tracing import RequestTrace
 MAX_PARALLEL_AGENTS = int(os.environ.get("MAX_PARALLEL_AGENTS", "5"))
 # Per-segment budget. Segment agents plan one leg — much tighter
 # than the whole trip, so a low cap catches runaway loops early.
-SEGMENT_MAX_ROUNDS = int(os.environ.get("SEGMENT_MAX_ROUNDS", "24"))
+SEGMENT_MAX_ROUNDS = int(os.environ.get("SEGMENT_MAX_ROUNDS", "32"))
 SUPERVISOR_MAX_ROUNDS = int(os.environ.get("SUPERVISOR_MAX_ROUNDS", "12"))
 MERGE_MAX_ROUNDS = int(os.environ.get("MERGE_MAX_ROUNDS", "3"))
 # Per-segment wall-clock cap. If a segment stalls past this, we
@@ -147,12 +147,12 @@ MERGE_PROMPT = """You are the MERGE stage of a multi-agent bike-tour planner. Yo
 
 1. The user's original request.
 2. The supervisor's chosen hub sequence (in order).
-3. N SegmentResult narratives, each covering one hub-to-hub leg — already written as Markdown.
+3. N SegmentResult narratives, each covering one hub-to-hub leg — already written as Markdown and **already renumbered globally** by the controller (Day 1 = trip's day 1; segment K's days follow segment K-1's without gap).
 
-Your job: emit ONE cohesive final response to the user. Structure:
+Your job: emit ONE cohesive final response. Structure:
 
 - One-paragraph intro naming the corridor, total km, n days, and what the partner-by-train constraint yields.
-- Concatenate the segment narratives IN ORDER (segment_i ascending). They already have proper H2 headings — reuse them, but **RENUMBER DAYS SEQUENTIALLY** across the whole tour. Each segment agent numbered its own days starting from 1; when merging, the first segment's "Day 1" stays as Day 1, but the next segment's "Day 1" is the trip's Day (prev_segment_last_day + 1). Rewrite the day-column values in every stage table accordingly. If a segment covers days 4-7, its narrative should read "Day 4 / Day 5 / …" not "Day 1 / Day 2 / …".
+- Concatenate the segment narratives IN ORDER (segment_i ascending) VERBATIM. Their H2 headings and day-column tables are already correct — DO NOT renumber, do not rewrite the tables. Just print each narrative back-to-back.
 - One-paragraph closing summary: total km, n riding days, n rest/detour days, buffer days if any.
 - **End with a one-line opt-in for follow-up help**: "Say **book lodging** or **book trains** if you'd like per-overnight hotel picks and train-ticket links for the partner." No em-dashes, keep it plain. This is the only trailing line — no other closer.
 - If any segment failed (status != "ok"), note it clearly under a "## Segment [N]: FAILED" heading with the error message.
@@ -385,8 +385,82 @@ async def run_multiagent_plan(
     # Ensure all tasks are collected (surfaces any uncaught exceptions).
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    # ---- Stage 3: merge ----
+    # ---- Stage 2b: controller commits segments in order ----
+    # Now that every segment agent has submitted, the coordinator is
+    # the single source of truth for how the plan renders. Two jobs:
+    #   1. Renumber overnights globally (segment K's day 1 becomes
+    #      trip's day (sum of prior segments' n_days + 1)).
+    #   2. Pull the final polyline from `tools._ROUTE_CACHE` for each
+    #      segment (the segment agent may have called `route` many
+    #      times; the CACHE holds the latest one for each (from, to)).
+    # Then emit `segment_committed` events per segment, in order. The
+    # frontend filters out intermediate route/split tool_calls from
+    # sub-agents and only draws on `segment_committed` — so no more
+    # "ghost loops" from mid-planning revisions.
+    from .tools import _ROUTE_CACHE
+    from . import trunk_router
+    from .settings import DEFAULT_PROFILE
+    _prof_for_coords = trunk_router._load_profile(DEFAULT_PROFILE)
+
+    def _coord_of(ref: str | None) -> list[float] | None:
+        if not ref:
+            return None
+        ci = _prof_for_coords.city_idx_by_ref.get(ref)
+        if ci is None:
+            return None
+        c = _prof_for_coords.cities[int(ci)]
+        return [float(c["lon"]), float(c["lat"])]
+
     ordered_results = [results[i] for i in sorted(results)]
+    day_offset = 0
+    for r in ordered_results:
+        # Compute how many riding days this segment contributes. Use
+        # `n_days` when the agent submitted it, else the overnight
+        # count minus 1.
+        seg_n_days = r.n_days or max(0, len(r.overnights) - 1)
+        # Renumber overnights in place — global day numbers. Attach
+        # a `lonlat` from the anchor lookup so the frontend can draw
+        # numbered day pins without a separate lookup.
+        renumbered_overnights = []
+        for i, ov in enumerate(r.overnights):
+            local_day = ov.day if ov.day is not None else i
+            renumbered_overnights.append({
+                "ref":          ov.ref,
+                "name":         ov.name,
+                "day":          local_day + day_offset,
+                "km_from_prev": ov.km_from_prev,
+                "lonlat":       _coord_of(ov.ref),
+            })
+        # Renumber "Day N" mentions in the narrative_md. Segment
+        # tables use both "Day 1"-style headers and bare `| 1 |` cells;
+        # the safer substitution is only on `Day N` keyword mentions.
+        # Bare-int cells stay wrong in some rows, but the overnights
+        # list carries the truth for map rendering.
+        r.narrative_md = _renumber_day_keywords(
+            r.narrative_md, offset=day_offset, max_n=seg_n_days,
+        )
+        # Pull the final cached polyline for this segment. Iterate
+        # the cache in reverse-insertion order to prefer the LATEST
+        # route call.
+        polyline = None
+        for key in reversed(list(_ROUTE_CACHE.keys())):
+            fr, to, _via = key
+            if fr == r.from_ref and to == r.to_ref:
+                polyline = _ROUTE_CACHE[key]
+                break
+        yield _sse("segment_committed", {
+            "segment_i":  r.segment_i,
+            "from_ref":   r.from_ref, "to_ref":   r.to_ref,
+            "from_name":  r.from_name, "to_name":  r.to_name,
+            "start_day":  day_offset + 1,
+            "n_days":     seg_n_days,
+            "overnights": renumbered_overnights,
+            "polyline":   polyline,
+            "status":     r.status,
+        })
+        day_offset += seg_n_days
+
+    # ---- Stage 3: merge ----
     merge_id = "merge"
     yield _sse("agent_start", {
         "role": "merge",
@@ -420,6 +494,41 @@ async def run_multiagent_plan(
 
 def _seg_agent_id(segment_i: int) -> str:
     return f"seg[{segment_i}]"
+
+
+import re as _re
+_DAY_KW_RE = _re.compile(r"\bDay\s+(\d+)\b")
+# Match table body rows whose FIRST cell is an integer (a day
+# column). Avoids over-matching km values elsewhere in the row.
+_TABLE_ROW_DAY_RE = _re.compile(r"^(\s*\|\s*)(\d+)(\s*\|)", flags=_re.MULTILINE)
+
+
+def _renumber_day_keywords(md: str, offset: int, max_n: int) -> str:
+    """Segment narratives use per-segment day numbering (Day 1..N).
+    The controller renumbers them to global (Day 1+offset..N+offset).
+    Two substitution passes:
+      1. `Day N` keyword mentions in prose.
+      2. Table body rows whose first cell is a bare integer 1..N.
+    Skips `Day N` with N > max_n as a light guard against clobbering
+    unrelated numbers ("Day 30 buffer") the model may reference."""
+    if not md or offset == 0:
+        return md
+
+    def _sub_kw(m: _re.Match) -> str:
+        n = int(m.group(1))
+        if 1 <= n <= max_n:
+            return f"Day {n + offset}"
+        return m.group(0)
+
+    def _sub_row(m: _re.Match) -> str:
+        n = int(m.group(2))
+        if 1 <= n <= max_n:
+            return f"{m.group(1)}{n + offset}{m.group(3)}"
+        return m.group(0)
+
+    md = _DAY_KW_RE.sub(_sub_kw, md)
+    md = _TABLE_ROW_DAY_RE.sub(_sub_row, md)
+    return md
 
 
 # ---------------------------------------------------------------------
