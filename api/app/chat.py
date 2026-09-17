@@ -91,11 +91,12 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
-    # "single" (default) or "multiagent". When "multiagent", the
-    # request is routed to `multiagent.run_multiagent_plan`, which
-    # decomposes the corridor into a supervisor + N segment sub-
-    # agents running in parallel. Single-agent path is unchanged.
-    mode: str | None = None
+    # Routing mode. Defaults to the multi-agent flow (supervisor +
+    # parallel segment agents + merge) — that's what the web UI
+    # sends. Pass `mode="single"` to run the legacy single-agent
+    # tool loop directly, still useful for one-shot queries in
+    # scripts / eval where the supervisor overhead isn't wanted.
+    mode: str | None = "multiagent"
 
 
 SYSTEM_PROMPT = """You are a bike-touring co-planner for a route spanning Austria, Czechia, Germany, and Denmark. The user is planning a Graz → Copenhagen tour (they can also plan sub-trips within that corridor).

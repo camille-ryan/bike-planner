@@ -146,13 +146,6 @@ footer code { background: #efefef; padding: 0 0.2rem; border-radius: 2px; }
 
 /* ---------- Multi-agent bubbles ---------- */
 
-.chat-mode-toggle {
-  display: inline-flex; align-items: center; gap: 0.35rem;
-  font-size: 0.75rem; color: #666; margin-top: 0.35rem;
-  cursor: pointer; user-select: none;
-}
-.chat-mode-toggle input[type="checkbox"] { margin: 0; }
-
 .chat-agent-bubble {
   border: 1px solid #d9d5cc;
   border-radius: 6px;

@@ -690,19 +690,12 @@ async function streamChat(userText) {
 
   clearAgentBubbles();
 
-  // Read the mode toggle: when checked, we ask the backend for the
-  // multi-agent supervisor/segment/merge decomposition. Element is
-  // optional; if missing (page not updated), default to single-agent.
-  const modeToggle = document.getElementById("chat-multiagent-toggle");
-  const mode = (modeToggle && modeToggle.checked) ? "multiagent" : undefined;
-
   let resp;
   try {
     resp = await fetch(`${CHAT_API_BASE}${CHAT_PATH}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(mode ? { messages: history, mode }
-                                  : { messages: history }),
+      body: JSON.stringify({ messages: history }),
       signal: controller.signal,
     });
   } catch (e) {

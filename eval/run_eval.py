@@ -108,8 +108,12 @@ def _stream_chat(client: httpx.Client, url: str, prompt: str) -> dict:
         "error":        None,
     }
     t0 = time.time()
+    # The /chat endpoint now defaults to multi-agent for interactive
+    # use; keep eval on the single-agent path for baseline
+    # comparability. Issue #12 adds per-segment axes + sub-trace
+    # packaging for a proper multi-agent eval.
     with client.stream("POST", url,
-                       json={"messages": messages},
+                       json={"messages": messages, "mode": "single"},
                        timeout=httpx.Timeout(1200.0, connect=30.0)) as r:
         r.raise_for_status()
         event_name: str | None = None
