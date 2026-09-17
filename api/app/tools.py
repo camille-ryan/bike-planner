@@ -1546,47 +1546,70 @@ def _tool_search_lodging(inp: dict) -> dict:
     return {"results": out[:limit], "n_total": len(out)}
 
 
-# Country → operator booking site. Each entry is a (label, url_fn)
-# where url_fn takes (from_name, to_name, date_iso_or_None). Trained
-# on stable public URLs; may need periodic refresh as operators
-# redesign their booking flows.
+# Country → operator booking site. URLs use current 2025-era formats
+# for each operator's public search page — deep-links to the journey-
+# planner. If an operator redesigns their URL scheme, update here.
 def _url_bahn(from_name: str, to_name: str, date: str | None) -> str:
-    """bahn.de covers cross-border; accepts free-text station names."""
-    import urllib.parse as up
-    q = {
-        "sts": "true",
-        "so": from_name, "zo": to_name,  # start / end place-name
-    }
-    if date:
-        # bahn.de expects dd.mm.yyyy but the modern journey planner
-        # takes an ISO string in the `hd` param too; use plain search.
-        q["hd"] = date
-    return "https://reiseauskunft.bahn.de/bin/query.exe/dn?" + up.urlencode(q)
-
-
-def _url_idos(from_name: str, to_name: str, date: str | None) -> str:
-    """CZ national timetable — supports name-based queries."""
-    import urllib.parse as up
-    q = {"f": from_name, "t": to_name}
-    if date:
-        q["date"] = date
-    return "https://idos.cz/vlakyautobusymhdvse/spojeni/?" + up.urlencode(q)
-
-
-def _url_oebb(from_name: str, to_name: str, date: str | None) -> str:
-    import urllib.parse as up
-    q = {"from": from_name, "to": to_name}
-    if date:
-        q["date"] = date
-    return "https://tickets.oebb.at/en/ticket/tickets?" + up.urlencode(q)
-
-
-def _url_rejseplanen(from_name: str, to_name: str, date: str | None) -> str:
+    """bahn.de journey planner — accepts free-text station names,
+    covers cross-border. This URL scheme is stable across the
+    modern bahn.de redesign (Buchung → Reiseauskunft), returns the
+    Verbindungssuche results page directly."""
     import urllib.parse as up
     q = {"S": from_name, "Z": to_name}
     if date:
         q["date"] = date
-    return "https://www.rejseplanen.dk/webapp/index.html#!?" + up.urlencode(q)
+    # www.bahn.de/vs-buchung (int'l) — free-text name search
+    return "https://www.bahn.de/buchung/fahrplan/suche#sts=true&" + up.urlencode(q)
+
+
+def _url_idos(from_name: str, to_name: str, date: str | None) -> str:
+    """CZ national timetable / journey planner. `f` and `t` accept
+    free-text place names."""
+    import urllib.parse as up
+    q = {"f": from_name, "t": to_name}
+    if date:
+        q["date"] = date
+    return "https://idos.cz/vlaky/spojeni/vysledky/?" + up.urlencode(q)
+
+
+def _url_oebb(from_name: str, to_name: str, date: str | None) -> str:
+    """ÖBB Scotty journey planner (fahrplan.oebb.at) — the public
+    departure-board / journey-search page. `Sf`/`Sz` = Start/Ziel."""
+    import urllib.parse as up
+    q = {
+        "Sf":  from_name, "Sz":  to_name,
+        "S":   from_name, "Z":   to_name,
+    }
+    if date:
+        # Scotty wants dd.mm.yyyy
+        try:
+            y, m, d = date.split("-")
+            q["date"] = f"{d}.{m}.{y}"
+        except ValueError:
+            pass
+    return "https://fahrplan.oebb.at/webapp/#!?" + up.urlencode(q)
+
+
+def _url_rejseplanen(from_name: str, to_name: str, date: str | None) -> str:
+    """Rejseplanen (DK) — free-text name search."""
+    import urllib.parse as up
+    q = {"origin": from_name, "destination": to_name}
+    if date:
+        q["date"] = date
+    return "https://www.rejseplanen.dk/webapp/?" + up.urlencode(q)
+
+
+def _url_google_transit(from_name: str, to_name: str, date: str | None) -> str:
+    """Google Maps transit directions — universal fallback that works
+    everywhere in Europe (and later, the US)."""
+    import urllib.parse as up
+    q = {
+        "api": "1",
+        "origin":      from_name,
+        "destination": to_name,
+        "travelmode":  "transit",
+    }
+    return "https://www.google.com/maps/dir/?" + up.urlencode(q)
 
 
 def _tool_train_booking_links(inp: dict) -> dict:
@@ -1615,12 +1638,13 @@ def _tool_train_booking_links(inp: dict) -> dict:
 
     # Pick operator(s). Cross-border → DB (has widest coverage of
     # foreign stations); same-country → national operator + DB as a
-    # cross-check.
+    # cross-check. Google Maps transit as a universal fallback that
+    # always works regardless of operator coverage.
     urls: list[dict] = []
     if from_country == to_country:
         internal = {
             "czech-republic": ("ČD (idos.cz)", _url_idos),
-            "austria":        ("ÖBB",           _url_oebb),
+            "austria":        ("ÖBB Scotty",    _url_oebb),
             "germany":        ("DB (bahn.de)",  _url_bahn),
             "denmark":        ("Rejseplanen",   _url_rejseplanen),
         }.get(from_country)
@@ -1639,12 +1663,18 @@ def _tool_train_booking_links(inp: dict) -> dict:
         # backup:
         internal = {
             "czech-republic": ("ČD (idos.cz)", _url_idos),
-            "austria":        ("ÖBB",           _url_oebb),
+            "austria":        ("ÖBB Scotty",    _url_oebb),
             "denmark":        ("Rejseplanen",   _url_rejseplanen),
         }.get(from_country)
         if internal:
             label, fn = internal
             urls.append({"operator": label, "url": fn(from_name, to_name, date)})
+    # Always append Google Maps transit as a universal fallback. If
+    # the operator URLs break someday, this still works.
+    urls.append({
+        "operator": "Google Maps (transit)",
+        "url":      _url_google_transit(from_name, to_name, date),
+    })
 
     return {
         "from_ref":  from_ref, "to_ref":  to_ref,

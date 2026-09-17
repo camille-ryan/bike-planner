@@ -49,7 +49,7 @@ from .tracing import RequestTrace
 MAX_PARALLEL_AGENTS = int(os.environ.get("MAX_PARALLEL_AGENTS", "5"))
 # Per-segment budget. Segment agents plan one leg — much tighter
 # than the whole trip, so a low cap catches runaway loops early.
-SEGMENT_MAX_ROUNDS = int(os.environ.get("SEGMENT_MAX_ROUNDS", "18"))
+SEGMENT_MAX_ROUNDS = int(os.environ.get("SEGMENT_MAX_ROUNDS", "24"))
 SUPERVISOR_MAX_ROUNDS = int(os.environ.get("SUPERVISOR_MAX_ROUNDS", "12"))
 MERGE_MAX_ROUNDS = int(os.environ.get("MERGE_MAX_ROUNDS", "3"))
 # Per-segment wall-clock cap. If a segment stalls past this, we
@@ -152,11 +152,12 @@ MERGE_PROMPT = """You are the MERGE stage of a multi-agent bike-tour planner. Yo
 Your job: emit ONE cohesive final response to the user. Structure:
 
 - One-paragraph intro naming the corridor, total km, n days, and what the partner-by-train constraint yields.
-- Concatenate the segment narratives IN ORDER (segment_i ascending). They already have proper H2 headings — do not rewrite them, just print them.
+- Concatenate the segment narratives IN ORDER (segment_i ascending). They already have proper H2 headings — reuse them, but **RENUMBER DAYS SEQUENTIALLY** across the whole tour. Each segment agent numbered its own days starting from 1; when merging, the first segment's "Day 1" stays as Day 1, but the next segment's "Day 1" is the trip's Day (prev_segment_last_day + 1). Rewrite the day-column values in every stage table accordingly. If a segment covers days 4-7, its narrative should read "Day 4 / Day 5 / …" not "Day 1 / Day 2 / …".
 - One-paragraph closing summary: total km, n riding days, n rest/detour days, buffer days if any.
+- **End with a one-line opt-in for follow-up help**: "Say **book lodging** or **book trains** if you'd like per-overnight hotel picks and train-ticket links for the partner." No em-dashes, keep it plain. This is the only trailing line — no other closer.
 - If any segment failed (status != "ok"), note it clearly under a "## Segment [N]: FAILED" heading with the error message.
 
-DO NOT re-verify anything. DO NOT call any tools. Just stream the merged Markdown. Once you're done, stop — no trailing "let me know if..." either."""
+DO NOT re-verify anything. DO NOT call any tools. Just stream the merged Markdown."""
 
 
 # ---------------------------------------------------------------------
@@ -406,43 +407,145 @@ async def run_multiagent_plan(
         "role": "merge", "status": "ok",
     }, agent_id=merge_id)
 
-    # ---- Stage 4: post-plan enrichment (lodging + transit) ----
-    # After the merge lands the final Markdown, fan out per-overnight
-    # LodgingAgents and per-consecutive-pair TransitAgents. These
-    # run in parallel using the same coordinator/queue pattern as
-    # the segment fan-out. If enrichment fails, the plan itself is
-    # still complete — enrichment cards just don't appear.
-    from . import enrichment, trunk_router
-    from .settings import DEFAULT_PROFILE
-    prof = trunk_router._load_profile(DEFAULT_PROFILE)
-    overnights: list[dict] = []
-    for hub in plan.corridor_hubs:
-        ref = hub.get("ref")
-        ci = prof.city_idx_by_ref.get(ref) if ref else None
-        if ci is None:
-            continue
-        c = prof.cities[int(ci)]
-        overnights.append({
-            "ref":    ref,
-            "name":   hub.get("name") or c.get("name"),
-            "day":    len(overnights),
-            "lonlat": f"{float(c['lon'])},{float(c['lat'])}",
-        })
-    try:
-        async for chunk in enrichment.run_enrichment_stage(
-            overnights, client, parent_trace,
-        ):
-            yield chunk
-    except Exception as exc:
-        yield _sse("error", {
-            "message": f"Enrichment stage failed: {type(exc).__name__}: {exc}",
-        })
+    # NOTE: post-plan enrichment (lodging + transit booking) is
+    # OPT-IN. The merge prompt asks the user whether they'd like
+    # help with lodging or booking; when they say yes on the next
+    # turn, chat._run_chat routes to enrichment against the plan
+    # still visible in the conversation history. Auto-running
+    # enrichment on every plan spent minutes on sub-agents the user
+    # may not want.
 
     yield _sse("done", {"stop_reason": "end_turn"})
 
 
 def _seg_agent_id(segment_i: int) -> str:
     return f"seg[{segment_i}]"
+
+
+# ---------------------------------------------------------------------
+# Enrichment follow-up (opt-in second turn)
+
+async def run_enrichment_followup(
+    user_messages: list[dict],
+    client: anthropic.AsyncAnthropic,
+    parent_trace: RequestTrace,
+) -> AsyncIterator[bytes]:
+    """Called when the user's follow-up message asks for lodging /
+    transit help after a prior plan turn. Runs a small extract-
+    overnights agent to pull the overnight sequence from the prior
+    assistant turn, then fans out lodging + transit sub-agents."""
+    from .chat import _run_chat_inner, _sse
+    from . import enrichment, trunk_router
+    from .settings import DEFAULT_PROFILE
+
+    extract_id = "extract-overnights"
+    yield _sse("agent_start", {
+        "role":      "extract",
+        "from_name": None,
+        "to_name":   None,
+    }, agent_id=extract_id)
+
+    captured: dict[str, list[dict]] = {"overnights": []}
+
+    def _capture(inp: dict) -> dict:
+        ovs = inp.get("overnights") or []
+        captured["overnights"] = [
+            {"ref": o.get("ref"), "name": o.get("name")}
+            for o in ovs if o.get("ref")
+        ]
+        return {"ok": True, "n": len(captured["overnights"])}
+
+    with RequestTrace(
+        model=parent_trace._model,
+        prompt_head="[extract-overnights]",
+        parent_request_id=parent_trace.request_id,
+        agent_role="extract-overnights",
+    ) as tr:
+        messages = [dict(m) for m in user_messages]
+        async for chunk in _run_chat_inner(
+            client, messages, tr,
+            agent_id=extract_id,
+            system_prompt=EXTRACT_OVERNIGHTS_PROMPT,
+            tool_names=["search_anchors"],
+            max_rounds=6,
+            extra_tools=[EXTRACT_OVERNIGHTS_TOOL],
+            extra_impls={"submit_overnights": _capture},
+        ):
+            yield chunk
+
+    overnights = captured["overnights"]
+    yield _sse("agent_end", {
+        "role":   "extract",
+        "status": "ok" if overnights else "failed",
+        "error":  None if overnights else "no overnights found in prior turn",
+    }, agent_id=extract_id)
+
+    if not overnights:
+        yield _sse("error", {"message": (
+            "Couldn't extract the overnights from the plan I wrote. "
+            "Try 'book trains and hotels for Graz, Wien, Praha, ...' "
+            "with the city names spelled out."
+        )})
+        yield _sse("done", {"stop_reason": "extract_failed"})
+        return
+
+    # Look up lonlats for the extracted overnights.
+    prof = trunk_router._load_profile(DEFAULT_PROFILE)
+    enriched: list[dict] = []
+    for i, ov in enumerate(overnights):
+        ref = ov.get("ref")
+        ci = prof.city_idx_by_ref.get(ref) if ref else None
+        if ci is None:
+            continue
+        c = prof.cities[int(ci)]
+        enriched.append({
+            "ref":    ref,
+            "name":   ov.get("name") or c.get("name"),
+            "day":    i,
+            "lonlat": f"{float(c['lon'])},{float(c['lat'])}",
+        })
+
+    async for chunk in enrichment.run_enrichment_stage(
+        enriched, client, parent_trace,
+    ):
+        yield chunk
+
+    yield _sse("done", {"stop_reason": "end_turn"})
+
+
+EXTRACT_OVERNIGHTS_TOOL: dict = {
+    "name": "submit_overnights",
+    "description": (
+        "TERMINAL. Emit the ordered list of overnights from the plan "
+        "you found in the prior assistant turn. Each entry: `ref` "
+        "(anchor ref like `db:66`) and `name` (city name). Order "
+        "matches the plan's day sequence."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "overnights": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ref":  {"type": "string"},
+                        "name": {"type": "string"},
+                    },
+                    "required": ["ref", "name"],
+                },
+            },
+        },
+        "required": ["overnights"],
+    },
+}
+
+
+EXTRACT_OVERNIGHTS_PROMPT = """You are an EXTRACTOR. The conversation history contains an assistant plan the user is now asking to enrich (book lodging or trains). Do one thing:
+
+Read the last assistant turn (the plan). Pull out the ORDERED list of overnights (base stops). Each is a city name; you can use `search_anchors` to resolve names to refs when needed. Call `submit_overnights` with the ordered list and STOP.
+
+Do not narrate. Do not answer any question. Just resolve overnight names to refs and submit."""
 
 
 # ---------------------------------------------------------------------

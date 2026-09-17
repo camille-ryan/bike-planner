@@ -204,6 +204,39 @@ def _prompt_head(messages: list[dict]) -> str:
     return ""
 
 
+_ENRICHMENT_TRIGGERS = (
+    "book lodging", "book train", "book hotel", "find lodging",
+    "find hotel", "book trains", "book the trains", "lodging plan",
+    "hotels please", "book everything", "yes please book",
+)
+
+
+def _looks_like_enrichment_request(messages: list[dict]) -> bool:
+    """Heuristic: does the LAST user message look like a follow-up
+    asking for lodging/transit help, and does the conversation have
+    a prior assistant plan? Both conditions must hold — a first-turn
+    'book lodging in Berlin' shouldn't skip the planner."""
+    if not messages:
+        return False
+    last = messages[-1]
+    if last.get("role") != "user":
+        return False
+    content = last.get("content")
+    text = ""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                text += b.get("text", "")
+    text_lc = text.lower()
+    if not any(trig in text_lc for trig in _ENRICHMENT_TRIGGERS):
+        return False
+    # Must have at least one prior assistant turn.
+    has_prior_plan = any(m.get("role") == "assistant" for m in messages[:-1])
+    return has_prior_plan
+
+
 async def _run_chat(
     req: ChatRequest, client: anthropic.AsyncAnthropic,
 ) -> AsyncIterator[bytes]:
@@ -213,6 +246,25 @@ async def _run_chat(
     # produces its own SSE stream (agent_start/agent_end + agent_id-
     # tagged events) and manages its own child RequestTraces.
     if req.mode == "multiagent":
+        # Follow-up detection: if the previous assistant turn produced
+        # a plan (has segment narratives in its content) AND this
+        # user turn asks for booking help, run enrichment on the
+        # existing plan instead of re-running the whole planner.
+        if _looks_like_enrichment_request(messages):
+            from . import multiagent
+            with RequestTrace(model=CHAT_MODEL,
+                              prompt_head=_prompt_head(messages),
+                              agent_role="coordinator-enrich") as tr:
+                try:
+                    async for chunk in multiagent.run_enrichment_followup(
+                        messages, client, tr,
+                    ):
+                        yield chunk
+                except Exception as exc:
+                    tr.set_error(f"{type(exc).__name__}: {exc}")
+                    yield _sse("error", {"message": _friendly_error(exc)})
+            return
+
         from . import multiagent
         with RequestTrace(model=CHAT_MODEL,
                           prompt_head=_prompt_head(messages),
@@ -227,6 +279,8 @@ async def _run_chat(
                 yield _sse("error", {"message": _friendly_error(exc)})
         return
 
+    # Single-agent fallback (mode="single") — still used by
+    # eval/run_eval.py for baseline traces.
     with RequestTrace(model=CHAT_MODEL,
                       prompt_head=_prompt_head(messages)) as tr:
         try:

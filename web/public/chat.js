@@ -42,12 +42,27 @@ let inflight = null;
 
 // ---------- rendering ----------
 
+// Standard chat-log scroll behavior: auto-scroll to bottom ONLY when
+// the user hasn't scrolled up to read something mid-stream. The flag
+// tracks the user's intent — updated by the scroll listener below —
+// and every append site replaces its unconditional scroll with a
+// call to `scrollToBottomIfPinned()` which respects the flag.
+let userScrolledUp = false;
+logEl.addEventListener("scroll", () => {
+  const dist = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight;
+  userScrolledUp = dist > 100;
+});
+
+function scrollToBottomIfPinned() {
+  if (!userScrolledUp) logEl.scrollTop = logEl.scrollHeight;
+}
+
 function addMessage(role, text) {
   const div = document.createElement("div");
   div.className = `chat-msg ${role}`;
   div.textContent = text;
   logEl.appendChild(div);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollToBottomIfPinned();
   return div;
 }
 
@@ -57,7 +72,7 @@ function addToolCall(name, input, output) {
   const summary = summarizeTool(name, input, output);
   div.innerHTML = `<span class="tool-name">🔧 ${escape(name)}</span> ${escape(summary)}`;
   logEl.appendChild(div);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollToBottomIfPinned();
 }
 
 // Live "🔧 <name> (running…)" indicator that turns into the real
@@ -74,7 +89,7 @@ function addToolPending(id, name, input, container) {
     `<span class="tool-name">🔧 ${escape(name)}</span> ` +
     `${escape(argHint)} <span class="running">(running…)</span>`;
   (container || logEl).appendChild(div);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollToBottomIfPinned();
   pendingToolMsgs.set(id, div);
 }
 
@@ -153,7 +168,7 @@ function handleAgentStart(data) {
   container.appendChild(tools);
   container.appendChild(textDiv);
   logEl.appendChild(container);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollToBottomIfPinned();
   agentBubbles.set(agentId, {
     container, header, tools, textDiv,
     textBuf: "",
@@ -228,7 +243,7 @@ function renderLodgingCards(bubble, input) {
     wrap.appendChild(card);
   }
   bubble.textDiv.appendChild(wrap);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollToBottomIfPinned();
 }
 
 function renderTransitLinks(bubble, input) {
@@ -262,7 +277,7 @@ function renderTransitLinks(bubble, input) {
     wrap.appendChild(ul);
   }
   bubble.textDiv.appendChild(wrap);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollToBottomIfPinned();
 }
 
 function escape(s) {
@@ -528,26 +543,29 @@ function drawStagesOnMap(stages, legKey) {
   chatLatestStages = flat;
 }
 
-// Collapse the accumulated overlays down to just the "final" plan:
-//  - keep only the longest polyline (removes sub-leg overlap loops)
-//  - per-leg stage dedup is already live-applied by drawStagesOnMap
-// Called from the SSE `done` path so the user sees planning progress
-// during the run, then a clean map at the end. Returns the longest
-// polyline so the GPX button has something to work with.
+// Called from the SSE `done` path. Historically this collapsed the
+// accumulated overlays to just the longest polyline because single-
+// agent runs produced overlapping sub-leg polylines. With multi-
+// agent, each SEGMENT is a distinct piece of the corridor (Graz→
+// Wien, Wien→Brno, …) — we want all of them to stay visible. So
+// we now leave the polylines as-drawn and just concatenate them
+// for GPX export purposes. Returns the concatenation (in insertion
+// order, which is segment order since agent_start fires per-
+// segment) so the GPX button has something to save.
 function finalizeChatMap() {
   if (chatRoutePolylines.size === 0) return null;
-  let longest = null;
-  for (const p of chatRoutePolylines.values()) {
-    if (!longest || p.length > longest.length) longest = p;
+  const all = Array.from(chatRoutePolylines.values());
+  // Concat in insertion order — dedup consecutive duplicate points
+  // at the seams (segment K's end coord = segment K+1's start).
+  const concat = [];
+  for (const seg of all) {
+    for (const pt of seg) {
+      const last = concat[concat.length - 1];
+      if (last && last[0] === pt[0] && last[1] === pt[1]) continue;
+      concat.push(pt);
+    }
   }
-  const map = window.map;
-  if (map && map.getSource("chat-route")) {
-    map.getSource("chat-route").setData({
-      type: "FeatureCollection",
-      features: _routesToFeatures([longest]),
-    });
-  }
-  return longest;
+  return concat;
 }
 
 // ---------- GPX export ----------
@@ -726,7 +744,7 @@ async function streamChat(userText) {
   statusDiv.className = "chat-msg status";
   statusDiv.textContent = "⏳ Planning…";
   logEl.appendChild(statusDiv);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollToBottomIfPinned();
 
   const t0 = performance.now();
   let toolCount = 0;
@@ -880,7 +898,7 @@ async function streamChat(userText) {
             } else {
               bubble.textDiv.textContent = bubble.textBuf;
             }
-            logEl.scrollTop = logEl.scrollHeight;
+            scrollToBottomIfPinned();
           } else {
             asstBubbleText += delta;
             // Lazy-create the bubble on first delta of the current
@@ -892,7 +910,7 @@ async function streamChat(userText) {
             } else {
               asstDiv.textContent = asstBubbleText;
             }
-            logEl.scrollTop = logEl.scrollHeight;
+            scrollToBottomIfPinned();
           }
         } else if (ev.event === "tool_start") {
           const container = bubble ? bubble.tools : null;
