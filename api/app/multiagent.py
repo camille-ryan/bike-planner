@@ -450,23 +450,24 @@ async def run_multiagent_plan(
         )
         day_offset += seg_n_days
 
-    # ---- Stage 3: merge ----
+    # ---- Stage 3: merge (programmatic — coordinator streams the
+    # assembled Markdown as text events with agent_id="merge") ----
+    #
+    # The prior LLM-merge stage was flaky: it kept re-renumbering days
+    # ("print verbatim" instructions didn't stick) and occasionally
+    # dropped segments. Since the segment narratives are already
+    # renumbered globally (previous stage), concatenating them
+    # programmatically is more reliable AND faster (no extra LLM
+    # round). Coordinator writes a short computed intro + segments +
+    # outro, streams as `text` events under agent_id="merge" so the
+    # frontend renders it in the merge bubble.
     merge_id = "merge"
     yield _sse("agent_start", {
-        "role": "merge",
-        "from_name": None,
-        "to_name":   None,
+        "role": "merge", "from_name": None, "to_name": None,
     }, agent_id=merge_id)
-    try:
-        async for chunk in _run_merge_stage(
-            user_messages, plan, ordered_results,
-            client, parent_trace, merge_id,
-        ):
-            yield chunk
-    except Exception as exc:
-        yield _sse("error", {
-            "message": f"Merge stage failed: {type(exc).__name__}: {exc}",
-        }, agent_id=merge_id)
+    for text_chunk in _assemble_merged_plan(plan, ordered_results):
+        yield _sse("text", {"delta": text_chunk}, agent_id=merge_id)
+    yield _sse("done", {"stop_reason": "end_turn"}, agent_id=merge_id)
     yield _sse("agent_end", {
         "role": "merge", "status": "ok",
     }, agent_id=merge_id)
@@ -486,6 +487,59 @@ def _seg_agent_id(segment_i: int) -> str:
     return f"seg[{segment_i}]"
 
 
+def _assemble_merged_plan(plan, ordered_results) -> list[str]:
+    """Assemble the final plan text programmatically. Segment
+    narratives have already been globally renumbered by the
+    coordinator; this just wraps them in a short intro + outro."""
+    hub_names = [h.get("name", "?") for h in plan.corridor_hubs]
+    corridor = " → ".join(hub_names)
+    total_days = sum(
+        (r.n_days or max(0, len(r.overnights) - 1))
+        for r in ordered_results
+    )
+    total_km = sum(float(r.total_km or 0.0) for r in ordered_results)
+    n_failed = sum(1 for r in ordered_results if r.status == "failed")
+
+    lines: list[str] = []
+    # Intro
+    lines.append(
+        f"## Corridor: {corridor}\n\n"
+        f"~{total_km:.0f} km over {total_days} riding days "
+        f"({len(ordered_results)} hub-to-hub segments). "
+        + ("**⚠️ Some segments failed to plan — see notes below.**\n\n"
+           if n_failed else "\n")
+    )
+    # Segment narratives — verbatim, no rewriting.
+    for r in ordered_results:
+        body = (r.narrative_md or "").strip()
+        if not body:
+            body = (
+                f"## Segment {r.segment_i}: "
+                f"{r.from_name} → {r.to_name}\n\n"
+                f"*(no narrative submitted)*"
+            )
+        # Prepend a failure marker if the segment didn't submit.
+        if r.status == "failed":
+            body = (
+                f"## ⚠️ Segment {r.segment_i}: "
+                f"{r.from_name} → {r.to_name} — FAILED\n\n"
+                f"{r.error or 'no error message'}\n\n"
+                f"---\n\n{body}"
+            )
+        lines.append(body + "\n\n---\n\n")
+    # Outro / follow-up prompt
+    lines.append(
+        f"**Total: ~{total_km:.0f} km over {total_days} riding days** "
+        f"across {len(ordered_results)} segments"
+        + (f", with {n_failed} needing re-planning" if n_failed else "")
+        + ".\n\n"
+        "Say **book lodging** or **book trains** if you'd like "
+        "per-overnight hotel picks and train-ticket links for the "
+        "partner.\n"
+    )
+    return lines
+
+
 def _coord_of_ref(ref: str | None) -> list[float] | None:
     """Anchor ref → [lon, lat] via the loaded profile. Used to attach
     coords to overnights in `segment_committed` events."""
@@ -502,7 +556,7 @@ def _coord_of_ref(ref: str | None) -> list[float] | None:
 
 
 import re as _re
-_DAY_KW_RE = _re.compile(r"\bDay\s+(\d+)\b")
+_DAY_KW_RE = _re.compile(r"\bDay\s+(\d+)\b", flags=_re.IGNORECASE)
 # Match table body rows whose FIRST cell is an integer (a day
 # column). Avoids over-matching km values elsewhere in the row.
 _TABLE_ROW_DAY_RE = _re.compile(r"^(\s*\|\s*)(\d+)(\s*\|)", flags=_re.MULTILINE)
@@ -512,22 +566,27 @@ def _renumber_day_keywords(md: str, offset: int, max_n: int) -> str:
     """Segment narratives use per-segment day numbering (Day 1..N).
     The controller renumbers them to global (Day 1+offset..N+offset).
     Two substitution passes:
-      1. `Day N` keyword mentions in prose.
-      2. Table body rows whose first cell is a bare integer 1..N.
-    Skips `Day N` with N > max_n as a light guard against clobbering
-    unrelated numbers ("Day 30 buffer") the model may reference."""
+      1. `Day N` keyword mentions in prose (case-insensitive).
+      2. Table body rows whose first cell is a bare integer.
+    `max_n` is a soft guard: it's set generously (segment n_days
+    plus a buffer) since some models number arrival days as day
+    n_days + 1 and we want those renumbered too."""
     if not md or offset == 0:
         return md
+    # Give a small buffer past n_days — some models include an
+    # arrival day in the table (day N+1) which is legit and should
+    # be renumbered along with the rest.
+    max_n_effective = max_n + 5
 
     def _sub_kw(m: _re.Match) -> str:
         n = int(m.group(1))
-        if 1 <= n <= max_n:
+        if 1 <= n <= max_n_effective:
             return f"Day {n + offset}"
         return m.group(0)
 
     def _sub_row(m: _re.Match) -> str:
         n = int(m.group(2))
-        if 1 <= n <= max_n:
+        if 1 <= n <= max_n_effective:
             return f"{m.group(1)}{n + offset}{m.group(3)}"
         return m.group(0)
 

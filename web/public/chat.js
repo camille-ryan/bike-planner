@@ -803,6 +803,24 @@ function handleToolResult(name, input, output, agentId) {
 // ---------- SSE parser ----------
 // Fetch-with-body streaming; parse `event:` + `data:` lines manually.
 
+// Enrichment triggers — mirror of _looks_like_enrichment_request in
+// api/app/chat.py. Used to (a) NOT clear the map layers on a booking
+// follow-up (user wants to keep seeing the route while lodging cards
+// fill in) and (b) leave the plan visible.
+const ENRICHMENT_TRIGGERS = [
+  "book lodging", "book train", "book hotel", "find lodging",
+  "find hotel", "book trains", "book the trains", "lodging plan",
+  "hotels please", "book everything", "yes please book",
+];
+
+function _isEnrichmentFollowup(userText) {
+  if (!userText) return false;
+  const t = String(userText).toLowerCase();
+  if (!ENRICHMENT_TRIGGERS.some(trig => t.includes(trig))) return false;
+  // Needs a prior assistant turn to enrich.
+  return history.some(m => m.role === "assistant");
+}
+
 async function streamChat(userText) {
   const userDiv = addMessage("user", userText);
   history.push({ role: "user", content: userText });
@@ -815,9 +833,15 @@ async function streamChat(userText) {
     chatUnitMode = detectUnitMode(userText);
   }
 
-  // Reset the map layers we own so a fresh plan starts on a clean map.
-  clearChatRouteLayer();
-  clearChatStagesLayer();
+  // Preserve the map on enrichment follow-ups — the user is asking
+  // for hotels or trains for the plan they already see, not a new
+  // plan. Wiping the route + pins would be a regression.
+  const isEnrichment = _isEnrichmentFollowup(userText);
+  if (!isEnrichment) {
+    // Reset the map layers we own so a fresh plan starts on a clean map.
+    clearChatRouteLayer();
+    clearChatStagesLayer();
+  }
 
   sendBtn.disabled = true;
   sendBtn.textContent = "Thinking…";

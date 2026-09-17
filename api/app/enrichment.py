@@ -93,18 +93,17 @@ class TransitResult(BaseModel):
 # ---------------------------------------------------------------------
 # Prompts
 
-LODGING_PROMPT = """You are a LODGING sub-agent in a bike-tour planner. Your job is narrow:
+LODGING_PROMPT = """You are a LODGING sub-agent in a bike-tour planner. Your job:
 
-You will be told which overnight stop this is (city name + coordinates). Do this:
+You will be told which overnight stop this is (city name + coordinates). Follow this pipeline; STOP as soon as you have a result to submit:
 
-1. Call `search_lodging(lonlat=<lon,lat>, radius_km=1.5)` ONCE. It returns nearby OSM lodging (hotels/hostels/guest_houses).
-2. Pick the top 3 options ranked by a bike-tourist's priorities:
-   - Closer to the anchor beats farther.
-   - Prefer variety: 1 mid-range hotel, 1 hostel/budget, 1 upscale/well-rated if the mix allows.
-   - Skip entries with no name or no website unless nothing else is available.
-3. Call `submit_lodging` with your top 3 (or fewer, if the search returned less) and a ONE-SENTENCE summary of what's nearby. Then STOP.
+1. Call `search_lodging(lonlat=<lon,lat>, radius_km=1.5)`. If it returns 3+ entries with names, jump to step 4.
+2. If step 1 returned nothing (or very few), widen the search: `search_lodging(lonlat=<same>, radius_km=5)`. If that finds options, note in `summary` that they're a bit further from the anchor (which is expected — small towns often lack in-city lodging).
+3. If step 2 still returns nothing, try `radius_km=15`. This picks up lodging in the neighboring town. In your `summary`, mention that this overnight (say "Ternitz") has no in-town lodging in the OSM dataset and the closest options are in <neighboring town, extracted from result names>. The user MAY want to shift the overnight to that neighbor — say so plainly in the summary.
+4. Pick the top 3 options ranked for a bike tourist: closer beats farther; variety helps (one hotel, one hostel/guest_house if available); prefer ones with a website.
+5. Call `submit_lodging` with your top options (may be 0-3) and a one-sentence summary. If you found nothing at any radius, submit an empty `hotels` list with a summary flagging the gap. Then STOP.
 
-Do not call any other tool. Do not narrate outside `submit_lodging.summary`. Keep it tight — you have ~4 rounds max."""
+Do not call any other tool. Do not narrate outside `submit_lodging.summary`. ~4 rounds max."""
 
 
 TRANSIT_PROMPT = """You are a TRANSIT sub-agent in a bike-tour planner. Your job is narrow:
