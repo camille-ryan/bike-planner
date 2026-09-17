@@ -1143,17 +1143,20 @@ function ensureRouteTrunksLayer() {
       type: "line",
       source: "route-trunks",
       paint: {
-        // Alternate red / green by paired-SPT (trunk_idx mod 2) so
-        // adjacent trunks along the chain stay visually
-        // distinguishable at a glance. Previous per-segment
-        // green→red gradient lost the "which trunk is this branch
-        // from" grouping. Same lightness/saturation between the two
-        // colors so neither reads as "primary."
+        // Color by trunk_progress ∈ [0, 1] over a red → orange →
+        // yellow → green palette. First paired-SPT on the chain is
+        // red, the last is green; middle trunks get orange/yellow.
+        // Handoffs between adjacent trunks show up as visible color
+        // transitions along the corridor. `to-number` coerces a
+        // missing property to 0, so features loaded before this
+        // change still render (as red).
         "line-color": [
-          "match",
-          ["%", ["to-number", ["get", "trunk_idx"]], 2],
-          0, "#dc2626",   // red
-          "#16a34a",       // default: green
+          "interpolate", ["linear"],
+          ["to-number", ["get", "trunk_progress"]],
+          0.0,  "#dc2626",  // red
+          0.33, "#f97316",  // orange
+          0.66, "#facc15",  // yellow
+          1.0,  "#16a34a",  // green
         ],
         "line-width": [
           "interpolate", ["linear"], ["zoom"],
@@ -1219,13 +1222,20 @@ async function loadRouteTrunks() {
   if (badge) badge.textContent =
     `loading 0 / ${pairs.length}… (${db}, ${skippedLegs.size} skipped)`;
 
-  // Each pair gets a distinct trunk_idx (its position in the walked
-  // chain); we color-cycle by that index so consecutive paired-SPTs
-  // stay visually distinguishable — you can tell where one trunk's
-  // tree ends and the next begins without checking labels. The
-  // existing per-segment green→red gradient was per-chain-tree-
-  // branch and lost the "which paired-SPT is this" grouping.
-  for (let i = 0; i < pairs.length; i++) pairs[i].trunk_idx = i;
+  // Each pair gets a `trunk_progress` in [0, 1] = its position in
+  // the walked chain, normalised. The layer paint interpolates the
+  // color across a red → orange → yellow → green palette using this
+  // value, so the FIRST paired-SPT is red, the LAST is green, and
+  // middle trunks smoothly get orange/yellow. Handoffs between
+  // trunks show up as color transitions along the corridor at a
+  // glance — much clearer than the previous per-branch gradient
+  // (which lost trunk grouping) or a 2-color alternation (which
+  // gave a jarring red/green/red pattern on adjacent trunks).
+  const _lastIdx = Math.max(pairs.length - 1, 1);
+  for (let i = 0; i < pairs.length; i++) {
+    pairs[i].trunk_idx = i;
+    pairs[i].trunk_progress = i / _lastIdx;
+  }
 
   const all = [];
   let done = 0;
@@ -1233,7 +1243,8 @@ async function loadRouteTrunks() {
   const queue = [...pairs];
   async function worker() {
     while (queue.length) {
-      const { aIdx, bIdx, aName, bName, trunk_idx } = queue.shift();
+      const { aIdx, bIdx, aName, bName, trunk_idx, trunk_progress }
+        = queue.shift();
       try {
         // Chain-mode endpoint: one LineString per succ leaf-to-root
         // walk. Feature count = ~n_leaves per trunk (tens to
@@ -1248,6 +1259,7 @@ async function loadRouteTrunks() {
             f.properties.trunk_a = aIdx;
             f.properties.trunk_b = bIdx;
             f.properties.trunk_idx = trunk_idx;
+            f.properties.trunk_progress = trunk_progress;
             f.properties.trunk_a_name = aName || String(aIdx);
             f.properties.trunk_b_name = bName || String(bIdx);
             all.push(f);

@@ -154,6 +154,7 @@ def local_dijkstra_to_targets(
     prefer_radius_km: float = 5.0,
     intercept_lonlat: tuple[float, float] | None = None,
     intercept_bias: float = 0.0,
+    intercept_probe_coords: np.ndarray | None = None,
 ) -> tuple[list[list[float]], int] | None:
     """Find the shortest bike-graph path from `start_vid` to whichever
     of `target_vids` is closest, bounded by `max_cost`. Returns
@@ -190,6 +191,17 @@ def local_dijkstra_to_targets(
     intercept coord. Edge costs are ~1000-per-km empirically so
     `intercept_bias=1000` ≈ "one bike-effort unit per meter of
     geodesic remaining." Bias 0 disables the heuristic.
+
+    `intercept_probe_coords` — when passed, use THESE coords per
+    target instead of `target_lonlats` for the intercept-bias
+    scoring. Purpose: paired trunks are trees with multiple branches,
+    and the ENTRY coord is a bad proxy for which branch the trunk
+    walk will take. The caller can pre-compute the coord `N` hops
+    along the succ-chain from each entry (via the trunk's own
+    `next_idx`) and pass that as `intercept_probe_coords`. Then the
+    intercept-bias picks whichever entry's SUCC-CHAIN heads toward
+    the destination, rather than whichever entry is itself near the
+    destination.
     """
     # Load the source cell + adjacent cells only if the source is
     # near a cell boundary. A 1° cell at central-EU latitudes spans
@@ -277,10 +289,19 @@ def local_dijkstra_to_targets(
     # `target_lonlats`: add a per-target penalty proportional to the
     # geodesic distance from the target to the intercept coord. Effect:
     # bias toward entering the trunk closer to the trip's destination.
+    # `intercept_probe_coords` (if given) OVERRIDES `target_lonlats` for
+    # the geometric distance — the caller has walked each target's
+    # succ-chain some hops forward and passed those "where will the
+    # walk actually go" coords in.
     reached_costs = dist0[reached_targets]
+    _bias_coords = (
+        intercept_probe_coords
+        if intercept_probe_coords is not None
+        else target_lonlats
+    )
     if (intercept_lonlat is not None and intercept_bias > 0
-            and target_lonlats is not None
-            and len(target_lonlats) == len(target_vids)):
+            and _bias_coords is not None
+            and len(_bias_coords) == len(target_vids)):
         # target_lonlats was aligned with the pre-filter tgt_arr_raw
         # via the `keep` mask. Rebuild the alignment: the entries in
         # `positions` came from tgt_arr (post-filter, sorted), and
@@ -298,9 +319,9 @@ def local_dijkstra_to_targets(
             orig_idx = order[opos]
             _R = 6_371_000.0
             _lat_a = math.radians(float(intercept_lonlat[1]))
-            _lat_v = np.radians(target_lonlats[orig_idx, 1].astype(np.float64))
+            _lat_v = np.radians(_bias_coords[orig_idx, 1].astype(np.float64))
             _lon_d = np.radians(
-                target_lonlats[orig_idx, 0].astype(np.float64)
+                _bias_coords[orig_idx, 0].astype(np.float64)
                 - float(intercept_lonlat[0])
             )
             _hav = (np.sin((_lat_v - _lat_a) / 2) ** 2

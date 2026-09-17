@@ -784,18 +784,6 @@ def route(
     # polygon SPT, stopping at the first vertex that's a member of
     # trunk(chain[1], chain[2]). Use that as chain_terminus_vid so the
     # main walk loop's succ chain takes over naturally from there.
-    #
-    # Prior version picked T_vid = B-frontier terminal nearest to start
-    # by haversine, then did a bidirectional-LCA parent-walk stitch
-    # (_last_mile). When both endpoints were downstream of a distant
-    # SPT-seed on different branches, that produced a V-shape: walk up
-    # to the seed, then back down to T_vid — visible as a several-km
-    # backtrack (Wien → NE to Gerasdorf → SW to Wien's north edge).
-    #
-    # A single upward parent walk finds the tree-shortest ancestor of
-    # fm_start_vid that lives in the trunk; no LCA, no reversal, no V.
-    # Fall back to the prior _last_mile stitch if the parent walk
-    # doesn't reach a trunk vertex (rare).
     if len(chain) >= 3 and walk_start_i == 1:
         a1, b1 = chain[1], chain[2]
         trunk_ab = prof.trunks.get((a1, b1))
@@ -894,47 +882,90 @@ def route(
                 break
 
             if not stitched:
-                # Real routing on the road-graph CSR — the
-                # "unpruned-CSR local-Dijkstra bridge" TODO'd in the
-                # module docstring. Loads per-1° cell edge files at
-                # query time (LRU-cached). Uses an A*-flavored
-                # intercept-point bias: instead of picking the
-                # trunk vertex cheapest to reach on the road graph,
-                # pick the one with min `dijkstra_cost + BIAS *
-                # geodesic_km_to(trip_end)`. That prefers entering
-                # the trunk closer to the trip destination, avoiding
-                # entries near the source whose succ-chain would
-                # loop back through where we started. `BIAS = 3000`
-                # (bike-effort-per-km) empirically dominates the raw
-                # dijkstra cost for our common corridors — the
-                # winning trunk vertex is farther along the corridor
-                # by design.
-                trunk_lonlats = np.column_stack([
-                    arr_ab["lon"].astype(np.float64),
-                    arr_ab["lat"].astype(np.float64),
-                ])
-                dijk = local_dijkstra_to_targets(
-                    profile,
-                    float(start[0]), float(start[1]),
-                    int(start_vid),
-                    arr_ab["vid"],
-                    max_cost=20_000.0,
-                    target_lonlats=trunk_lonlats,
-                    intercept_lonlat=(float(end[0]), float(end[1])),
-                    intercept_bias=1000.0,
-                )
-                if dijk is not None:
-                    dijk_poly, reached_vid = dijk
+                # Real routing on the road-graph CSR. Loads per-1°
+                # cell edge files at query time (LRU-cached). Uses an
+                # A*-flavored intercept-point bias so the winning
+                # trunk entry is the one with min `dijkstra_cost +
+                # BIAS * geodesic_km_to(trip_end)`.
+                #
+                # KEY: iterate over legs 1..SKIP_MAX+1, not just
+                # leg 1. Because paired-SPT polygons overlap in
+                # geographic space (especially for wetland-detour
+                # corridors), the source vertex is sometimes actually
+                # CLOSER to a downstream trunk than to leg 1's trunk.
+                # In the Senftenberg→Halbe case, Senftenberg is
+                # geographically nearer to the (Lübbenau, Halbe)
+                # trunk than to the (Vetschau, Lübbenau) trunk it
+                # was walking, because the Lübbenau→Halbe path
+                # extends south. Entering the far trunk directly
+                # bypasses the wetland detour on the intermediate
+                # legs.
+                #
+                # Score each candidate leg by dijkstra polyline km +
+                # geodesic-remaining to the trip end. Pick the min.
+                best_dijk_cand = None  # (score, k, poly, reached_vid, arr, next_idx)
+                for k in range(1, SKIP_MAX + 2):
+                    if k + 1 >= len(chain):
+                        break
+                    trunk_k = prof.trunks.get(
+                        (int(chain[k]), int(chain[k + 1])))
+                    if trunk_k is None:
+                        continue
+                    arr_k, next_idx_k = trunk_k
+                    trunk_k_lonlats = np.column_stack([
+                        arr_k["lon"].astype(np.float64),
+                        arr_k["lat"].astype(np.float64),
+                    ])
+                    dijk_k = local_dijkstra_to_targets(
+                        profile,
+                        float(start[0]), float(start[1]),
+                        int(start_vid),
+                        arr_k["vid"],
+                        max_cost=200_000.0,
+                        target_lonlats=trunk_k_lonlats,
+                        intercept_lonlat=(float(end[0]), float(end[1])),
+                        intercept_bias=1000.0,
+                    )
+                    if dijk_k is None:
+                        continue
+                    poly_k, reached_k = dijk_k
+                    poly_km = 0.0
+                    for _j in range(1, len(poly_k)):
+                        poly_km += _haversine_m(
+                            poly_k[_j - 1][0], poly_k[_j - 1][1],
+                            poly_k[_j][0],     poly_k[_j][1],
+                        ) / 1000.0
+                    remain_km = _haversine_m(
+                        poly_k[-1][0], poly_k[-1][1],
+                        float(end[0]),  float(end[1]),
+                    ) / 1000.0
+                    score = poly_km + remain_km
+                    if best_dijk_cand is None or score < best_dijk_cand[0]:
+                        best_dijk_cand = (score, k, poly_k, reached_k,
+                                          arr_k, next_idx_k)
+                if best_dijk_cand is not None:
+                    _sc, k_win, dijk_poly, reached_vid, arr_ab, next_idx_ab = \
+                        best_dijk_cand
                     for c in dijk_poly[1:-1]:
                         coords.append([float(c[0]), float(c[1])])
                     tpos = int(np.searchsorted(arr_ab["vid"], reached_vid))
                     if (tpos < len(arr_ab)
                             and int(arr_ab["vid"][tpos]) == reached_vid):
-                        chain_terminus_vid = reached_vid
+                        chain_terminus_vid = int(reached_vid)
                         chain_terminus_coord = (
                             float(arr_ab["lat"][tpos]),
                             float(arr_ab["lon"][tpos]),
                         )
+                        # If we entered a later leg, skip the earlier
+                        # ones. Also mark them as skipped for the viz.
+                        for skipped in range(walk_start_i, k_win):
+                            bridges.append({
+                                "leg": skipped,
+                                "from_city": int(chain[skipped]),
+                                "to_city":   int(chain[skipped + 1]),
+                                "distance_m": 0.0, "skipped": True,
+                            })
+                        walk_start_i = k_win
                         stitched = True
 
             if not stitched and best_salvage is not None:
