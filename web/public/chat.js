@@ -200,13 +200,17 @@ function _routesToFeatures(polylines) {
   }));
 }
 
-// A tool-call's (from_ref, to_ref, via_refs) identifies the corridor.
-// Same key = same corridor → replace, not append.
+// A tool-call's (from_ref, to_ref) identifies the corridor endpoints.
+// via_refs is intentionally NOT part of the key: a revised call for
+// the same (from, to) — say the model first tries direct Graz→CPH
+// then re-routes via the rail hubs — should REPLACE the previous
+// polyline, not paint on top of it. Different (from, to) pairs
+// (say per-segment sub-agent polylines) still coexist naturally
+// because they have distinct keys.
 function _routeKey(input) {
   const from = input?.from_ref ?? input?.from_lonlat ?? "?";
   const to   = input?.to_ref   ?? input?.to_lonlat   ?? "?";
-  const via  = Array.isArray(input?.via_refs) ? input.via_refs.join(",") : "";
-  return `${from}→${to}|${via}`;
+  return `${from}→${to}`;
 }
 
 function drawRouteOnMap(polyline, key) {
