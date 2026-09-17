@@ -251,6 +251,51 @@ TOOLS = [
         },
     },
     {
+        "name": "direct_rail_service_batch",
+        "description": (
+            "BATCHED version of `direct_rail_service`. Check up to 30 "
+            "`(from_ref, to_ref)` pairs in ONE tool call. Prefer this "
+            "over individual `direct_rail_service` calls whenever you "
+            "need to verify rail connectivity for more than 2 pairs — "
+            "e.g. a multi-overnight itinerary where you're checking "
+            "every overnight against Graz + Copenhagen + a corridor "
+            "hub. One call replaces N rounds; saves your tool-loop "
+            "budget for the actual day-by-day narrative.\n\n"
+            "Returns `{'results': [...]}` where each entry has the "
+            "same shape as a single `direct_rail_service` response, "
+            "in the SAME order as the input pairs, tagged with the "
+            "input `from_ref`/`to_ref` for identification.\n\n"
+            "Global `max_station_dist_km` / `min_routes_rail` apply "
+            "to every pair; a pair can't override them individually."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pairs": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 30,
+                    "description": "List of {from_ref, to_ref} pairs.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "from_ref": {"type": "string"},
+                            "to_ref":   {"type": "string"},
+                        },
+                        "required": ["from_ref", "to_ref"],
+                    },
+                },
+                "max_station_dist_km": {
+                    "type": "number", "default": 5, "minimum": 0.5, "maximum": 25,
+                },
+                "min_routes_rail": {
+                    "type": "integer", "default": 1, "minimum": 1, "maximum": 50,
+                },
+            },
+            "required": ["pairs"],
+        },
+    },
+    {
         "name": "split_into_stages",
         "description": (
             "Split a tour into daily stages of roughly "
@@ -979,12 +1024,52 @@ def _tool_direct_rail_service(inp: dict) -> dict:
     }
 
 
+def _tool_direct_rail_service_batch(inp: dict) -> dict:
+    """Run `_tool_direct_rail_service` for each `(from_ref, to_ref)`
+    pair in `pairs` and return an aligned results list. Applies the
+    same global `max_station_dist_km` / `min_routes_rail` to every
+    pair — a per-pair override would multiply the schema without
+    much practical use.
+
+    Cheap: all the data (stations kdtree, route-id sidecar, anchor
+    lookups) is already loaded and cached. This is O(pairs) with a
+    tiny constant. The value it adds isn't compute — it's tool-loop
+    rounds. 20 pairs go from 20 model rounds to 1.
+    """
+    pairs = inp.get("pairs") or []
+    if not isinstance(pairs, list) or not pairs:
+        return {"error": "pairs must be a non-empty list"}
+    if len(pairs) > 30:
+        return {"error": f"at most 30 pairs per call (got {len(pairs)})"}
+    max_km = inp.get("max_station_dist_km")
+    min_r  = inp.get("min_routes_rail")
+    results = []
+    for p in pairs:
+        if not isinstance(p, dict):
+            results.append({"error": "pair must be an object"})
+            continue
+        one_inp = {"from_ref": p.get("from_ref"),
+                   "to_ref":   p.get("to_ref")}
+        if max_km is not None:
+            one_inp["max_station_dist_km"] = max_km
+        if min_r is not None:
+            one_inp["min_routes_rail"] = min_r
+        one_out = _tool_direct_rail_service(one_inp)
+        # Echo the input refs so the caller can align results with
+        # its own list without positional counting.
+        one_out["from_ref"] = p.get("from_ref")
+        one_out["to_ref"]   = p.get("to_ref")
+        results.append(one_out)
+    return {"results": results, "n_pairs": len(results)}
+
+
 TOOL_IMPLS = {
     "search_anchors":       _tool_search_anchors,
     "route":                _tool_route,
     "stations_near":        _tool_stations_near,
     "stations_along_route": _tool_stations_along_route,
     "direct_rail_service":  _tool_direct_rail_service,
+    "direct_rail_service_batch": _tool_direct_rail_service_batch,
     "split_into_stages":    _tool_split_into_stages,
     "pois_near_anchor":     _tool_pois_near_anchor,
     "pois_along_route":     _tool_pois_along_route,
