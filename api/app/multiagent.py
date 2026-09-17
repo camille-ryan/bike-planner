@@ -389,13 +389,39 @@ async def run_multiagent_plan(
         # global numbers on pins too, that's a later re-render pass
         # after all segments in.
         if status == "ok" and result is not None:
-            from .tools import _ROUTE_CACHE
+            from .tools import _tool_route, _ROUTE_CACHE
+            # Controller-side polyline upgrade. Segment agents get
+            # fast-mode polylines by default (straight lines between
+            # chain anchors) and sometimes opt into precise mode
+            # inconsistently — user saw straight-lines on some legs
+            # and bike paths on others. Force a precise route call
+            # using the segment agent's own overnight sequence so the
+            # committed polyline is uniformly the real bike path.
+            via_refs = [ov.ref for ov in result.overnights[1:-1] if ov.ref]
             polyline = None
-            for key in reversed(list(_ROUTE_CACHE.keys())):
-                fr, to, _via = key
-                if fr == spec.from_ref and to == spec.to_ref:
-                    polyline = _ROUTE_CACHE[key]
-                    break
+            try:
+                loop = asyncio.get_running_loop()
+                precise = await asyncio.wait_for(
+                    loop.run_in_executor(None, _tool_route, {
+                        "from_ref": spec.from_ref,
+                        "to_ref":   spec.to_ref,
+                        "via_refs": via_refs,
+                        "precise":  True,
+                    }),
+                    timeout=30.0,
+                )
+                if isinstance(precise, dict) and precise.get("polyline"):
+                    polyline = precise["polyline"]
+            except Exception:
+                pass
+            # If precise routing failed or timed out, fall back to
+            # whatever the segment agent left in the shared cache.
+            if not polyline:
+                for key in reversed(list(_ROUTE_CACHE.keys())):
+                    fr, to, _via = key
+                    if fr == spec.from_ref and to == spec.to_ref:
+                        polyline = _ROUTE_CACHE[key]
+                        break
             overnights_out = []
             for i, ov in enumerate(result.overnights):
                 overnights_out.append({
