@@ -46,13 +46,28 @@ STATION_MAX_KM = 5.0
 # `scripts/build_rail_route_names.py`.
 _ROUTE_NAMES_PATH = Path(DATA_DIR) / "rail_route_names.json"
 
+# Route-ids that GTFS feeds file as rail (route_type=2) but that are
+# actually buses run under a fare-integrated tag (Pražská
+# integrovaná doprava, Moravskoslezský kraj, German Verkehrsverbünde).
+# Excluded from the rail-anchor graph so `direct_rail_service` /
+# `rail_path` don't falsely report bus service as direct trains.
+_ROUTE_EXCLUDES_PATH = Path(DATA_DIR) / "rail_route_excludes.json"
+
 
 @lru_cache(maxsize=1)
 def _load_route_names() -> dict[str, str]:
-    """route_id (namespaced `<country>:<gtfs_route_id>`) → short_name."""
+    """raw route_id → short_name (across all feeds)."""
     if not _ROUTE_NAMES_PATH.exists():
         return {}
     return json.loads(_ROUTE_NAMES_PATH.read_text())
+
+
+@lru_cache(maxsize=1)
+def _load_route_excludes() -> frozenset[str]:
+    """Set of raw route_ids to skip when building rail adjacency."""
+    if not _ROUTE_EXCLUDES_PATH.exists():
+        return frozenset()
+    return frozenset(json.loads(_ROUTE_EXCLUDES_PATH.read_text()))
 
 
 def _hav_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
@@ -78,11 +93,17 @@ def _build_rail_adjacency(profile: str) -> dict[int, dict[int, float]]:
     if not station_routes or not stations:
         return {}
 
-    # Attach route_id set to each station; drop stations with no routes.
+    excludes = _load_route_excludes()
+
+    # Attach route_id set to each station; drop stations with no routes
+    # (after filtering fare-integrated bus routes from the set).
     rail_stations = []
     for s in stations:
         key = f"{s.get('country')}:{s.get('gtfs_id')}"
         routes = station_routes.get(key)
+        if not routes:
+            continue
+        routes = {r for r in routes if r not in excludes}
         if not routes:
             continue
         rail_stations.append((s["lon"], s["lat"], routes))

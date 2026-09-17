@@ -733,15 +733,31 @@ def _load_station_routes_cache() -> dict[str, set[str]]:
     """Load the per-station rail-route-id sidecar emitted by
     `pgrouting/main.py export-rail-routes`. Keys are
     `<country>:<gtfs_id>`; values are sets of GTFS route_ids serving
-    that station. Empty dict if the sidecar hasn't been produced yet."""
+    that station.
+
+    Filtered against `data/rail_route_excludes.json` at load time —
+    national feeds abuse `route_type=2` for fare-integrated regional
+    bus lines (Pražská integrovaná doprava, Moravskoslezský kraj,
+    German Verkehrsverbünde) which would otherwise cause
+    `direct_rail_service` to report bus service as direct-train
+    connectivity. Regenerate the excludes with
+    `python3 scripts/build_rail_route_names.py`.
+    """
     if not hasattr(_load_station_routes_cache, "_cache"):
         if not STATION_ROUTES_PATH.exists():
             _load_station_routes_cache._cache = {}
         else:
+            excludes_path = Path(DATA_DIR) / "rail_route_excludes.json"
+            excludes: set[str] = set()
+            if excludes_path.exists():
+                excludes = set(json.loads(excludes_path.read_text()))
             data = json.loads(STATION_ROUTES_PATH.read_text())
-            _load_station_routes_cache._cache = {
-                k: set(v) for k, v in data.items()
-            }
+            filtered: dict[str, set[str]] = {}
+            for k, v in data.items():
+                kept = {r for r in v if r not in excludes}
+                if kept:
+                    filtered[k] = kept
+            _load_station_routes_cache._cache = filtered
     return _load_station_routes_cache._cache
 
 
