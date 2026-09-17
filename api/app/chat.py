@@ -42,7 +42,7 @@ def _get_client() -> anthropic.Anthropic:
         # loop indefinitely. 120s covers even long extended-thinking
         # rounds; anything longer than that is a genuine failure the
         # client should see quickly.
-        _client = anthropic.Anthropic(api_key=key, timeout=120.0)
+        _client = anthropic.Anthropic(api_key=key, timeout=240.0)
     return _client
 
 
@@ -105,6 +105,7 @@ Workflow — do exactly what the user asked, no more. DO NOT stop mid-workflow f
 - **Phase-stream your writeup, don't dump it at the end.** For a multi-hub plan (Graz→Wien→Praha→…), the user's UI renders your text tokens in real time. Write each phase's narrative in the SAME round that its tool results come back — heading, table, rail-check summary — THEN if you still need tool calls for later phases, emit them in the same response. The model API happily combines text output + tool_use in one round. Do NOT wait until every last tool call has returned to start writing. A plan that streams phase-by-phase feels dramatically faster than one that appears all at once at minute 11.
 - Call `stations_near` ONLY if the user asked about rail, train, meeting the partner, or station-accessible overnights.
 - When you need rail-accessible overnights across multiple candidate towns along a route, PREFER `stations_along_route` (one call, returns the ranked corridor) over N × `stations_near` calls.
+- **For rail-constrained plans, call `stations_along_route` BEFORE `split_into_stages`, not after.** The natural pipeline is: (a) `stations_along_route` returns every rail-served anchor along the corridor with its `km_along_route` — pick anchors ~one day's ride apart (from the km column), (b) pass those refs as `via_refs` to `split_into_stages` so overnights land at real rail-served cities by construction, (c) `direct_rail_service_batch` verifies direct-train connectivity in one round. Doing split-first and stations-after strands you with overnights in villages that have no station and forces re-planning.
 - If the user's prompt uses the words "direct train", "non-transfer", "one-seat", or "single change" (or asks that overnights be reachable by a direct train from a specific place / hub), you MUST verify direct rail service. `n_routes_rail` alone does not prove direct service — a station with 20 routes may still require a transfer to reach the hub the user cares about. Choose the tool by count:
     - 1–2 pairs to check → call `direct_rail_service` per pair.
     - **3 or more pairs → call `direct_rail_service_batch` ONCE** with all pairs. It replaces N model rounds with 1, leaving budget for the actual day-by-day narrative.
@@ -261,8 +262,16 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
             for event in stream:
                 if event.type == "text":
                     yield _sse("text", {"delta": event.text})
-                elif event.type == "input_json":
-                    pass
+                else:
+                    # Non-text SDK events (content_block_start,
+                    # input_json deltas for tool_use, block_stop,
+                    # message_delta, etc.) don't carry a payload the
+                    # client renders — but they DO signal the server
+                    # is still alive. Emit an SSE comment line as a
+                    # heartbeat so the browser's stream-idle timer
+                    # doesn't trip during long silent phases (e.g.
+                    # tool_use input generation, extended thinking).
+                    yield b": tick\n\n"
             final = stream.get_final_message()
 
         n_text = sum(1 for b in final.content if b.type == "text")

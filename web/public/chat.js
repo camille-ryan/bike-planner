@@ -21,10 +21,10 @@ const saveBtn  = document.getElementById("chat-save");
 const loadSel  = document.getElementById("chat-load");
 
 // Abort the SSE if no bytes arrive for this many ms. Route planning
-// can take ~2 min end-to-end; the API's own per-request timeout is
-// 120s, so 90s of silence with no delta / tool_call / done is a real
-// stall (Anthropic slow, WSL sleep, network drop). We surface it as a
-// clean error instead of hanging the UI forever.
+// can take several minutes end-to-end; the API also emits `: tick`
+// comment heartbeats during long silent LLM phases (tool_use JSON
+// generation, extended thinking), so 90s of true silence signals a
+// real stall (Anthropic dropped us, WSL sleep, network drop).
 const CHAT_STREAM_IDLE_MS = 90_000;
 
 console.log("[chat.js] loaded, elements:", {
