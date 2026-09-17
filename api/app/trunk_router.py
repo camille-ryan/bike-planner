@@ -893,45 +893,35 @@ def route(
                 stitched = True
                 break
 
-            if not stitched and best_salvage is not None:
-                # Primary: min-bridge salvage across stitch_city
-                # attempts (empirically picks a trunk vertex with a
-                # clean `succ`-chain toward the frontier). Local
-                # Dijkstra was tried but for trunks built around
-                # wetland detours (Vetschau→Lübbenau round the
-                # Spreewald) it picks the cheapest-to-reach trunk
-                # vertex, whose succ chain then loops back through
-                # the source area. Straight-line salvage bridges up
-                # to 30 km — visible but bounded — win here.
-                SALVAGE_MAX_BRIDGE_M = 30_000.0
-                if best_salvage["bridge_m"] <= SALVAGE_MAX_BRIDGE_M:
-                    for spos in best_salvage["stitch_positions"][:-1]:
-                        c = best_salvage["spt_coords"][spos]
-                        coords.append([float(c[0]), float(c[1])])
-                    trunk_entry_vid = best_salvage["trunk_vid"]
-                    trunk_entry_pos = best_salvage["trunk_pos"]
-                    chain_terminus_vid = trunk_entry_vid
-                    chain_terminus_coord = (
-                        float(arr_ab["lat"][trunk_entry_pos]),
-                        float(arr_ab["lon"][trunk_entry_pos]),
-                    )
-                    stitched = True
-
             if not stitched:
-                # Salvage wasn't available or its bridge exceeded 30 km.
-                # Fall back to the runtime bounded local Dijkstra on
-                # the road-graph CSR — the "unpruned-CSR local-Dijkstra
-                # bridge" the module docstring TODO'd. Loads per-1°
-                # cell edge files at query time; no straight-line
-                # stitches. Not the primary because for some pruned
-                # trunks it picks a shortest-to-reach entry whose
-                # succ-chain loops back through source.
+                # Real routing on the road-graph CSR — the
+                # "unpruned-CSR local-Dijkstra bridge" TODO'd in the
+                # module docstring. Loads per-1° cell edge files at
+                # query time (LRU-cached). Uses an A*-flavored
+                # intercept-point bias: instead of picking the
+                # trunk vertex cheapest to reach on the road graph,
+                # pick the one with min `dijkstra_cost + BIAS *
+                # geodesic_km_to(trip_end)`. That prefers entering
+                # the trunk closer to the trip destination, avoiding
+                # entries near the source whose succ-chain would
+                # loop back through where we started. `BIAS = 3000`
+                # (bike-effort-per-km) empirically dominates the raw
+                # dijkstra cost for our common corridors — the
+                # winning trunk vertex is farther along the corridor
+                # by design.
+                trunk_lonlats = np.column_stack([
+                    arr_ab["lon"].astype(np.float64),
+                    arr_ab["lat"].astype(np.float64),
+                ])
                 dijk = local_dijkstra_to_targets(
                     profile,
                     float(start[0]), float(start[1]),
                     int(start_vid),
                     arr_ab["vid"],
                     max_cost=20_000.0,
+                    target_lonlats=trunk_lonlats,
+                    intercept_lonlat=(float(end[0]), float(end[1])),
+                    intercept_bias=1000.0,
                 )
                 if dijk is not None:
                     dijk_poly, reached_vid = dijk
@@ -946,6 +936,26 @@ def route(
                             float(arr_ab["lon"][tpos]),
                         )
                         stitched = True
+
+            if not stitched and best_salvage is not None:
+                # Fallback: min-bridge salvage across stitch_city
+                # attempts. Straight-line bridge of up to 30 km —
+                # visible but bounded. Used when the local Dijkstra
+                # failed (cells missing at edge of coverage, or
+                # start_vid not in the loaded subgraph).
+                SALVAGE_MAX_BRIDGE_M = 30_000.0
+                if best_salvage["bridge_m"] <= SALVAGE_MAX_BRIDGE_M:
+                    for spos in best_salvage["stitch_positions"][:-1]:
+                        c = best_salvage["spt_coords"][spos]
+                        coords.append([float(c[0]), float(c[1])])
+                    trunk_entry_vid = best_salvage["trunk_vid"]
+                    trunk_entry_pos = best_salvage["trunk_pos"]
+                    chain_terminus_vid = trunk_entry_vid
+                    chain_terminus_coord = (
+                        float(arr_ab["lat"][trunk_entry_pos]),
+                        float(arr_ab["lon"][trunk_entry_pos]),
+                    )
+                    stitched = True
 
             if not stitched:
                 # Fallback to the prior bidirectional-LCA stitch. Can

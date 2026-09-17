@@ -152,6 +152,8 @@ def local_dijkstra_to_targets(
     target_lonlats: np.ndarray | None = None,
     prefer_lonlat: tuple[float, float] | None = None,
     prefer_radius_km: float = 5.0,
+    intercept_lonlat: tuple[float, float] | None = None,
+    intercept_bias: float = 0.0,
 ) -> tuple[list[list[float]], int] | None:
     """Find the shortest bike-graph path from `start_vid` to whichever
     of `target_vids` is closest, bounded by `max_cost`. Returns
@@ -175,6 +177,19 @@ def local_dijkstra_to_targets(
     anchor — one whose successor chain would walk back through where
     we started. If the filtered set is empty, falls back to the full
     target set.
+
+    `intercept_lonlat` + `intercept_bias` + `target_lonlats` — when
+    set, the WINNING target is the one that minimizes
+    `dijkstra_cost + intercept_bias * geodesic_km_to(intercept)`
+    rather than `dijkstra_cost` alone. An A*-flavored intercept-point
+    heuristic: prefer entering the trunk closer to the trip's
+    destination even if it costs more bike-effort locally. Trades
+    off "reach the trunk cheaply" against "avoid trunks whose succ-
+    chain from the near-source entry would loop back through where
+    we started." Larger `intercept_bias` means stronger pull toward
+    intercept coord. Edge costs are ~1000-per-km empirically so
+    `intercept_bias=1000` ≈ "one bike-effort unit per meter of
+    geodesic remaining." Bias 0 disables the heuristic.
     """
     # Load the source cell + adjacent cells only if the source is
     # near a cell boundary. A 1° cell at central-EU latitudes spans
@@ -252,10 +267,48 @@ def local_dijkstra_to_targets(
     # Pick the reached target with smallest dist.
     dist0 = dist[0]  # dijkstra returns 2D even for one source
     pred0 = pred[0]
-    reached_targets = target_locals[np.isfinite(dist0[target_locals])]
+    reached_mask = np.isfinite(dist0[target_locals])
+    reached_targets = target_locals[reached_mask]
     if len(reached_targets) == 0:
         return None
-    best_local = int(reached_targets[np.argmin(dist0[reached_targets])])
+
+    # Score reached targets. Default: pure dijkstra cost (cheapest to
+    # reach on the road graph). With `intercept_lonlat`+`intercept_bias`+
+    # `target_lonlats`: add a per-target penalty proportional to the
+    # geodesic distance from the target to the intercept coord. Effect:
+    # bias toward entering the trunk closer to the trip's destination.
+    reached_costs = dist0[reached_targets]
+    if (intercept_lonlat is not None and intercept_bias > 0
+            and target_lonlats is not None
+            and len(target_lonlats) == len(target_vids)):
+        # target_lonlats was aligned with the pre-filter tgt_arr_raw
+        # via the `keep` mask. Rebuild the alignment: the entries in
+        # `positions` came from tgt_arr (post-filter, sorted), and
+        # matched[i] tells us which tgt_arr[i] survived. We need the
+        # coords for the reached targets specifically. Easier path:
+        # look each reached vid back up in the ORIGINAL target_vids
+        # via searchsorted, then index target_lonlats.
+        reached_vids_arr = gid_of_local[reached_targets]
+        orig_target_arr = np.asarray(target_vids, dtype=np.int64)
+        order = np.argsort(orig_target_arr)
+        sorted_orig = orig_target_arr[order]
+        opos = np.searchsorted(sorted_orig, reached_vids_arr)
+        valid = (opos < len(sorted_orig)) & (sorted_orig[opos] == reached_vids_arr)
+        if valid.all():
+            orig_idx = order[opos]
+            _R = 6_371_000.0
+            _lat_a = math.radians(float(intercept_lonlat[1]))
+            _lat_v = np.radians(target_lonlats[orig_idx, 1].astype(np.float64))
+            _lon_d = np.radians(
+                target_lonlats[orig_idx, 0].astype(np.float64)
+                - float(intercept_lonlat[0])
+            )
+            _hav = (np.sin((_lat_v - _lat_a) / 2) ** 2
+                    + math.cos(_lat_a) * np.cos(_lat_v)
+                    * np.sin(_lon_d / 2) ** 2)
+            geodesic_m = 2 * _R * np.arcsin(np.sqrt(_hav))
+            reached_costs = reached_costs + intercept_bias * (geodesic_m / 1000.0)
+    best_local = int(reached_targets[np.argmin(reached_costs)])
 
     # Walk predecessors from best_local back to start_pos.
     path_locals = [best_local]
