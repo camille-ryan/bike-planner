@@ -1,0 +1,168 @@
+"""Rail-anchor graph, parallel to `trunk_router.chain_adj` for bikes.
+
+The bike side of this project stores a pre-computed chain graph of
+anchor cities (nodes) with paired-SPT trunks (edges) between them.
+For the rail-constrained partner-meets-by-direct-train use case, we
+need the same *shape* but derived from GTFS rail data instead of
+bike routing:
+
+  - Nodes: anchor cities that sit within `STATION_MAX_KM` of a
+    rail-served station.
+  - Edges: two anchors share at least one GTFS `route_id`, i.e. a
+    train serves BOTH stations without a transfer.
+  - Weight: geodesic km between the anchor city centers.
+
+Shortest path in this graph = the minimum-daily-hop rail spine from
+A to B, where every consecutive pair is guaranteed to have direct
+service. That's exactly what the flagship tour planner needs before
+picking bike overnights: route the bike along the rail spine
+(Wien→Brno→Praha, not Wien→Praha direct which is bus-only), and
+every base overnight is automatically rail-chain-compatible.
+
+Data source: `rail_station_routes.json` (per-station route_id sets,
+same feed `direct_rail_service` reads) + `rail_stations.geojson`
+(station coords). Both are lazy-loaded via helpers in `tools.py`.
+"""
+from __future__ import annotations
+
+import heapq
+import math
+from collections import defaultdict
+from functools import lru_cache
+
+
+STATION_MAX_KM = 5.0
+
+
+def _hav_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+@lru_cache(maxsize=4)
+def _build_rail_adjacency(profile: str) -> dict[int, dict[int, float]]:
+    """Build the rail-anchor graph. Cached per profile. First call is
+    ~1-2 s for a Europe-scale corpus (33 k stations, 2.5 k routes);
+    subsequent calls are dict lookups."""
+    from . import trunk_router
+    from .tools import _load_station_routes_cache, _load_stations_cache
+
+    prof = trunk_router._load_profile(profile)
+    station_routes = _load_station_routes_cache()  # {country:gtfs_id: set(route_id)}
+    stations = _load_stations_cache()
+    if not station_routes or not stations:
+        return {}
+
+    # Attach route_id set to each station; drop stations with no routes.
+    rail_stations = []
+    for s in stations:
+        key = f"{s.get('country')}:{s.get('gtfs_id')}"
+        routes = station_routes.get(key)
+        if not routes:
+            continue
+        rail_stations.append((s["lon"], s["lat"], routes))
+
+    if not rail_stations:
+        return {}
+
+    # KDTree over rail stations for the per-anchor radius query.
+    try:
+        import numpy as np
+        from scipy.spatial import cKDTree
+        arr = np.array([[s[0], s[1]] for s in rail_stations], dtype=np.float64)
+        stree = cKDTree(arr)
+        _KM_PER_DEG = 111.0
+        radius_deg = STATION_MAX_KM / _KM_PER_DEG
+    except ImportError:
+        stree = None
+        radius_deg = None  # type: ignore[assignment]
+
+    # For each anchor city, union the route_id sets of all rail stations
+    # within STATION_MAX_KM. Multi-terminal cities (Wien Hbf + Wien Mitte
+    # + Praterstern) should count as one hub, same convention as
+    # `direct_rail_service`.
+    anchor_routes: dict[int, set[str]] = {}
+    for ci, c in enumerate(prof.cities):
+        alon, alat = c.get("lon"), c.get("lat")
+        if alon is None or alat is None:
+            continue
+        if stree is not None:
+            cand = stree.query_ball_point([alon, alat], r=radius_deg)
+        else:
+            cand = range(len(rail_stations))
+        route_union: set[str] = set()
+        for si in cand:
+            slon, slat, sroutes = rail_stations[si]
+            if _hav_km(alon, alat, slon, slat) > STATION_MAX_KM:
+                continue
+            route_union |= sroutes
+        if route_union:
+            anchor_routes[ci] = route_union
+
+    # Invert: route_id → list of anchors served.
+    route_to_anchors: dict[str, list[int]] = defaultdict(list)
+    for ci, routes in anchor_routes.items():
+        for r in routes:
+            route_to_anchors[r].append(ci)
+
+    # Adjacency: all pairs of anchors on the same route are edge-connected.
+    # A pair may sit on multiple shared routes; keep the min weight (they're
+    # all the same geodesic distance, so this is a no-op — but expresses
+    # the intent cleanly).
+    adj: dict[int, dict[int, float]] = defaultdict(dict)
+    for _r, anchors_on_r in route_to_anchors.items():
+        n = len(anchors_on_r)
+        # Skip degenerate 1-station routes; they can't produce edges.
+        if n < 2:
+            continue
+        for i in range(n):
+            a = anchors_on_r[i]
+            ac = prof.cities[a]
+            for j in range(i + 1, n):
+                b = anchors_on_r[j]
+                if b in adj[a]:
+                    continue
+                bc = prof.cities[b]
+                km = _hav_km(ac["lon"], ac["lat"], bc["lon"], bc["lat"])
+                adj[a][b] = km
+                adj[b][a] = km
+
+    return dict(adj)
+
+
+def rail_shortest_path(
+    profile: str, src_ci: int, dst_ci: int,
+) -> list[int] | None:
+    """Standard Dijkstra over the rail-anchor graph. Returns the chain
+    of anchor city indices from src to dst (inclusive), or None if
+    they're in disconnected components / not on the graph at all."""
+    adj = _build_rail_adjacency(profile)
+    if src_ci not in adj or dst_ci not in adj:
+        return None
+    if src_ci == dst_ci:
+        return [src_ci]
+    dist: dict[int, float] = {src_ci: 0.0}
+    parent: dict[int, int] = {}
+    heap: list[tuple[float, int]] = [(0.0, src_ci)]
+    while heap:
+        d, u = heapq.heappop(heap)
+        if u == dst_ci:
+            path = [u]
+            while u in parent:
+                u = parent[u]
+                path.append(u)
+            path.reverse()
+            return path
+        if d > dist.get(u, float("inf")):
+            continue
+        for v, w in adj[u].items():
+            nd = d + w
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                parent[v] = u
+                heapq.heappush(heap, (nd, v))
+    return None

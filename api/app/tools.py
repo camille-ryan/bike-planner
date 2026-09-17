@@ -220,6 +220,40 @@ TOOLS = [
         },
     },
     {
+        "name": "rail_path",
+        "description": (
+            "Shortest chain of RAIL-connected anchors from `from_ref` to "
+            "`to_ref` where every consecutive pair has direct-train "
+            "service (they share at least one GTFS route_id). Uses the "
+            "SAME shape as the bike chain graph but derived from GTFS "
+            "rail data instead of bike-route trunks.\n\n"
+            "**Call this FIRST for any rail-constrained tour.** The bike "
+            "corridor should FOLLOW the rail spine, not the shortest-"
+            "distance bike route: pass this tool's chain as `via_refs` "
+            "to `route` and `split_into_stages` so every base overnight "
+            "lands on a rail line and the consecutive-pair direct-train "
+            "constraint is satisfied by construction. Doing bike routing "
+            "first and checking rail after leaves overnights stranded "
+            "when the direct rail line diverges from the bike route "
+            "(Wien↔Praha rail runs via Brno; direct is bus-only).\n\n"
+            "Returns `{reachable, n_hops, total_km, chain: [{ref, name, "
+            "population, country, km_from_start}, ...]}`. Chain is "
+            "ordered from `from_ref` to `to_ref`; `total_km` is the "
+            "sum of geodesic hop distances (a lower bound on the bike "
+            "distance that will follow it). If unreachable (isolated on "
+            "the rail graph or missing stations), returns "
+            "`reachable: false`."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "from_ref": {"type": "string", "description": "Start anchor ref"},
+                "to_ref":   {"type": "string", "description": "End anchor ref"},
+            },
+            "required": ["from_ref", "to_ref"],
+        },
+    },
+    {
         "name": "direct_rail_service",
         "description": (
             "USE THIS whenever the user asks about a DIRECT, "
@@ -1251,11 +1285,72 @@ def _tool_direct_rail_service_batch(inp: dict) -> dict:
     return {"results": results, "n_pairs": len(results)}
 
 
+def _tool_rail_path(inp: dict) -> dict:
+    """Rail-anchor-graph Dijkstra between two anchors. Returns the
+    chain of intermediate rail-served anchors — the "rail spine" the
+    bike corridor should follow so every consecutive overnight pair
+    has direct-train service."""
+    from . import rail_router
+
+    from_ref = inp.get("from_ref")
+    to_ref = inp.get("to_ref")
+    if not from_ref or not to_ref:
+        return {"error": "provide from_ref and to_ref"}
+    prof = trunk_router._load_profile(DEFAULT_PROFILE)
+    src_ci = prof.city_idx_by_ref.get(from_ref)
+    dst_ci = prof.city_idx_by_ref.get(to_ref)
+    if src_ci is None:
+        return {"error": f"unknown from_ref: {from_ref}"}
+    if dst_ci is None:
+        return {"error": f"unknown to_ref: {to_ref}"}
+
+    chain = rail_router.rail_shortest_path(DEFAULT_PROFILE, src_ci, dst_ci)
+    if chain is None:
+        return {
+            "reachable": False,
+            "chain": [],
+            "note": (
+                f"No direct-rail chain from {from_ref} to {to_ref}. "
+                "Either one of them isn't within 5 km of a rail-served "
+                "station, or they're in disconnected components on the "
+                "rail graph. Falling back to bike-shortest routing is "
+                "your only option."
+            ),
+        }
+
+    # Cumulative km along the chain (geodesic per hop).
+    entries: list[dict] = []
+    prev_lon: float | None = None
+    prev_lat: float | None = None
+    cum_km = 0.0
+    for ci in chain:
+        c = prof.cities[ci]
+        lon, lat = float(c["lon"]), float(c["lat"])
+        if prev_lon is not None:
+            cum_km += rail_router._hav_km(prev_lon, prev_lat, lon, lat)
+        entries.append({
+            "ref":           c.get("ref"),
+            "name":          c.get("name"),
+            "population":    c.get("population"),
+            "country":       c.get("country"),
+            "km_from_start": round(cum_km, 1),
+        })
+        prev_lon, prev_lat = lon, lat
+
+    return {
+        "reachable": True,
+        "n_hops":    len(entries) - 1,
+        "total_km":  round(cum_km, 1),
+        "chain":     entries,
+    }
+
+
 TOOL_IMPLS = {
     "search_anchors":       _tool_search_anchors,
     "route":                _tool_route,
     "stations_near":        _tool_stations_near,
     "stations_along_route": _tool_stations_along_route,
+    "rail_path":            _tool_rail_path,
     "direct_rail_service":  _tool_direct_rail_service,
     "direct_rail_service_batch": _tool_direct_rail_service_batch,
     "split_into_stages":    _tool_split_into_stages,
