@@ -125,9 +125,16 @@ def _merge_cells(cell_a: dict, cell_b: dict) -> dict:
 
 
 def _build_csr(cell: dict) -> csr_matrix:
-    """CSR over the cell's bike-routable edges. Negative-cost edges
-    are treated as impassable (matches the SPT preprocess), so
-    fwd/rev >= 0 masks are applied."""
+    """CSR over the WHOLE cell's bike-routable edges. Negative-cost
+    edges are treated as impassable (matches the SPT preprocess), so
+    fwd/rev >= 0 masks are applied.
+
+    Cached on the cell dict itself — `_load_cell` is `@lru_cache`d so
+    subsequent stitches into the same cell skip the 0.8s coo→csr
+    setup.
+    """
+    if "_csr" in cell:
+        return cell["_csr"]
     src = cell["src"]; dst = cell["dst"]
     fwd = cell["fwd"]; rev = cell["rev"]
     fwd_mask = fwd >= 0
@@ -136,11 +143,74 @@ def _build_csr(cell: dict) -> csr_matrix:
     e_dst = np.concatenate([dst[fwd_mask], src[rev_mask]])
     e_cost = np.concatenate([fwd[fwd_mask], rev[rev_mask]])
     n = len(cell["gid_of_local"])
-    return csr_matrix(
+    csr = csr_matrix(
         (e_cost, (e_src, e_dst)),
         shape=(n, n),
         dtype=np.float32,
     )
+    cell["_csr"] = csr
+    return csr
+
+
+def _build_csr_bbox(
+    cell: dict,
+    bbox: tuple[float, float, float, float],
+    must_keep_locals: np.ndarray,
+) -> tuple[csr_matrix, np.ndarray] | None:
+    """CSR over a rectangular sub-window of the cell (lon_min, lon_max,
+    lat_min, lat_max). Returns `(csr, kept_locals)` where
+    `kept_locals[i]` is the FULL-CELL local index of CSR row `i`
+    (sorted). Callers translate:
+      full → csr  via  np.searchsorted(kept_locals, full_idx)
+      csr  → full via  kept_locals[csr_idx]
+
+    `must_keep_locals` is a set of full-cell local indices (start +
+    target verts) that MUST be included even if outside the bbox, so
+    Dijkstra can find them by position.
+
+    Returns None if the crop is empty (no edges survive).
+
+    Cheap enough (2 boolean masks + a compact remap + one coo→csr)
+    that it undercuts the full-cell build when the crop is <1% of
+    the cell — which is the target case for a first-mile stitch.
+    """
+    verts = cell["verts"]
+    lon_min, lon_max, lat_min, lat_max = bbox
+    in_bbox = (
+        (verts[:, 0] >= lon_min) & (verts[:, 0] <= lon_max)
+        & (verts[:, 1] >= lat_min) & (verts[:, 1] <= lat_max)
+    )
+    if must_keep_locals.size:
+        in_bbox[must_keep_locals] = True
+    # Keep only edges whose BOTH endpoints survive — a directed edge
+    # into a dropped vertex is unusable, and Dijkstra can't relax
+    # through it anyway.
+    src = cell["src"]; dst = cell["dst"]
+    e_keep = in_bbox[src] & in_bbox[dst]
+    if not e_keep.any():
+        return None
+    src_full = src[e_keep]
+    dst_full = dst[e_keep]
+    fwd = cell["fwd"][e_keep]
+    rev = cell["rev"][e_keep]
+    # Remap full-cell locals → compact 0..k-1 in sorted order.
+    kept_locals = np.where(in_bbox)[0]  # sorted ascending
+    remap = np.full(len(verts), -1, dtype=np.int32)
+    remap[kept_locals] = np.arange(len(kept_locals), dtype=np.int32)
+    src_c = remap[src_full]
+    dst_c = remap[dst_full]
+    fwd_mask = fwd >= 0
+    rev_mask = rev >= 0
+    e_src = np.concatenate([src_c[fwd_mask], dst_c[rev_mask]])
+    e_dst = np.concatenate([dst_c[fwd_mask], src_c[rev_mask]])
+    e_cost = np.concatenate([fwd[fwd_mask], rev[rev_mask]])
+    n = len(kept_locals)
+    csr = csr_matrix(
+        (e_cost, (e_src, e_dst)),
+        shape=(n, n),
+        dtype=np.float32,
+    )
+    return csr, kept_locals
 
 
 def local_dijkstra_to_targets(
@@ -268,82 +338,140 @@ def local_dijkstra_to_targets(
     if len(target_locals) == 0:
         return None
 
-    csr = _build_csr(graph)
-    dist, pred = dijkstra(
-        csgraph=csr,
-        indices=[start_pos],
-        return_predecessors=True,
-        directed=True,
-        limit=max_cost,
-    )
-    # Pick the reached target with smallest dist.
-    dist0 = dist[0]  # dijkstra returns 2D even for one source
-    pred0 = pred[0]
-    reached_mask = np.isfinite(dist0[target_locals])
-    reached_targets = target_locals[reached_mask]
-    if len(reached_targets) == 0:
-        return None
-
-    # Score reached targets. Default: pure dijkstra cost (cheapest to
-    # reach on the road graph). With `intercept_lonlat`+`intercept_bias`+
-    # `target_lonlats`: add a per-target penalty proportional to the
-    # geodesic distance from the target to the intercept coord. Effect:
-    # bias toward entering the trunk closer to the trip's destination.
-    # `intercept_probe_coords` (if given) OVERRIDES `target_lonlats` for
-    # the geometric distance — the caller has walked each target's
-    # succ-chain some hops forward and passed those "where will the
-    # walk actually go" coords in.
-    reached_costs = dist0[reached_targets]
-    _bias_coords = (
-        intercept_probe_coords
-        if intercept_probe_coords is not None
-        else target_lonlats
-    )
-    if (intercept_lonlat is not None and intercept_bias > 0
-            and _bias_coords is not None
-            and len(_bias_coords) == len(target_vids)):
-        # target_lonlats was aligned with the pre-filter tgt_arr_raw
-        # via the `keep` mask. Rebuild the alignment: the entries in
-        # `positions` came from tgt_arr (post-filter, sorted), and
-        # matched[i] tells us which tgt_arr[i] survived. We need the
-        # coords for the reached targets specifically. Easier path:
-        # look each reached vid back up in the ORIGINAL target_vids
-        # via searchsorted, then index target_lonlats.
-        reached_vids_arr = gid_of_local[reached_targets]
-        orig_target_arr = np.asarray(target_vids, dtype=np.int64)
-        order = np.argsort(orig_target_arr)
-        sorted_orig = orig_target_arr[order]
-        opos = np.searchsorted(sorted_orig, reached_vids_arr)
-        valid = (opos < len(sorted_orig)) & (sorted_orig[opos] == reached_vids_arr)
-        if valid.all():
-            orig_idx = order[opos]
-            _R = 6_371_000.0
-            _lat_a = math.radians(float(intercept_lonlat[1]))
-            _lat_v = np.radians(_bias_coords[orig_idx, 1].astype(np.float64))
-            _lon_d = np.radians(
-                _bias_coords[orig_idx, 0].astype(np.float64)
-                - float(intercept_lonlat[0])
-            )
-            _hav = (np.sin((_lat_v - _lat_a) / 2) ** 2
-                    + math.cos(_lat_a) * np.cos(_lat_v)
-                    * np.sin(_lon_d / 2) ** 2)
-            geodesic_m = 2 * _R * np.arcsin(np.sqrt(_hav))
-            reached_costs = reached_costs + intercept_bias * (geodesic_m / 1000.0)
-    best_local = int(reached_targets[np.argmin(reached_costs)])
-
-    # Walk predecessors from best_local back to start_pos.
-    path_locals = [best_local]
-    cur = best_local
-    while cur != start_pos:
-        p = int(pred0[cur])
-        if p < 0:
-            return None  # shouldn't happen if best_local was reached
-        path_locals.append(p)
-        cur = p
-    path_locals.reverse()
-
     verts = graph["verts"]
-    polyline = [[float(verts[i][0]), float(verts[i][1])]
-                for i in path_locals]
-    reached_vid = int(gid_of_local[best_local])
-    return polyline, reached_vid
+
+    # Inner helper: run Dijkstra on a (csr, kept_locals) pair.
+    # `kept_locals is None` means the CSR spans the whole cell
+    # (identity mapping). Otherwise `kept_locals[i]` is the full-cell
+    # local index of CSR row `i`; callers translate full↔csr through
+    # it. Encapsulated so the bbox-fast-path and full-cell fallback
+    # share the same post-Dijkstra scoring and path-recovery logic.
+    def _run(csr, kept_locals):
+        if kept_locals is None:
+            csr_start = start_pos
+            csr_targets = target_locals
+        else:
+            pos_s = int(np.searchsorted(kept_locals, start_pos))
+            if (pos_s >= len(kept_locals)
+                    or int(kept_locals[pos_s]) != start_pos):
+                return None
+            csr_start = pos_s
+            pos_t = np.searchsorted(kept_locals, target_locals)
+            in_crop = (pos_t < len(kept_locals))
+            hit = np.zeros_like(in_crop)
+            hit[in_crop] = kept_locals[pos_t[in_crop]] == target_locals[in_crop]
+            if not hit.any():
+                return None
+            csr_targets = pos_t[hit].astype(np.int32)
+        dist, pred = dijkstra(
+            csgraph=csr,
+            indices=[csr_start],
+            return_predecessors=True,
+            directed=True,
+            limit=max_cost,
+        )
+        dist0 = dist[0]
+        pred0 = pred[0]
+        reached_mask = np.isfinite(dist0[csr_targets])
+        reached_targets = csr_targets[reached_mask]
+        if len(reached_targets) == 0:
+            return None
+        reached_costs = dist0[reached_targets]
+        # Intercept-bias scoring (see docstring).
+        _bias_coords = (
+            intercept_probe_coords
+            if intercept_probe_coords is not None
+            else target_lonlats
+        )
+        if (intercept_lonlat is not None and intercept_bias > 0
+                and _bias_coords is not None
+                and len(_bias_coords) == len(target_vids)):
+            reached_full = (reached_targets if kept_locals is None
+                            else kept_locals[reached_targets])
+            reached_vids_arr = gid_of_local[reached_full]
+            orig_target_arr = np.asarray(target_vids, dtype=np.int64)
+            order = np.argsort(orig_target_arr)
+            sorted_orig = orig_target_arr[order]
+            opos = np.searchsorted(sorted_orig, reached_vids_arr)
+            valid = (opos < len(sorted_orig)) & (sorted_orig[opos] == reached_vids_arr)
+            if valid.all():
+                orig_idx = order[opos]
+                _R = 6_371_000.0
+                _lat_a = math.radians(float(intercept_lonlat[1]))
+                _lat_v = np.radians(_bias_coords[orig_idx, 1].astype(np.float64))
+                _lon_d = np.radians(
+                    _bias_coords[orig_idx, 0].astype(np.float64)
+                    - float(intercept_lonlat[0])
+                )
+                _hav = (np.sin((_lat_v - _lat_a) / 2) ** 2
+                        + math.cos(_lat_a) * np.cos(_lat_v)
+                        * np.sin(_lon_d / 2) ** 2)
+                geodesic_m = 2 * _R * np.arcsin(np.sqrt(_hav))
+                reached_costs = reached_costs + intercept_bias * (geodesic_m / 1000.0)
+        best_csr = int(reached_targets[np.argmin(reached_costs)])
+        # Walk predecessors in CSR space.
+        path_csr = [best_csr]
+        cur = best_csr
+        while cur != csr_start:
+            p = int(pred0[cur])
+            if p < 0:
+                return None
+            path_csr.append(p)
+            cur = p
+        path_csr.reverse()
+        # Translate to full-cell for coord lookup.
+        path_full = (path_csr if kept_locals is None
+                     else [int(kept_locals[i]) for i in path_csr])
+        polyline = [[float(verts[i][0]), float(verts[i][1])]
+                    for i in path_full]
+        reached_vid = int(gid_of_local[path_full[-1]])
+        return polyline, reached_vid
+
+    # Fast path: crop to a small bbox around START sized by the
+    # geodesic distance to the NEAREST target. A first-mile stitch
+    # rarely needs more than ~1.5× the straight-line distance
+    # (bike-route slack over geodesic). Sizing the bbox by that
+    # distance means:
+    #   - trunk passes close to the anchor (0.5 km) → 2 km bbox
+    #   - anchor sits inside the SPT with trunk 5 km away → 10 km bbox
+    #   - anchor at edge, trunk 25 km away → the full-cell fallback
+    # A 3 km floor covers the very-close case with room to bend.
+    #
+    # Cost of this pre-check: one vectorized haversine over the
+    # target verts (already loaded), <1 ms.
+    tgt_local_coords = verts[target_locals]
+    _R = 6_371_000.0
+    _lat_a = math.radians(start_lat)
+    _lat_v = np.radians(tgt_local_coords[:, 1].astype(np.float64))
+    _lon_d = np.radians(tgt_local_coords[:, 0].astype(np.float64) - start_lon)
+    _hav = (np.sin((_lat_v - _lat_a) / 2) ** 2
+            + math.cos(_lat_a) * np.cos(_lat_v)
+            * np.sin(_lon_d / 2) ** 2)
+    _target_km = 2 * _R * np.arcsin(np.sqrt(_hav)) / 1000.0
+    nearest_km = float(_target_km.min())
+    stitch_radius_km = max(3.0, nearest_km * 1.5 + 2.0)
+    _km_per_deg_lat = 111.0
+    _km_per_deg_lon = 111.0 * math.cos(math.radians(start_lat))
+    _dlat = stitch_radius_km / _km_per_deg_lat
+    _dlon = stitch_radius_km / max(_km_per_deg_lon, 1.0)
+    bbox = (start_lon - _dlon, start_lon + _dlon,
+            start_lat - _dlat, start_lat + _dlat)
+    must_keep = np.array([start_pos], dtype=np.int32)
+    bbox_build = _build_csr_bbox(graph, bbox, must_keep)
+    if bbox_build is not None:
+        csr_bbox, kept_locals = bbox_build
+        # Only worth the crop overhead if we actually shrunk things.
+        # The cell is ~200k verts; a stitch bbox is usually a few
+        # thousand. Skip the crop attempt when it barely helps.
+        if len(kept_locals) * 2 < len(gid_of_local):
+            result = _run(csr_bbox, kept_locals)
+            if result is not None:
+                return result
+            # Crop was built but Dijkstra didn't reach any target
+            # inside it — shortest path may exit the bbox. Fall
+            # through to the full-cell retry.
+
+    # Fallback: whole-cell CSR (cached on the cell dict so this is
+    # a lookup after the first hit).
+    csr = _build_csr(graph)
+    return _run(csr, None)
