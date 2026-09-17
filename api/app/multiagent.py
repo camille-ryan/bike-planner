@@ -49,7 +49,7 @@ from .tracing import RequestTrace
 MAX_PARALLEL_AGENTS = int(os.environ.get("MAX_PARALLEL_AGENTS", "5"))
 # Per-segment budget. Segment agents plan one leg — much tighter
 # than the whole trip, so a low cap catches runaway loops early.
-SEGMENT_MAX_ROUNDS = int(os.environ.get("SEGMENT_MAX_ROUNDS", "12"))
+SEGMENT_MAX_ROUNDS = int(os.environ.get("SEGMENT_MAX_ROUNDS", "18"))
 SUPERVISOR_MAX_ROUNDS = int(os.environ.get("SUPERVISOR_MAX_ROUNDS", "12"))
 MERGE_MAX_ROUNDS = int(os.environ.get("MERGE_MAX_ROUNDS", "3"))
 # Per-segment wall-clock cap. If a segment stalls past this, we
@@ -137,6 +137,8 @@ Pipeline (execute in this order):
 5. **Call `submit_segment` with your final result. That's terminal.**
 
 Then STOP. Do not write a full narrative outside `submit_segment.narrative_md`. Do not verify things the supervisor already verified (hub choice). Keep tool calls tight — you have {max_rounds} rounds max.
+
+**IMPORTANT**: submit_segment is your TERMINAL action. Call it EARLY and DEFINITIVELY — if you're unsure about one detail, submit with your best guess and note the caveat in narrative_md rather than burning rounds trying to perfect it. Running out of rounds without submitting means your segment goes on the final map as FAILED, which is much worse than an imperfect submission.
 
 Style: your `narrative_md` should be a compact Markdown fragment: an H2 heading (## Segment K: X → Y), a per-day km table, a one-line rail check summary. No preamble."""
 
@@ -342,6 +344,13 @@ async def run_multiagent_plan(
             error = f"{type(exc).__name__}: {exc}"
         wall_ms = int((time.monotonic() - t0) * 1000)
         if result is None:
+            # Segment agent ran to its round cap without calling
+            # `submit_segment`. Fill in a placeholder narrative and
+            # mark the segment failed. Reporting status="ok" here
+            # (as the old code did) would silently mislead the
+            # merge stage / frontend.
+            status = "failed"
+            error = error or "segment agent hit its round cap without submitting a result"
             result = SegmentResult(
                 segment_i=spec.segment_i,
                 from_ref=spec.from_ref, to_ref=spec.to_ref,
@@ -349,7 +358,7 @@ async def run_multiagent_plan(
                 narrative_md=(
                     f"## Segment {spec.segment_i}: "
                     f"{spec.from_name} → {spec.to_name}\n\n"
-                    f"*Planning failed: {error or 'no result submitted'}.*"
+                    f"*Planning failed: {error}.*"
                 ),
                 status="failed",
                 error=error,
