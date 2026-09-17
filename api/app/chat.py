@@ -99,7 +99,12 @@ Workflow — do exactly what the user asked, no more. DO NOT stop mid-workflow f
 - Always resolve every named place with `search_anchors` (English + local variants are auto-tried) before any other tool.
 - Always call `route` between the resolved anchors if the user asked for a route.
 - `route` is FAST by default (~50 ms, chain-graph + straight lines between anchors). That's the mode for exploration — cheap enough to try many candidate corridors. Pass `precise: true` ONLY on the final route you're handing to the user (adds ~1-3 s for real pathfinding + first/last-mile stitching). Do not sprinkle `precise: true` on intermediate calls.
-- **The natural corridor-planning pipeline is: fast route → stations along it → REVISE the via_refs based on rail-served anchors → fast route again with revised via_refs → split.** Do NOT split before revising — if `stations_along_route` reveals that overnights need to hug a different rail spine (e.g. the Wien→Praha rail runs via Brno, not the direct bike line), REVISE and re-`route` with new `via_refs` before splitting. Split-first strands you.
+- **Corridor pipeline is `route → stations → RE-ROUTE → split` — the "re-route" step is not optional.** After `stations_along_route` returns, YOU MUST:
+    1. Look at the returned anchors and decide which cover the corridor at reasonable spacing (~1 day apart) AND lie on the same rail line.
+    2. If the returned rail-served anchors are NOT on the current route's polyline (i.e. the initial route missed the rail spine — very common when the direct bike route diverges from the rail line, like Wien→Praha direct vs Wien→Brno→Praha rail), call `route` AGAIN with those anchors as `via_refs` before calling `split_into_stages`.
+    3. Verify with `direct_rail_service_batch` on the CONSECUTIVE-PAIR chain of chosen overnights.
+    4. THEN call `split_into_stages` with the revised via_refs.
+  Do NOT skip step 2 and go straight from `stations_along_route` to `split_into_stages`. Split-first freezes the corridor at whatever the initial route picked, which is usually the bike-shortest path (not the rail-following one), stranding overnights off the rail line. If you find yourself splitting immediately after stations without a re-route in between, you're doing it wrong.
 - Call `split_into_stages` ONLY if the user asked for a multi-day plan, daily stages, km/day, or overnights — cues like "plan a X-day tour", "80 km/day", "break into stages". Do NOT split just because a route is long.
 - **`split_into_stages` already returns per-stage km, from/to anchor names+refs, and full polylines.** After it returns, narrate the days directly from that result. DO NOT call `route` on each consecutive stage pair to "get the km" — you already have it. DO NOT call `route` and `split_into_stages` on the same segment; pick one. Only re-`route` a stage if the user explicitly asks for an alternate routing on that specific stage.
 - For a multi-leg tour (Graz→Wien→Praha→Berlin→Hamburg→CPH), one `split_into_stages` call covers the whole thing when you pass the intermediate hubs as `via_refs`. Don't call `split_into_stages` per-leg AND once for the whole trip — the whole-trip call is authoritative.
@@ -253,12 +258,14 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
     for round_i in range(CHAT_MAX_TOOL_ROUNDS):
         tr.round_start(round_i, messages_len=len(messages))
         _shift_message_cache_breakpoint(messages)
-        # Explicit heartbeat before we enter `client.messages.stream`:
-        # for a big cached-context request, time-to-first-token can
-        # be several seconds, and no SDK event fires until then. An
-        # SSE comment right now resets the browser's idle timer so
-        # the wait doesn't look like a stall.
-        yield b": round_start\n\n"
+        # `round_start` marks a new LLM round to the client. Two jobs:
+        # (1) heartbeat — for a big cached-context request TTFT can be
+        # several seconds and no SDK event fires until then, so this
+        # keeps the browser's idle timer from tripping; (2) tells the
+        # frontend to start a fresh assistant bubble so text and tool
+        # rows from consecutive rounds interleave visually instead of
+        # piling into one giant paragraph followed by every tool call.
+        yield _sse("round_start", {"round_i": round_i})
         # `time.monotonic()`, not `time.time()` — WSL2's wall clock
         # can jump backward on VM resume, which produced negative
         # latency_ms values on the first Phase 6 smoke run.

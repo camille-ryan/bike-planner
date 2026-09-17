@@ -559,8 +559,16 @@ async function streamChat(userText) {
   // Don't create the assistant bubble yet — tool calls are about to
   // stream in and we want the final text to land BELOW them, not above.
   // We'll create it lazily on the first text delta.
+  // The assistant text stream may span many LLM rounds, each of which
+  // can produce a short rationale before its tool calls plus a chunk
+  // of narrative. Each round gets its own bubble (reset by
+  // `round_start`) so text and tool rows interleave naturally in the
+  // log. `asstText` accumulates across rounds for the history entry
+  // saved on `done`; `asstDiv` / `asstBubbleText` are for the current
+  // bubble only.
   let asstDiv = null;
   let asstText = "";
+  let asstBubbleText = "";
 
   const controller = new AbortController();
   inflight = controller;
@@ -650,17 +658,26 @@ async function streamChat(userText) {
         buf = buf.slice(idx + 2);
         const ev = parseSSE(raw);
         if (!ev) continue;
-        if (ev.event === "text") {
-          asstText += ev.data.delta || "";
-          // Lazy-create the assistant bubble on first delta so it lands
-          // below any tool calls that have already streamed in.
+        if (ev.event === "round_start") {
+          // Start a new bubble for this round's text so a "rationale
+          // sentence + narrative" chunk lands right above THIS round's
+          // tool rows, not glommed onto whatever the previous round
+          // wrote. `asstText` (history buffer) keeps accumulating.
+          asstDiv = null;
+          asstBubbleText = "";
+        } else if (ev.event === "text") {
+          const delta = ev.data.delta || "";
+          asstText       += delta;
+          asstBubbleText += delta;
+          // Lazy-create the bubble on first delta of the current round
+          // so it lands below any tool calls that already streamed in.
           if (!asstDiv) asstDiv = addMessage("assistant", "");
           // Render as markdown so tables/lists format properly. `marked`
           // is loaded from the CDN via a <script> tag in index.html.
           if (typeof marked !== "undefined") {
-            asstDiv.innerHTML = marked.parse(asstText);
+            asstDiv.innerHTML = marked.parse(asstBubbleText);
           } else {
-            asstDiv.textContent = asstText;
+            asstDiv.textContent = asstBubbleText;
           }
           logEl.scrollTop = logEl.scrollHeight;
         } else if (ev.event === "tool_start") {
