@@ -482,11 +482,12 @@ function handleToolResult(name, input, output) {
     }
   }
   if (name === "split_into_stages" && output?.stages) {
-    // Key stage pins by the (from_ref, to_ref) leg so a re-split of
-    // the same leg REPLACES its pin set. Without this, Claude's
-    // per-leg + full-tour + retry splits all pile pins on the map.
-    const legKey = `${input?.from_ref ?? "?"}→${input?.to_ref ?? "?"}`;
-    drawStagesOnMap(output.stages, legKey);
+    // Key stage pins by the full (from, to, via_refs) so a re-split
+    // of the same corridor REPLACES its pin set. A key that ignores
+    // via_refs would let split(Wien→Praha) and split(Wien→Praha via
+    // Brno) both survive and paint their day pins on top of each
+    // other.
+    drawStagesOnMap(output.stages, _routeKey(input));
   }
 }
 
