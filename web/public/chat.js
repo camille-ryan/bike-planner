@@ -40,6 +40,29 @@ if (!formEl || !inputEl || !sendBtn) {
 let history = [];
 let inflight = null;
 
+// Detect the user's unit preference from their first message so map
+// pins + GPX names match. Cached across the session; recomputed only
+// when the log is cleared (Reset button).
+let chatUnitMode = "km";  // "km" | "mi"
+
+function detectUnitMode(text) {
+  if (!text) return "km";
+  const t = String(text).toLowerCase();
+  // Look for a distance-y "mile" or "mi" reference; ignore "km".
+  if (/\bmiles?\b|\bmi\b|\bmi\/day\b/.test(t)) return "mi";
+  return "km";
+}
+
+function fmtDistance(km) {
+  // Consistent 1-decimal formatting in the current unit.
+  if (km == null || !isFinite(km)) return "?";
+  if (chatUnitMode === "mi") {
+    const mi = km * 0.6213711922;
+    return `${mi.toFixed(1)} mi`;
+  }
+  return `${km.toFixed(1)} km`;
+}
+
 // ---------- rendering ----------
 
 // Standard chat-log scroll behavior: auto-scroll to bottom ONLY when
@@ -226,6 +249,16 @@ function handleSegmentCommit(data) {
       const prev = overnights[i - 1];
       const cur  = overnights[i];
       if (!Array.isArray(cur.lonlat) || cur.lonlat.length !== 2) continue;
+      // km per stage: prefer the segment agent's `km_from_prev` if it
+      // was submitted, otherwise fall back to a haversine along the
+      // polyline (rough, but avoids "undefined km" in labels).
+      let km = (typeof cur.km_from_prev === "number" && isFinite(cur.km_from_prev))
+        ? cur.km_from_prev
+        : null;
+      if (km == null && Array.isArray(data.polyline) && data.polyline.length > 1
+          && Array.isArray(prev.lonlat) && prev.lonlat.length === 2) {
+        km = _hav_m(prev.lonlat[0], prev.lonlat[1], cur.lonlat[0], cur.lonlat[1]) / 1000;
+      }
       stages.push({
         day:         cur.day,
         from_ref:    prev.ref,
@@ -233,6 +266,7 @@ function handleSegmentCommit(data) {
         to_ref:      cur.ref,
         to_name:     cur.name,
         to_lonlat:   cur.lonlat,
+        km:          km != null ? Math.round(km * 10) / 10 : null,
       });
     }
     if (stages.length) drawStagesOnMap(stages, segKey);
@@ -549,8 +583,8 @@ function _stagesToFeatures() {
         properties: {
           // day number rendered inside the circle (chat-stages-daynum)
           day: s.day,
-          // city + km label rendered below (chat-stages-labels)
-          label: `${s.to_name || "?"} · ${s.km} km`,
+          // city + distance label rendered below (chat-stages-labels)
+          label: `${s.to_name || "?"} · ${fmtDistance(s.km)}`,
         },
       });
     }
@@ -648,7 +682,7 @@ function buildGpx(polyline, stages, tripName = "Bike tour") {
       const seg = polyline.slice(lo, hi + 1);
       if (seg.length >= 2) {
         tracks.push({
-          name: `Day ${s.day}: ${s.from_name ?? "?"} → ${s.to_name ?? "?"} (${s.km} km)`,
+          name: `Day ${s.day}: ${s.from_name ?? "?"} → ${s.to_name ?? "?"} (${fmtDistance(s.km)})`,
           seg,
         });
       }
@@ -772,6 +806,14 @@ function handleToolResult(name, input, output, agentId) {
 async function streamChat(userText) {
   const userDiv = addMessage("user", userText);
   history.push({ role: "user", content: userText });
+
+  // Detect unit preference from the first turn's user message. If they
+  // say "50 miles/day" we render pins / GPX in miles; else km. This
+  // stays sticky across follow-up turns in the same session (Reset
+  // clears history and re-detects on the next first message).
+  if (history.filter(m => m.role === "user").length === 1) {
+    chatUnitMode = detectUnitMode(userText);
+  }
 
   // Reset the map layers we own so a fresh plan starts on a clean map.
   clearChatRouteLayer();

@@ -49,7 +49,7 @@ from .tracing import RequestTrace
 MAX_PARALLEL_AGENTS = int(os.environ.get("MAX_PARALLEL_AGENTS", "5"))
 # Per-segment budget. Segment agents plan one leg — much tighter
 # than the whole trip, so a low cap catches runaway loops early.
-SEGMENT_MAX_ROUNDS = int(os.environ.get("SEGMENT_MAX_ROUNDS", "32"))
+SEGMENT_MAX_ROUNDS = int(os.environ.get("SEGMENT_MAX_ROUNDS", "15"))
 SUPERVISOR_MAX_ROUNDS = int(os.environ.get("SUPERVISOR_MAX_ROUNDS", "12"))
 MERGE_MAX_ROUNDS = int(os.environ.get("MERGE_MAX_ROUNDS", "3"))
 # Per-segment wall-clock cap. If a segment stalls past this, we
@@ -128,19 +128,30 @@ Your segment:  {from_name} ({from_ref})  →  {to_name} ({to_ref})
 
 Corridor context (all hubs, in order, for orientation): {corridor_context}
 
-Pipeline (execute in this order):
+## Strict tool-call budget (this is the hard part — don't overspend it)
 
-1. If the user's prompt is rail-constrained, call `rail_path({from_ref}, {to_ref})` to get the rail spine for this leg. Its chain entries become your via_refs. If it returns `reachable: false`, use `stations_along_route` on the direct route as fallback and pick rail-served anchors.
-2. Call `route(from_ref={from_ref}, to_ref={to_ref}, via_refs=<rail spine>)`. Fast mode.
-3. Call `split_into_stages(from_ref={from_ref}, to_ref={to_ref}, via_refs=<same>)` with a `target_km_per_day` matching the user's request. Overnights come out of this.
-4. Verify the consecutive-pair direct-rail chain with `direct_rail_service_batch` on the list of adjacent overnight pairs.
-5. **Call `submit_segment` with your final result. That's terminal.**
+You have room for approximately these tool calls, in this order:
 
-Then STOP. Do not write a full narrative outside `submit_segment.narrative_md`. Do not verify things the supervisor already verified (hub choice). Keep tool calls tight — you have {max_rounds} rounds max.
+1. `rail_path({from_ref}, {to_ref})` — optional, only if the user's prompt has a rail constraint. If it returns `reachable: false`, DO NOT retry it — use `stations_along_route` fallback (see below).
+2. `route({from_ref}, {to_ref}, via_refs=<rail spine>)` — once, at most twice. If your first call gives a bad km total, one revision is OK; more is not.
+3. `split_into_stages({from_ref}, {to_ref}, via_refs=<same>, target_km_per_day=<user's target>)` — once.
+4. `direct_rail_service_batch` on the CONSECUTIVE-PAIR list of overnights — once. **If ANY pair comes back `direct=false`, ACCEPT IT** and note the caveat in your narrative_md. DO NOT loop trying to find a perfect chain — a partial-rail segment with a noted transfer is FINE, an unsubmitted segment is a failure.
+5. `submit_segment` — TERMINAL. Call this after the direct-rail check no matter what the results are.
 
-**IMPORTANT**: submit_segment is your TERMINAL action. Call it EARLY and DEFINITIVELY — if you're unsure about one detail, submit with your best guess and note the caveat in narrative_md rather than burning rounds trying to perfect it. Running out of rounds without submitting means your segment goes on the final map as FAILED, which is much worse than an imperfect submission.
+Total: ≤6 tool calls in a healthy run. If you find yourself past your fourth `route` or third `direct_rail_service_batch` call, you're wasting the budget. SUBMIT what you have with a caveat and stop.
 
-Style: your `narrative_md` should be a compact Markdown fragment: an H2 heading (## Segment K: X → Y), a per-day km table, a one-line rail check summary. No preamble."""
+## Non-negotiables
+
+- `submit_segment` is your TERMINAL action. Once called, stop. Do not call any other tool.
+- Do not narrate outside `submit_segment.narrative_md`.
+- Do not verify things the supervisor already verified (hub choice).
+- If the direct-rail check returns partial results, THAT IS ACCEPTABLE. Note in narrative_md that leg K-1 → K needs a transfer; submit anyway.
+
+## Style
+
+Your `narrative_md` is a compact Markdown fragment: an H2 heading (## Segment K: X → Y), a per-day distance table, a one-line rail check summary. No preamble.
+
+**Units**: internal tools always return km. In `narrative_md`, use whichever unit the user asked for — if they said "50 miles/day", convert to miles (1 km ≈ 0.6214 mi) and label the column "mi". Otherwise use km. Never mix."""
 
 
 MERGE_PROMPT = """You are the MERGE stage of a multi-agent bike-tour planner. You have:
