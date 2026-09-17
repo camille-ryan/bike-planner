@@ -97,6 +97,10 @@ def _build_rail_adjacency(profile: str) -> dict[int, dict[int, float]]:
 
     # Attach route_id set to each station; drop stations with no routes
     # (after filtering fare-integrated bus routes from the set).
+    # Stations are also tagged with `physical_mode` — reserved for
+    # the multi-modal work in #14; not filtered on here yet, because
+    # the current name-heuristic is too aggressive on 'bus' and
+    # regresses valid pairs.
     rail_stations = []
     for s in stations:
         key = f"{s.get('country')}:{s.get('gtfs_id')}"

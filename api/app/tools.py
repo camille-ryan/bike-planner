@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -676,25 +677,86 @@ def _tool_route(inp: dict) -> dict:
     }
 
 
-def _stations_kdtree():
+# Regexes for station-name mode tagging. See _tag_station_mode below.
+_RAIL_NAME_KW = re.compile(
+    r"(nádraží|hlavní|nádr\.|hl\.n\.|Hbf|Bahnhof|banegård|banegaard|"
+    r" St\.| st\.$|Station|railway|Hauptbahnhof|železniční stanice)",
+    re.IGNORECASE,
+)
+# Strong signals a station is NOT a real rail station:
+#   - ", <something>" — bus stops in CZ / AT feeds almost always
+#     carry a location descriptor after a comma.
+#   - "zast." (abbreviated "zastávka") — the CZ feed uses the
+#     abbreviated form for bus stops and the FULL form ("zastávka")
+#     for real train halts. Not perfect but empirically correct on
+#     Zruč nad Sázavou etc.
+#   - "aut.st.", "autobusové nádraží", explicit bus keywords.
+_BUS_NAME_KW = re.compile(
+    r"(,|aut\.\s*st\.|autobusové|autobus|bus\b|Busbahnhof|Busstop|ZOB|zast\.$| zast\.)",
+    re.IGNORECASE,
+)
+
+
+def _tag_station_mode(name: str) -> str:
+    """Best-effort mode tag from station name alone:
+       'rail'    — name has an unambiguous rail-station keyword
+                   (Hbf / nádraží / Hauptbahnhof / hovedbanegård / …)
+       'bus'     — name has a bus/coach keyword, the ", descriptor"
+                   pattern, or the "zast." abbreviation typical of
+                   CZ bus stops.
+       'unknown' — plain city name (e.g. "Wien", "Brno", "Praha").
+                   The Czech feed uses these for BOTH real train
+                   halts AND bus depots — see #14 for the proper
+                   fix (cross-reference OSM railway=station geometry).
+    Rail-scoped tools filter to 'rail' + 'unknown' by default —
+    strict 'rail' would exclude too many valid stations whose feed
+    just used the city name."""
+    if not name:
+        return "unknown"
+    if _BUS_NAME_KW.search(name):
+        return "bus"
+    if _RAIL_NAME_KW.search(name):
+        return "rail"
+    return "unknown"
+
+
+def _stations_kdtree(mode: str | None = None):
     """Cached scipy.spatial.cKDTree over station lon/lat, plus the
     parallel list of station dicts. Both are None if no stations
     are loaded yet or if scipy isn't available.
-    Returns (tree, stations_list) — both indexed the same way."""
+
+    `mode` filters to only stations matching that physical mode
+    (`'rail'`, `'bus'`, `'unknown'`, or None for all). Bus stations
+    are kept in memory so multi-modal tools can query them, but
+    rail-scoped tools pass `mode='rail'` (or `'rail-or-unknown'`
+    when they want the permissive fallback).
+    """
+    key = mode or "all"
     if not hasattr(_stations_kdtree, "_cache"):
-        stations = _load_stations_cache()
-        if not stations:
-            _stations_kdtree._cache = (None, [])
-        else:
-            try:
-                import numpy as np
-                from scipy.spatial import cKDTree
-                arr = np.array([(s["lon"], s["lat"]) for s in stations],
-                               dtype=np.float64)
-                _stations_kdtree._cache = (cKDTree(arr), stations)
-            except ImportError:
-                _stations_kdtree._cache = (None, stations)
-    return _stations_kdtree._cache
+        _stations_kdtree._cache = {}
+    if key in _stations_kdtree._cache:
+        return _stations_kdtree._cache[key]
+    all_stations = _load_stations_cache()
+    if mode is None:
+        subset = all_stations
+    elif mode == "rail-or-unknown":
+        subset = [s for s in all_stations
+                  if s.get("physical_mode") in ("rail", "unknown")]
+    else:
+        subset = [s for s in all_stations
+                  if s.get("physical_mode") == mode]
+    if not subset:
+        _stations_kdtree._cache[key] = (None, [])
+        return _stations_kdtree._cache[key]
+    try:
+        import numpy as np
+        from scipy.spatial import cKDTree
+        arr = np.array([(s["lon"], s["lat"]) for s in subset],
+                       dtype=np.float64)
+        _stations_kdtree._cache[key] = (cKDTree(arr), subset)
+    except ImportError:
+        _stations_kdtree._cache[key] = (None, subset)
+    return _stations_kdtree._cache[key]
 
 
 def _load_stations_cache() -> list[dict]:
@@ -705,6 +767,14 @@ def _load_stations_cache() -> list[dict]:
         _load_stations_cache._cache = [
             {
                 "name": f["properties"].get("name"),
+                # Physical-mode tag from station name. See
+                # _tag_station_mode / issue #14 for the multi-modal
+                # design. `direct_rail_service` and rail_path filter
+                # to 'rail' so bus-stops-with-mislabeled-rail-tags
+                # don't poison direct-train checks.
+                "physical_mode": _tag_station_mode(
+                    f["properties"].get("name") or ""
+                ),
                 # `n_routes_rail` is the reliable "has real train service"
                 # signal after task #78; prefer it over raw `n_routes` in
                 # any filtering.
@@ -764,8 +834,17 @@ def _load_station_routes_cache() -> dict[str, set[str]]:
 def _stations_for_anchor(alon: float, alat: float,
                           max_dist_m: float,
                           min_routes_rail: int) -> list[tuple[float, dict]]:
-    """All rail stations near (alon, alat) meeting `min_routes_rail`,
-    within `max_dist_m`, sorted by distance. Empty list if none.
+    """All rail-served stations near (alon, alat) meeting
+    `min_routes_rail`, within `max_dist_m`, sorted by distance.
+    Empty list if none.
+
+    Stations are tagged with `physical_mode in {rail, bus, unknown}`
+    by `_tag_station_mode` (name heuristic). We do NOT hard-filter
+    on that tag yet — the heuristic isn't precise enough (killing
+    'bus'-tagged stations regressed valid pairs like Brno↔Pardubice
+    where a real rail station's name happens to match a bus
+    keyword). #14 tracks the proper multi-modal filter (OSM
+    railway-station cross-reference).
 
     We return ALL nearby stations (not just the closest) so callers
     like `direct_rail_service` can union the route_id sets — GTFS feed
