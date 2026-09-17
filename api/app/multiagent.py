@@ -316,7 +316,9 @@ async def run_multiagent_plan(
 
     async def _run_one(spec: SegmentSpec) -> None:
         """Run one segment agent, pipe its SSE bytes to the queue,
-        stash its result in `results`."""
+        stash its result in `results`, and emit a `segment_committed`
+        event with the segment's polyline as soon as it lands so the
+        map lights up progressively (not all at once at the end)."""
         agent_id = _seg_agent_id(spec.segment_i)
         t0 = time.monotonic()
         status = "ok"
@@ -365,6 +367,41 @@ async def run_multiagent_plan(
                 error=error,
             )
         results[spec.segment_i] = result
+
+        # Emit segment_committed as soon as THIS segment lands — before
+        # the other segments finish — so the map draws progressively.
+        # Day numbers on pins are LOCAL to the segment (Day 1..n_days)
+        # at this point; the coordinator's post-gather pass fixes the
+        # merged narrative_md text to use global numbering. If we want
+        # global numbers on pins too, that's a later re-render pass
+        # after all segments in.
+        if status == "ok" and result is not None:
+            from .tools import _ROUTE_CACHE
+            polyline = None
+            for key in reversed(list(_ROUTE_CACHE.keys())):
+                fr, to, _via = key
+                if fr == spec.from_ref and to == spec.to_ref:
+                    polyline = _ROUTE_CACHE[key]
+                    break
+            overnights_out = []
+            for i, ov in enumerate(result.overnights):
+                overnights_out.append({
+                    "ref":          ov.ref,
+                    "name":         ov.name,
+                    "day":          ov.day if ov.day is not None else i,
+                    "km_from_prev": ov.km_from_prev,
+                    "lonlat":       _coord_of_ref(ov.ref),
+                })
+            await queue.put(_sse("segment_committed", {
+                "segment_i":  spec.segment_i,
+                "from_ref":   spec.from_ref, "to_ref":   spec.to_ref,
+                "from_name":  spec.from_name, "to_name":  spec.to_name,
+                "n_days":     result.n_days,
+                "overnights": overnights_out,
+                "polyline":   polyline,
+                "status":     status,
+            }))
+
         await queue.put(_sse("agent_end", {
             "role":   "segment",
             "segment_i":     spec.segment_i,
@@ -385,79 +422,21 @@ async def run_multiagent_plan(
     # Ensure all tasks are collected (surfaces any uncaught exceptions).
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    # ---- Stage 2b: controller commits segments in order ----
-    # Now that every segment agent has submitted, the coordinator is
-    # the single source of truth for how the plan renders. Two jobs:
-    #   1. Renumber overnights globally (segment K's day 1 becomes
-    #      trip's day (sum of prior segments' n_days + 1)).
-    #   2. Pull the final polyline from `tools._ROUTE_CACHE` for each
-    #      segment (the segment agent may have called `route` many
-    #      times; the CACHE holds the latest one for each (from, to)).
-    # Then emit `segment_committed` events per segment, in order. The
-    # frontend filters out intermediate route/split tool_calls from
-    # sub-agents and only draws on `segment_committed` — so no more
-    # "ghost loops" from mid-planning revisions.
-    from .tools import _ROUTE_CACHE
-    from . import trunk_router
-    from .settings import DEFAULT_PROFILE
-    _prof_for_coords = trunk_router._load_profile(DEFAULT_PROFILE)
-
-    def _coord_of(ref: str | None) -> list[float] | None:
-        if not ref:
-            return None
-        ci = _prof_for_coords.city_idx_by_ref.get(ref)
-        if ci is None:
-            return None
-        c = _prof_for_coords.cities[int(ci)]
-        return [float(c["lon"]), float(c["lat"])]
-
+    # ---- Stage 2b: coordinator renumbers narratives for merge ----
+    # Segment agents emitted their own `segment_committed` events as
+    # they landed (see _run_one). Those carry SEGMENT-LOCAL day
+    # numbers on the map pins — good enough for immediate map
+    # rendering. What still needs a global pass: the merge stage's
+    # input text. Rewrite each segment's `narrative_md` so day
+    # numbers are cumulative across the whole tour (segment K's
+    # local Day 1 becomes trip's Day (prior segments' days + 1)).
     ordered_results = [results[i] for i in sorted(results)]
     day_offset = 0
     for r in ordered_results:
-        # Compute how many riding days this segment contributes. Use
-        # `n_days` when the agent submitted it, else the overnight
-        # count minus 1.
         seg_n_days = r.n_days or max(0, len(r.overnights) - 1)
-        # Renumber overnights in place — global day numbers. Attach
-        # a `lonlat` from the anchor lookup so the frontend can draw
-        # numbered day pins without a separate lookup.
-        renumbered_overnights = []
-        for i, ov in enumerate(r.overnights):
-            local_day = ov.day if ov.day is not None else i
-            renumbered_overnights.append({
-                "ref":          ov.ref,
-                "name":         ov.name,
-                "day":          local_day + day_offset,
-                "km_from_prev": ov.km_from_prev,
-                "lonlat":       _coord_of(ov.ref),
-            })
-        # Renumber "Day N" mentions in the narrative_md. Segment
-        # tables use both "Day 1"-style headers and bare `| 1 |` cells;
-        # the safer substitution is only on `Day N` keyword mentions.
-        # Bare-int cells stay wrong in some rows, but the overnights
-        # list carries the truth for map rendering.
         r.narrative_md = _renumber_day_keywords(
             r.narrative_md, offset=day_offset, max_n=seg_n_days,
         )
-        # Pull the final cached polyline for this segment. Iterate
-        # the cache in reverse-insertion order to prefer the LATEST
-        # route call.
-        polyline = None
-        for key in reversed(list(_ROUTE_CACHE.keys())):
-            fr, to, _via = key
-            if fr == r.from_ref and to == r.to_ref:
-                polyline = _ROUTE_CACHE[key]
-                break
-        yield _sse("segment_committed", {
-            "segment_i":  r.segment_i,
-            "from_ref":   r.from_ref, "to_ref":   r.to_ref,
-            "from_name":  r.from_name, "to_name":  r.to_name,
-            "start_day":  day_offset + 1,
-            "n_days":     seg_n_days,
-            "overnights": renumbered_overnights,
-            "polyline":   polyline,
-            "status":     r.status,
-        })
         day_offset += seg_n_days
 
     # ---- Stage 3: merge ----
@@ -494,6 +473,21 @@ async def run_multiagent_plan(
 
 def _seg_agent_id(segment_i: int) -> str:
     return f"seg[{segment_i}]"
+
+
+def _coord_of_ref(ref: str | None) -> list[float] | None:
+    """Anchor ref → [lon, lat] via the loaded profile. Used to attach
+    coords to overnights in `segment_committed` events."""
+    if not ref:
+        return None
+    from . import trunk_router
+    from .settings import DEFAULT_PROFILE
+    prof = trunk_router._load_profile(DEFAULT_PROFILE)
+    ci = prof.city_idx_by_ref.get(ref)
+    if ci is None:
+        return None
+    c = prof.cities[int(ci)]
+    return [float(c["lon"]), float(c["lat"])]
 
 
 import re as _re
