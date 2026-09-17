@@ -134,18 +134,21 @@ function ensureChatRouteLayer() {
 }
 
 // Accumulate route polylines DURING planning so the user watches the
-// map build up as Claude iterates. On ✓ Done we collapse to just the
-// longest polyline via `finalizeChatMap()` — accumulated sub-legs
-// overlap the full route and would otherwise read as loops at every
-// city stop.
-let chatRoutePolylines = [];
+// map build up as Claude iterates. Keyed by the (from_ref, to_ref,
+// via_refs) triple of the route call, so a revised call for the
+// same corridor REPLACES its polyline instead of overlaying — the
+// old array-append behavior painted loops at every revision, exactly
+// what the user was seeing during planning. On ✓ Done we collapse
+// to just the longest polyline via `finalizeChatMap()`, since even
+// with dedup, sub-legs still overlap the full corridor.
+let chatRoutePolylines = new Map();
 
 // Latest `split_into_stages` result, used by the GPX-download button
 // to slice the polyline into per-day tracks.
 let chatLatestStages = null;
 
 function clearChatRouteLayer() {
-  chatRoutePolylines = [];
+  chatRoutePolylines = new Map();
   chatLatestStages = null;
   const map = window.map;
   if (map && map.getSource("chat-route")) {
@@ -154,21 +157,31 @@ function clearChatRouteLayer() {
 }
 
 function _routesToFeatures(polylines) {
-  return polylines.map(p => ({
+  const arr = Array.isArray(polylines) ? polylines : Array.from(polylines);
+  return arr.map(p => ({
     type: "Feature",
     geometry: { type: "LineString", coordinates: p },
     properties: {},
   }));
 }
 
-function drawRouteOnMap(polyline) {
+// A tool-call's (from_ref, to_ref, via_refs) identifies the corridor.
+// Same key = same corridor → replace, not append.
+function _routeKey(input) {
+  const from = input?.from_ref ?? input?.from_lonlat ?? "?";
+  const to   = input?.to_ref   ?? input?.to_lonlat   ?? "?";
+  const via  = Array.isArray(input?.via_refs) ? input.via_refs.join(",") : "";
+  return `${from}→${to}|${via}`;
+}
+
+function drawRouteOnMap(polyline, key) {
   const map = window.map;
   if (!map || !polyline || polyline.length < 2) return;
-  chatRoutePolylines.push(polyline);
+  chatRoutePolylines.set(key ?? String(chatRoutePolylines.size), polyline);
   ensureChatRouteLayer();
   map.getSource("chat-route").setData({
     type: "FeatureCollection",
-    features: _routesToFeatures(chatRoutePolylines),
+    features: _routesToFeatures(chatRoutePolylines.values()),
   });
   // Fit to bounds of the drawn polyline.
   let minLon =  Infinity, minLat =  Infinity;
@@ -307,10 +320,10 @@ function drawStagesOnMap(stages, legKey) {
 // during the run, then a clean map at the end. Returns the longest
 // polyline so the GPX button has something to work with.
 function finalizeChatMap() {
-  if (!chatRoutePolylines.length) return null;
-  let longest = chatRoutePolylines[0];
-  for (const p of chatRoutePolylines) {
-    if (p.length > longest.length) longest = p;
+  if (chatRoutePolylines.size === 0) return null;
+  let longest = null;
+  for (const p of chatRoutePolylines.values()) {
+    if (!longest || p.length > longest.length) longest = p;
   }
   const map = window.map;
   if (map && map.getSource("chat-route")) {
@@ -441,7 +454,7 @@ function handleToolResult(name, input, output) {
   // can update the "(running…)" pending row in place. This function
   // just handles the side effects (map draw, sidebar sync).
   if (name === "route" && output?.polyline?.length) {
-    drawRouteOnMap(output.polyline);
+    drawRouteOnMap(output.polyline, _routeKey(input));
     // Also populate the sidebar's route state so the paired-SPT viz
     // ("Show route data" toggle) works after a chat-driven plan.
     // Before this, only sidebar-form routes populated state, and any
@@ -724,7 +737,7 @@ function saveCurrentSession() {
     history,
     // Serialize map state so a reload can restore visuals without
     // needing to re-run tools.
-    polylines: chatRoutePolylines,
+    polylines: Array.from(chatRoutePolylines.entries()),
     stagesByLeg: Array.from(chatStagesByLeg.entries()),
   };
   try {
@@ -773,9 +786,19 @@ function loadSession(id) {
     }
   }
 
-  // Restore map state.
+  // Restore map state. Handle both the new [key, polyline][] and the
+  // legacy polyline[] shape so older saved sessions still load.
   if (Array.isArray(payload.polylines)) {
-    for (const p of payload.polylines) drawRouteOnMap(p);
+    for (const entry of payload.polylines) {
+      if (Array.isArray(entry) && entry.length === 2
+          && typeof entry[0] === "string") {
+        // New shape: [key, polyline]
+        drawRouteOnMap(entry[1], entry[0]);
+      } else {
+        // Legacy shape: raw polyline
+        drawRouteOnMap(entry);
+      }
+    }
     finalizeChatMap();
   }
   if (Array.isArray(payload.stagesByLeg)) {
