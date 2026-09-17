@@ -1143,16 +1143,17 @@ function ensureRouteTrunksLayer() {
       type: "line",
       source: "route-trunks",
       paint: {
-        // Each chain has coords ordered from LEAF → A-seed. Gradient
-        // paints green at the leaf end, red at the A-seed end, so
-        // "where the trunk reaches farthest" is highlighted green.
-        "line-gradient": [
-          "interpolate", ["linear"], ["line-progress"],
-          0.0, "#22c55e",   // leaf end (start of coords)
-          0.25, "#84cc16",
-          0.5,  "#facc15",
-          0.75, "#f97316",
-          1.0,  "#dc2626",  // A-seed end (end of coords)
+        // Alternate red / green by paired-SPT (trunk_idx mod 2) so
+        // adjacent trunks along the chain stay visually
+        // distinguishable at a glance. Previous per-segment
+        // green→red gradient lost the "which trunk is this branch
+        // from" grouping. Same lightness/saturation between the two
+        // colors so neither reads as "primary."
+        "line-color": [
+          "match",
+          ["%", ["to-number", ["get", "trunk_idx"]], 2],
+          0, "#dc2626",   // red
+          "#16a34a",       // default: green
         ],
         "line-width": [
           "interpolate", ["linear"], ["zoom"],
@@ -1218,13 +1219,21 @@ async function loadRouteTrunks() {
   if (badge) badge.textContent =
     `loading 0 / ${pairs.length}… (${db}, ${skippedLegs.size} skipped)`;
 
+  // Each pair gets a distinct trunk_idx (its position in the walked
+  // chain); we color-cycle by that index so consecutive paired-SPTs
+  // stay visually distinguishable — you can tell where one trunk's
+  // tree ends and the next begins without checking labels. The
+  // existing per-segment green→red gradient was per-chain-tree-
+  // branch and lost the "which paired-SPT is this" grouping.
+  for (let i = 0; i < pairs.length; i++) pairs[i].trunk_idx = i;
+
   const all = [];
   let done = 0;
   let totalChains = 0;
   const queue = [...pairs];
   async function worker() {
     while (queue.length) {
-      const { aIdx, bIdx, aName, bName } = queue.shift();
+      const { aIdx, bIdx, aName, bName, trunk_idx } = queue.shift();
       try {
         // Chain-mode endpoint: one LineString per succ leaf-to-root
         // walk. Feature count = ~n_leaves per trunk (tens to
@@ -1238,6 +1247,7 @@ async function loadRouteTrunks() {
             f.properties = f.properties || {};
             f.properties.trunk_a = aIdx;
             f.properties.trunk_b = bIdx;
+            f.properties.trunk_idx = trunk_idx;
             f.properties.trunk_a_name = aName || String(aIdx);
             f.properties.trunk_b_name = bName || String(bIdx);
             all.push(f);
