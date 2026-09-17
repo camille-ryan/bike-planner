@@ -62,7 +62,16 @@ TOOLS = [
             "Compute a bike route between two anchors or lon,lat coords. "
             "Returns the polyline, total distance in km, and per-anchor "
             "waypoints. Prefer passing anchor `ref` values (from "
-            "`search_anchors`) over raw coords when possible."
+            "`search_anchors`) over raw coords when possible.\n\n"
+            "**Default is FAST mode** — uses the pre-computed city-graph "
+            "chain (rail-line-following, ~50 ms) and returns a polyline "
+            "of anchor coords + straight-line segments between them. "
+            "Total km comes from the city-graph edge weights and is a "
+            "good approximation (~5-10% of the true bike distance). "
+            "Perfect for exploration — cheap enough to try many "
+            "candidate corridors. Pass `precise: true` ONLY for the "
+            "final route you want to hand to the user (adds ~1-3 s "
+            "for full pathfinding + first/last-mile stitching)."
         ),
         "input_schema": {
             "type": "object",
@@ -75,6 +84,15 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Intermediate stops in order (each is an anchor ref).",
+                },
+                "precise": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Full pathfinding (slow, precise polyline). "
+                        "Only use for the final route the user will "
+                        "see; defaults to false for planning."
+                    ),
                 },
             },
         },
@@ -396,6 +414,15 @@ def _hav_m(lon1, lat1, lon2, lat2):
 # (from_ref, to_ref, via_refs_tuple) triple.
 _ROUTE_CACHE: dict[tuple, list[list[float]]] = {}
 
+# Parallel cache of the total_km value the route call reported.
+# Split_into_stages and friends measure haversine along the polyline
+# — that's fine for a precise polyline (matches the router's own
+# gross_length_m), but for a FAST polyline (straight-lines between
+# chain anchors) the haversine total underestimates the real bike
+# distance. When a km hint is present, day-count math uses THAT
+# instead of the haversine total.
+_ROUTE_KM_CACHE: dict[tuple, float] = {}
+
 
 def _route_cache_key(inp: dict) -> tuple:
     return (
@@ -446,8 +473,116 @@ def _tool_search_anchors(inp: dict) -> dict:
     }
 
 
+def _tool_route_fast(inp: dict) -> dict:
+    """Chain-graph-only route: pairwise city-graph Dijkstra through
+    the anchor chain (start → via[0] → via[1] → … → end), polyline
+    is straight-line segments between the picked anchors, total_km
+    is the sum of city-graph edge weights. ~50 ms per call, no
+    trunk polylines loaded, no local Dijkstra.
+
+    Approximate distance error is 5-10% vs the precise trunk-walk
+    (which follows real roads); good enough for planning. The
+    frontend can hydrate to precise later.
+    """
+    prof = trunk_router._load_profile(DEFAULT_PROFILE)
+
+    def _resolve(ref: str | None) -> int | None:
+        if not ref:
+            return None
+        return prof.city_idx_by_ref.get(ref)
+
+    from_ref = inp.get("from_ref")
+    to_ref   = inp.get("to_ref")
+    if not from_ref or not to_ref:
+        return {"error": "fast mode requires from_ref and to_ref (anchor refs)"}
+    src = _resolve(from_ref)
+    dst = _resolve(to_ref)
+    if src is None:
+        return {"error": f"unknown from_ref: {from_ref}"}
+    if dst is None:
+        return {"error": f"unknown to_ref: {to_ref}"}
+
+    via_refs = list(inp.get("via_refs") or [])
+    waypoints = [src]
+    for vr in via_refs:
+        vi = _resolve(vr)
+        if vi is None:
+            return {"error": f"unknown via_ref: {vr}"}
+        waypoints.append(vi)
+    waypoints.append(dst)
+
+    chain: list[int] = []
+    total_km = 0.0
+    for a, b in zip(waypoints[:-1], waypoints[1:]):
+        seg = trunk_router._city_graph_dijkstra(prof.chain_adj, a, b)
+        if seg is None:
+            return {"error": (f"no chain-graph path from "
+                              f"{prof.cities[a].get('name','?')} to "
+                              f"{prof.cities[b].get('name','?')}")}
+        # Sum edge weights for this segment. `chain_adj` weights are
+        # in METERS (from city_graph.json's `weight` column, matching
+        # the paired-SPT preprocess) — convert to km for the response.
+        for u, v in zip(seg[:-1], seg[1:]):
+            for nbr, w in prof.chain_adj.get(u, ()):
+                if nbr == v:
+                    total_km += float(w) / 1000.0
+                    break
+        # Concat, dedup at the shared waypoint.
+        chain.extend(seg if not chain else seg[1:])
+    # Empirical fudge: chain-graph edge weights come from the paired-
+    # SPT preprocess and consistently underestimate the precise trunk-
+    # walked distance by ~15-20% (Graz→Wien 178 vs 215, full trip 1296
+    # vs 1583). Scaling by 1.20 lands close enough for day-count math
+    # without misleading the model. Precise mode has the true number.
+    total_km *= 1.20
+
+    coords: list[list[float]] = []
+    chain_stops: list[dict] = []
+    for ci in chain:
+        c = prof.cities[ci]
+        lon = float(c.get("lon", 0.0))
+        lat = float(c.get("lat", 0.0))
+        coords.append([lon, lat])
+        chain_stops.append({
+            "name":       c.get("name"),
+            "ref":        c.get("ref"),
+            "population": c.get("population"),
+            "country":    c.get("country"),
+            "kind":       c.get("place"),
+        })
+
+    key = _route_cache_key(inp)
+    _ROUTE_CACHE[key]    = coords
+    _ROUTE_KM_CACHE[key] = total_km
+    return {
+        "total_km":       round(total_km, 1),
+        "polyline":       coords,
+        "chain_stops":    chain_stops,
+        "chain_names":    [s["name"] for s in chain_stops],
+        "chain_city_idx": chain,
+        "n_bridges":      0,
+        "mode":           "fast",
+    }
+
+
 def _tool_route(inp: dict) -> dict:
-    """Call trunk_router.route() and flatten the response for the LLM."""
+    """Fast (default) chain-graph route, or precise trunk-walked route.
+
+    Fast mode skips both trunk polyline walking and first/last-mile
+    local Dijkstra — the polyline is straight lines between the
+    chain anchors picked by city-graph Dijkstra, and total_km is
+    the sum of city-graph edge weights. Cheap enough (~50 ms) that
+    the model can call it many times during exploration.
+
+    `precise: true` falls through to `trunk_router.route()` for
+    the real pathfinding — use for the FINAL polyline the user
+    sees. All the pathfinding cost (multi-leg local Dijkstra,
+    trunk walk, decimation) lives here.
+    """
+    precise = bool(inp.get("precise", False))
+    if not precise:
+        return _tool_route_fast(inp)
+
     kwargs: dict[str, Any] = {"profile": DEFAULT_PROFILE,
                               "start": None, "end": None}
     if inp.get("from_ref"):
@@ -651,7 +786,19 @@ def _tool_split_into_stages(inp: dict) -> dict:
     for i in range(1, len(poly)):
         cum.append(cum[-1] + _hav_m(poly[i-1][0], poly[i-1][1],
                                      poly[i][0], poly[i][1]))
-    total_km = cum[-1] / 1000.0
+    haversine_total_km = cum[-1] / 1000.0
+    # A fast-mode polyline is straight-lines between chain anchors,
+    # so `haversine_total_km` under-reads real bike distance by ~15-20%.
+    # When the route call cached a km hint (fudged toward the precise
+    # value), use that for day-count math and scale the cumulative
+    # array so per-stage `km` values inherit the correction too.
+    hint = _ROUTE_KM_CACHE.get((from_ref, to_ref, via_refs))
+    if hint and haversine_total_km > 1e-9:
+        _scale = (hint * 1000.0) / cum[-1]
+        cum = [c * _scale for c in cum]
+        total_km = hint
+    else:
+        total_km = haversine_total_km
     n_days = max(1, round(total_km / target_km))
     cut_km = [total_km * (i + 1) / n_days for i in range(n_days - 1)]
 
