@@ -529,11 +529,14 @@ def _tool_route_fast(inp: dict) -> dict:
                     break
         # Concat, dedup at the shared waypoint.
         chain.extend(seg if not chain else seg[1:])
-    # Empirical fudge: chain-graph edge weights come from the paired-
-    # SPT preprocess and consistently underestimate the precise trunk-
-    # walked distance by ~15-20% (Graz→Wien 178 vs 215, full trip 1296
-    # vs 1583). Scaling by 1.20 lands close enough for day-count math
-    # without misleading the model. Precise mode has the true number.
+    # Empirical fudge: chain_adj weights are the paired-SPT preprocess's
+    # DISC-to-DISC shortest bike paths, not city-center-to-city-center.
+    # Summing them underreads the precise trunk-walked total by ~15-20%
+    # because a real trip's first/last-mile stitches (city center → disc
+    # boundary, disc boundary → city center) aren't in the edge weights.
+    # A proper fix is additive per hop (~disc radius × 2), TBD when we
+    # can read the preprocess disc radius; 1.20× lands close enough
+    # today (Graz→Wien 178 → 214 vs 215; full trip 1296 → 1556 vs 1583).
     total_km *= 1.20
 
     coords: list[list[float]] = []
