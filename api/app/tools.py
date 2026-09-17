@@ -802,8 +802,6 @@ def _tool_split_into_stages(inp: dict) -> dict:
         total_km = hint
     else:
         total_km = haversine_total_km
-    n_days = max(1, round(total_km / target_km))
-    cut_km = [total_km * (i + 1) / n_days for i in range(n_days - 1)]
 
     prof = trunk_router._load_profile(DEFAULT_PROFILE)
     anchors = [(c.get("lon"), c.get("lat"), c.get("name"), c.get("ref"))
@@ -818,49 +816,89 @@ def _tool_split_into_stages(inp: dict) -> dict:
                 best_d = d; best = (aname, aref, alon, alat, d)
         return best
 
-    def _point_at_km(km_target):
+    def _idx_at_km(km_target):
+        """Polyline vertex index closest to a given cumulative km."""
         target_m = km_target * 1000.0
         for i in range(1, len(cum)):
             if cum[i] >= target_m:
-                seg = cum[i] - cum[i-1] or 1e-9
-                t = (target_m - cum[i-1]) / seg
-                lon = poly[i-1][0] + t * (poly[i][0] - poly[i-1][0])
-                lat = poly[i-1][1] + t * (poly[i][1] - poly[i-1][1])
-                return lon, lat
-        return poly[-1][0], poly[-1][1]
+                return i - 1 if (target_m - cum[i-1]) < (cum[i] - target_m) else i
+        return len(cum) - 1
 
-    # First pass: pick the sequence of overnight anchors from the
-    # whole-trip polyline. This just uses the corridor to decide WHERE
-    # to stop for the night; the actual daily riding polyline is
-    # computed per-day below via `_tool_route`, which lets the router
-    # handle start-of-day departures from the previous overnight's
-    # actual city center (same logic that handles trip start).
-    overnights = [_nearest_anchor(poly[0][0], poly[0][1])]
-    for km_at in cut_km:
-        overnights.append(_nearest_anchor(*_point_at_km(km_at)))
-    overnights.append(_nearest_anchor(poly[-1][0], poly[-1][1]))
-    # Drop consecutive-duplicate anchors (can happen when cut points
-    # land near the same city as the trip origin/terminus).
-    dedup: list = []
-    for a in overnights:
+    def _anchor_from_ref(ref: str):
+        """Look up an anchor by ref, return the (name, ref, lon, lat, 0) tuple
+        `_nearest_anchor` returns."""
+        ci = prof.city_idx_by_ref.get(ref)
+        if ci is None:
+            return None
+        c = prof.cities[int(ci)]
+        return (c.get("name"), c.get("ref"),
+                float(c.get("lon", 0.0)), float(c.get("lat", 0.0)), 0.0)
+
+    # STEP 1: fix the mandatory boundaries — from_ref, every via_ref
+    # (in order), and to_ref MUST be overnights. Find each's index
+    # along the polyline (nearest vertex to the anchor coord). This
+    # gives us the km-along-route where each boundary sits, and lets
+    # us split the trip into inter-boundary SEGMENTS to size day
+    # counts within each. Fixes the "split stops in Hennigsdorf
+    # instead of Berlin" bug: Berlin was in via_refs but the km-based
+    # cut fell nearer a suburb, so it never became an overnight.
+    boundary_refs = [from_ref, *via_refs, to_ref]
+    boundary_anchors = []
+    boundary_idxs = []
+    for ref in boundary_refs:
+        a = _anchor_from_ref(ref)
         if a is None:
-            continue
-        if not dedup or dedup[-1][1] != a[1]:
-            dedup.append(a)
-    overnights = dedup
+            return {"error": f"unknown ref: {ref}"}
+        # Nearest vertex on the polyline to this anchor.
+        best_i, best_d = 0, float("inf")
+        for i, (lon, lat) in enumerate(poly):
+            d = _hav_m(a[2], a[3], lon, lat)
+            if d < best_d:
+                best_d, best_i = d, i
+        boundary_anchors.append(a)
+        boundary_idxs.append(best_i)
 
-    # Second pass: route each daily leg. Each leg is its own
-    # `_tool_route` call — the routing engine natively handles
-    # "start at anchor A's center, walk out via A's trunk to B" which
-    # is exactly the morning-departure problem. No spurs, no
-    # retreading: the router picks the best path from the previous
-    # overnight's actual snap_vertex to the current overnight's
-    # snap_vertex.
+    # STEP 2: pick day boundaries within each inter-hub segment.
+    # `target_km_per_day` sizes the day-count per segment; we cut
+    # evenly and snap each cut to the nearest anchor.
+    overnights = [boundary_anchors[0]]
+    overnight_idxs = [boundary_idxs[0]]
+    for seg_i in range(len(boundary_idxs) - 1):
+        a_idx, b_idx = boundary_idxs[seg_i], boundary_idxs[seg_i + 1]
+        if b_idx <= a_idx:
+            # Degenerate segment (anchors collide on the polyline);
+            # nothing to insert between them.
+            overnights.append(boundary_anchors[seg_i + 1])
+            overnight_idxs.append(b_idx)
+            continue
+        seg_km = (cum[b_idx] - cum[a_idx]) / 1000.0
+        seg_days = max(1, round(seg_km / target_km))
+        for i in range(1, seg_days):
+            cut_km_abs = cum[a_idx] / 1000.0 + seg_km * i / seg_days
+            cut_idx = _idx_at_km(cut_km_abs)
+            # Only add if it moves us forward past the previous overnight.
+            if cut_idx <= overnight_idxs[-1]:
+                continue
+            near = _nearest_anchor(poly[cut_idx][0], poly[cut_idx][1])
+            if near is None or near[1] == overnight_idxs[-1]:
+                continue
+            overnights.append(near)
+            overnight_idxs.append(cut_idx)
+        overnights.append(boundary_anchors[seg_i + 1])
+        overnight_idxs.append(b_idx)
+
+    # STEP 3: build stage dicts by SLICING the already-computed
+    # polyline instead of a nested `_tool_route` call per day. The
+    # old per-day nested route was the 272-s stall in the flagship
+    # trace (issue #9) — the polyline is already precise (or fast,
+    # matching the caller's choice), so a slice gives the exact same
+    # daily route for zero extra work.
     stages = []
     for day_i in range(1, len(overnights)):
-        prev = overnights[day_i - 1]
-        cur  = overnights[day_i]
-        leg = _tool_route({"from_ref": prev[1], "to_ref": cur[1]})
+        prev, cur = overnights[day_i - 1], overnights[day_i]
+        a_idx, b_idx = overnight_idxs[day_i - 1], overnight_idxs[day_i]
+        day_poly = poly[a_idx:b_idx + 1]
+        day_km = round((cum[b_idx] - cum[a_idx]) / 1000.0, 1)
         stages.append({
             "day": day_i,
             "from_ref":    prev[1],
@@ -869,8 +907,8 @@ def _tool_split_into_stages(inp: dict) -> dict:
             "to_ref":      cur[1],
             "to_name":     cur[0],
             "to_lonlat":   [cur[2], cur[3]],
-            "km":          leg.get("total_km", 0.0),
-            "polyline":    leg.get("polyline") or [],
+            "km":          day_km,
+            "polyline":    day_poly,
         })
     return {
         "total_km": round(sum(s["km"] for s in stages), 1),

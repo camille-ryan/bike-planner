@@ -20,12 +20,14 @@ const resetBtn = document.getElementById("chat-reset");
 const saveBtn  = document.getElementById("chat-save");
 const loadSel  = document.getElementById("chat-load");
 
-// Abort the SSE if no bytes arrive for this many ms. Route planning
-// can take several minutes end-to-end; the API emits `: tick` and
-// `: round_start` heartbeats and a `tool_start` event around each
-// potentially-silent phase, so any 180s gap really is a stall
-// (Anthropic dropped us, WSL sleep, network drop).
-const CHAT_STREAM_IDLE_MS = 180_000;
+// Abort the SSE if no bytes arrive for this many ms. Between LLM
+// round text-deltas, `: tick` and `round_start` heartbeats, and
+// `tool_start` events, we normally emit bytes every few seconds.
+// A 5-minute silence is a real stall — Anthropic dropped us, WSL
+// sleep, network drop, or a tool that hangs (see #9 for split
+// stalling on the whole-trip pass; that's fixed but the ceiling is
+// still cheap insurance).
+const CHAT_STREAM_IDLE_MS = 300_000;
 
 console.log("[chat.js] loaded, elements:", {
   log: !!logEl, form: !!formEl, input: !!inputEl, send: !!sendBtn, reset: !!resetBtn,

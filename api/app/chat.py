@@ -131,7 +131,13 @@ Reformat / recall requests — DO NOT re-run tools:
 Style:
 - Be concise. No hedging preamble like "I'll help you plan…" — just start doing the work.
 - If a tool errors, note briefly and try one alternative (e.g. local-language spelling) before giving up.
-- Never invent anchors or coordinates. Every place-name is verified via `search_anchors` first."""
+- Never invent anchors or coordinates. Every place-name is verified via `search_anchors` first.
+- **Talk to the user, not to the tools.** Never leak tool-schema names into user-facing text — no "via_refs", "from_ref", "precise mode", "direct_rail_service", "chain-graph", "polyline", or any other JSON field name. Translate:
+    - "via_refs" → "waypoints" or just say "route via X, Y, Z"
+    - "direct_rail_service" → "direct-train check" or plain English ("Berlin ↔ Hamburg has a direct train")
+    - "split_into_stages" → "the daily-stage plan" or just describe the days
+    - "search_anchors" → don't mention it, just use the city name
+  Internal reasoning is fine ("I need to check…"), but reference user concepts (cities, days, trains, waypoints), not implementation."""
 
 
 def _sse(event: str, data: Any) -> bytes:
