@@ -94,17 +94,50 @@ function escape(s) {
 
 function summarizeTool(name, input, output) {
   if (output && output.error) return `— error: ${output.error}`;
+  // Post-result branches (output present) show what came back.
+  // Pre-result branches (output === null, from the "running…" row)
+  // show the arg shape without "→ undefined" placeholders.
+  const done = output != null;
   switch (name) {
-    case "search_anchors": {
-      const n = output?.results?.length || 0;
-      return `“${input.query}” → ${n} anchor${n === 1 ? "" : "s"}`;
+    case "search_anchors":
+      return done
+        ? `“${input.query}” → ${output?.results?.length || 0} anchor${(output?.results?.length || 0) === 1 ? "" : "s"}`
+        : `“${input.query}”`;
+    case "route": {
+      const via = Array.isArray(input.via_refs) && input.via_refs.length
+        ? ` via ${input.via_refs.length}` : "";
+      const path = `${input.from_ref || input.from_lonlat} → ${input.to_ref || input.to_lonlat}${via}`;
+      return done ? `${path}  ⇒  ${output?.total_km ?? "?"} km` : path;
     }
-    case "route":
-      return `${input.from_ref || input.from_lonlat} → ${input.to_ref || input.to_lonlat}  ⇒  ${output?.total_km ?? "?"} km`;
     case "stations_near":
-      return `${output?.stations?.length || 0} stations within ${input.radius_km || 15} km of ${input.lon.toFixed(2)},${input.lat.toFixed(2)}`;
-    case "split_into_stages":
-      return `${output?.n_days ?? "?"} stages @ ~${input.target_km_per_day} km/day`;
+      return done
+        ? `${output?.stations?.length || 0} stations within ${input.radius_km || 15} km of ${input.lon.toFixed(2)},${input.lat.toFixed(2)}`
+        : `${input.radius_km || 15} km around ${input.lon.toFixed(2)},${input.lat.toFixed(2)}`;
+    case "stations_along_route": {
+      const via = Array.isArray(input.via_refs) && input.via_refs.length
+        ? ` via ${input.via_refs.length}` : "";
+      const path = `${input.from_ref || "?"} → ${input.to_ref || "?"}${via}`;
+      return done
+        ? `${path}  ⇒  ${output?.anchors?.length ?? "?"} rail-served anchors`
+        : path;
+    }
+    case "direct_rail_service":
+      return done
+        ? `${input.from_ref} ↔ ${input.to_ref}  ⇒  ${output?.direct ? "direct" : "no direct"}`
+        : `${input.from_ref} ↔ ${input.to_ref}`;
+    case "direct_rail_service_batch": {
+      const n = Array.isArray(input.pairs) ? input.pairs.length : 0;
+      const nd = done
+        ? (output?.results?.filter(r => r && r.direct).length ?? "?")
+        : null;
+      return done ? `${n} pair${n === 1 ? "" : "s"}  ⇒  ${nd} direct` : `${n} pair${n === 1 ? "" : "s"}`;
+    }
+    case "split_into_stages": {
+      const via = Array.isArray(input.via_refs) && input.via_refs.length
+        ? ` via ${input.via_refs.length}` : "";
+      const path = `${input.from_ref || "?"} → ${input.to_ref || "?"}${via} @ ~${input.target_km_per_day || 80} km/day`;
+      return done ? `${path}  ⇒  ${output?.n_days ?? "?"} stages` : path;
+    }
     default:
       return "";
   }
