@@ -135,6 +135,8 @@ You have room for approximately these tool calls, in this order:
 1. `rail_path({from_ref}, {to_ref})` — optional, only if the user's prompt has a rail constraint. If it returns `reachable: false`, DO NOT retry it — use `stations_along_route` fallback (see below).
 2. `route({from_ref}, {to_ref}, via_refs=<rail spine>)` — once, at most twice. If your first call gives a bad km total, one revision is OK; more is not.
 3. `split_into_stages({from_ref}, {to_ref}, via_refs=<same>, target_km_per_day=<user's target>)` — once.
+   - **UNITS**: the tool expects km. If the user specified miles, CONVERT FIRST. Rule of thumb: 50 mi ≈ 80 km, 60 mi ≈ 96 km, 80 mi ≈ 128 km. If you pass `target_km_per_day=50` when the user said 50 miles/day, you've under-planned by 40%; days come out at ~30 mi instead of ~50 mi.
+   - **RANGE ENFORCEMENT**: if the user gave a range (e.g. "30-80 mi, prefer 50"), after `split_into_stages` returns, check each stage's km. If ANY stage is under the min (30 mi = 48 km) OR over the max (80 mi = 128 km), the split is wrong. Two ways to fix: (a) call `split_into_stages` again with a different `target_km_per_day` closer to the range midpoint; (b) merge adjacent under-min days by adjusting the overnights you submit — e.g. drop the middle overnight between two 25-mi days and submit as one 50-mi day. Prefer (b) since it doesn't burn tool rounds.
 4. `direct_rail_service_batch` on the CONSECUTIVE-PAIR list of overnights — once. **If ANY pair comes back `direct=false`, ACCEPT IT** and note the caveat in your narrative_md. DO NOT loop trying to find a perfect chain — a partial-rail segment with a noted transfer is FINE, an unsubmitted segment is a failure.
 5. `submit_segment` — TERMINAL. Call this after the direct-rail check no matter what the results are.
 
@@ -602,11 +604,15 @@ async def run_enrichment_followup(
     user_messages: list[dict],
     client: anthropic.AsyncAnthropic,
     parent_trace: RequestTrace,
+    scope: dict | None = None,
 ) -> AsyncIterator[bytes]:
     """Called when the user's follow-up message asks for lodging /
-    transit help after a prior plan turn. Runs a small extract-
-    overnights agent to pull the overnight sequence from the prior
-    assistant turn, then fans out lodging + transit sub-agents."""
+    transit help after a prior plan turn. `scope` = {lodging, transit}
+    bool flags — the caller (chat._run_chat) parses which the user
+    asked for so we don't spawn agents for the other kind. Both True
+    if omitted (legacy call path)."""
+    if scope is None:
+        scope = {"lodging": True, "transit": True}
     from .chat import _run_chat_inner, _sse
     from . import enrichment, trunk_router
     from .settings import DEFAULT_PROFILE
@@ -679,7 +685,7 @@ async def run_enrichment_followup(
         })
 
     async for chunk in enrichment.run_enrichment_stage(
-        enriched, client, parent_trace,
+        enriched, client, parent_trace, scope=scope,
     ):
         yield chunk
 

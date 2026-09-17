@@ -278,6 +278,7 @@ function handleSegmentCommit(data) {
 function renderLodgingCards(bubble, input) {
   const hotels = Array.isArray(input?.hotels) ? input.hotels : [];
   const summary = input?.summary || "";
+  const overnightName = bubble.headerData?.overnight_name || "";
   const wrap = document.createElement("div");
   wrap.className = "lodging-cards";
   if (summary) {
@@ -295,13 +296,32 @@ function renderLodgingCards(bubble, input) {
   for (const h of hotels) {
     const card = document.createElement("div");
     card.className = "lodging-card";
-    const title = h.website
-      ? `<a href="${escape(h.website)}" target="_blank" rel="noopener">${escape(h.name || "(unnamed)")}</a>`
-      : `<span>${escape(h.name || "(unnamed)")}</span>`;
+    // Every card gets a clickable title. OSM website is preferred;
+    // fall back to a Google search for "<name> <town> hotel" so the
+    // user can always click through.
+    const href = h.website
+      ? h.website
+      : `https://www.google.com/search?q=${encodeURIComponent(
+            (h.name || "hotel") + " " + overnightName)}`;
+    const title = `<a href="${escape(href)}" target="_blank" rel="noopener">${escape(h.name || "(unnamed)")}</a>`;
     const meta = [];
     if (h.subtype)  meta.push(escape(h.subtype));
     if (h.stars)    meta.push(`${escape(String(h.stars))}★`);
-    if (h.distance_m) meta.push(`${Math.round(h.distance_m)} m from stop`);
+    if (h.distance_m != null) {
+      const dm = Math.round(Number(h.distance_m));
+      // Flag far-from-town-center options prominently — bike-tourists
+      // don't want a 10 km detour to their hotel after 60 km riding.
+      let distLabel;
+      if (dm >= 3000) {
+        distLabel = `⚠ ${(dm / 1000).toFixed(1)} km from town`;
+      } else if (dm >= 1500) {
+        distLabel = `${(dm / 1000).toFixed(1)} km from town`;
+      } else {
+        distLabel = `${dm} m from town`;
+      }
+      meta.push(distLabel);
+    }
+    if (!h.website) meta.push("no OSM website — link is a Google search");
     card.innerHTML =
       `<div class="lodging-card-title">${title}</div>` +
       (meta.length ? `<div class="lodging-card-meta">${meta.join(" · ")}</div>` : "");

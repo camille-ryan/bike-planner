@@ -204,23 +204,33 @@ def _prompt_head(messages: list[dict]) -> str:
     return ""
 
 
-_ENRICHMENT_TRIGGERS = (
-    "book lodging", "book train", "book hotel", "find lodging",
-    "find hotel", "book trains", "book the trains", "lodging plan",
-    "hotels please", "book everything", "yes please book",
+_LODGING_TRIGGERS = (
+    "book lodging", "lodging plan", "find lodging", "hotels", "hotel",
+    "book hotel", "find hotel", "book a hotel", "find a hotel",
+    "accommodation", "book accommodation",
+)
+_TRANSIT_TRIGGERS = (
+    "book train", "book trains", "book the trains", "book the train",
+    "train ticket", "train tickets", "train booking",
+    "book transit",
+)
+_BOTH_TRIGGERS = (
+    "book everything", "book lodging and trains",
+    "book trains and hotels", "book hotels and trains",
+    "book both", "yes please book", "book it all",
 )
 
 
-def _looks_like_enrichment_request(messages: list[dict]) -> bool:
-    """Heuristic: does the LAST user message look like a follow-up
-    asking for lodging/transit help, and does the conversation have
-    a prior assistant plan? Both conditions must hold — a first-turn
-    'book lodging in Berlin' shouldn't skip the planner."""
+def _detect_enrichment_scope(messages: list[dict]) -> dict:
+    """Return `{lodging: bool, transit: bool}` for the LAST user
+    message. Both False means the message isn't an enrichment
+    trigger. Must also have a prior assistant turn to enrich."""
+    empty = {"lodging": False, "transit": False}
     if not messages:
-        return False
+        return empty
     last = messages[-1]
     if last.get("role") != "user":
-        return False
+        return empty
     content = last.get("content")
     text = ""
     if isinstance(content, str):
@@ -230,11 +240,20 @@ def _looks_like_enrichment_request(messages: list[dict]) -> bool:
             if isinstance(b, dict) and b.get("type") == "text":
                 text += b.get("text", "")
     text_lc = text.lower()
-    if not any(trig in text_lc for trig in _ENRICHMENT_TRIGGERS):
-        return False
-    # Must have at least one prior assistant turn.
-    has_prior_plan = any(m.get("role") == "assistant" for m in messages[:-1])
-    return has_prior_plan
+    if not any(m.get("role") == "assistant" for m in messages[:-1]):
+        return empty
+    # `both` beats everything (user asked for the whole enrichment).
+    if any(t in text_lc for t in _BOTH_TRIGGERS):
+        return {"lodging": True, "transit": True}
+    lodging = any(t in text_lc for t in _LODGING_TRIGGERS)
+    transit = any(t in text_lc for t in _TRANSIT_TRIGGERS)
+    return {"lodging": lodging, "transit": transit}
+
+
+def _looks_like_enrichment_request(messages: list[dict]) -> bool:
+    """Convenience wrapper — is any enrichment requested?"""
+    scope = _detect_enrichment_scope(messages)
+    return scope["lodging"] or scope["transit"]
 
 
 async def _run_chat(
@@ -250,14 +269,15 @@ async def _run_chat(
         # a plan (has segment narratives in its content) AND this
         # user turn asks for booking help, run enrichment on the
         # existing plan instead of re-running the whole planner.
-        if _looks_like_enrichment_request(messages):
+        scope = _detect_enrichment_scope(messages)
+        if scope["lodging"] or scope["transit"]:
             from . import multiagent
             with RequestTrace(model=CHAT_MODEL,
                               prompt_head=_prompt_head(messages),
                               agent_role="coordinator-enrich") as tr:
                 try:
                     async for chunk in multiagent.run_enrichment_followup(
-                        messages, client, tr,
+                        messages, client, tr, scope=scope,
                     ):
                         yield chunk
                 except Exception as exc:

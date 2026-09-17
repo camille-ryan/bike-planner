@@ -97,13 +97,16 @@ LODGING_PROMPT = """You are a LODGING sub-agent in a bike-tour planner. Your job
 
 You will be told which overnight stop this is (city name + coordinates). Follow this pipeline; STOP as soon as you have a result to submit:
 
-1. Call `search_lodging(lonlat=<lon,lat>, radius_km=1.5)`. If it returns 3+ entries with names, jump to step 4.
-2. If step 1 returned nothing (or very few), widen the search: `search_lodging(lonlat=<same>, radius_km=5)`. If that finds options, note in `summary` that they're a bit further from the anchor (which is expected — small towns often lack in-city lodging).
-3. If step 2 still returns nothing, try `radius_km=15`. This picks up lodging in the neighboring town. In your `summary`, mention that this overnight (say "Ternitz") has no in-town lodging in the OSM dataset and the closest options are in <neighboring town, extracted from result names>. The user MAY want to shift the overnight to that neighbor — say so plainly in the summary.
-4. Pick the top 3 options ranked for a bike tourist: closer beats farther; variety helps (one hotel, one hostel/guest_house if available); prefer ones with a website.
-5. Call `submit_lodging` with your top options (may be 0-3) and a one-sentence summary. If you found nothing at any radius, submit an empty `hotels` list with a summary flagging the gap. Then STOP.
+1. `search_lodging(lonlat=<lon,lat>, radius_km=3)`. If it returns 2+ entries with names within 3 km, jump to step 4.
+2. If nothing near, widen once: `search_lodging(lonlat=<same>, radius_km=8)`. Note in `summary` that the closest options are further out (expected in small towns).
+3. Only if step 2 still empty: `search_lodging(lonlat=<same>, radius_km=15)`. Anything you submit at this radius MUST be flagged clearly in `summary` — the user should hear "this overnight has no in-town lodging in the OSM dataset; nearest options are in X ~12 km away. Consider shifting the overnight to X." That gives them an actionable path.
+4. Pick up to 3 options ranked for a bike tourist:
+   - Closer beats farther. Prefer under 2 km from the anchor. Anything >5 km is a red flag — call it out in the `summary`.
+   - Variety helps: one hotel, one hostel/guest_house if available, one upscale if the mix allows.
+   - Ties broken by whether the entry has a website (better).
+5. `submit_lodging` with your top options (0-3) and a one-sentence summary. If nothing at any radius, submit `hotels: []` with a summary flagging the gap and naming the next-closest town.
 
-Do not call any other tool. Do not narrate outside `submit_lodging.summary`. ~4 rounds max."""
+Do not call any other tool. ~4 rounds max."""
 
 
 TRANSIT_PROMPT = """You are a TRANSIT sub-agent in a bike-tour planner. Your job is narrow:
@@ -194,36 +197,46 @@ async def run_enrichment_stage(
     overnights: list[dict],
     client: anthropic.AsyncAnthropic,
     parent_trace: RequestTrace,
+    scope: dict | None = None,
 ) -> AsyncIterator[bytes]:
     """Fan out per-overnight LodgingAgent + per-consecutive-pair
-    TransitAgent. Merges all sub-agent SSE bytes onto the shared
-    stream in whatever order they complete."""
+    TransitAgent. `scope = {lodging, transit}` selects which kinds
+    of sub-agents to run; both True by default. When the user asks
+    "book lodging" only, transit stays off."""
     from .chat import _sse
 
     if not overnights:
         return
+    if scope is None:
+        scope = {"lodging": True, "transit": True}
+    do_lodging = bool(scope.get("lodging"))
+    do_transit = bool(scope.get("transit"))
+    if not do_lodging and not do_transit:
+        return
 
     # Announce all enrichment bubbles up front so the frontend renders
     # them in a stable order.
-    for i, ov in enumerate(overnights):
-        yield _sse("agent_start", {
-            "role":           "lodging",
-            "overnight_i":    i,
-            "overnight_ref":  ov.get("ref"),
-            "overnight_name": ov.get("name"),
-        }, agent_id=_lodging_agent_id(i))
-    # Transit: N-1 pairs (day K-1 end → day K end).
-    for i in range(1, len(overnights)):
-        prev = overnights[i - 1]
-        cur  = overnights[i]
-        yield _sse("agent_start", {
-            "role":      "transit",
-            "pair_i":    i - 1,
-            "from_ref":  prev.get("ref"),
-            "to_ref":    cur.get("ref"),
-            "from_name": prev.get("name"),
-            "to_name":   cur.get("name"),
-        }, agent_id=_transit_agent_id(i - 1))
+    if do_lodging:
+        for i, ov in enumerate(overnights):
+            yield _sse("agent_start", {
+                "role":           "lodging",
+                "overnight_i":    i,
+                "overnight_ref":  ov.get("ref"),
+                "overnight_name": ov.get("name"),
+            }, agent_id=_lodging_agent_id(i))
+    if do_transit:
+        # Transit: N-1 pairs (day K-1 end → day K end).
+        for i in range(1, len(overnights)):
+            prev = overnights[i - 1]
+            cur  = overnights[i]
+            yield _sse("agent_start", {
+                "role":      "transit",
+                "pair_i":    i - 1,
+                "from_ref":  prev.get("ref"),
+                "to_ref":    cur.get("ref"),
+                "from_name": prev.get("name"),
+                "to_name":   cur.get("name"),
+            }, agent_id=_transit_agent_id(i - 1))
 
     sem = asyncio.Semaphore(MAX_PARALLEL_ENRICHMENT)
     queue: asyncio.Queue[bytes | None] = asyncio.Queue()
@@ -283,13 +296,16 @@ async def run_enrichment_stage(
         await queue.put(None)
 
     tasks: list[asyncio.Task] = []
-    for i, ov in enumerate(overnights):
-        tasks.append(asyncio.create_task(_run_lodging(i, ov)))
-    for i in range(1, len(overnights)):
-        tasks.append(
-            asyncio.create_task(_run_transit(i - 1, overnights[i - 1],
-                                              overnights[i]))
-        )
+    if do_lodging:
+        for i, ov in enumerate(overnights):
+            tasks.append(asyncio.create_task(_run_lodging(i, ov)))
+    if do_transit:
+        for i in range(1, len(overnights)):
+            tasks.append(
+                asyncio.create_task(
+                    _run_transit(i - 1, overnights[i - 1], overnights[i])
+                )
+            )
 
     done_sentinels = 0
     total = len(tasks)

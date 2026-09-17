@@ -953,6 +953,20 @@ def _tool_split_into_stages(inp: dict) -> dict:
     to_ref = inp.get("to_ref")
     via_refs = tuple(inp.get("via_refs") or [])
     target_km = float(inp.get("target_km_per_day", 80))
+    # Miles-vs-km confusion guard. A cyclist's target is almost never
+    # below 30 km/day (that's ~19 mi — too short); values 20-50 here
+    # almost always mean the caller passed a miles value verbatim.
+    # Auto-convert and warn instead of silently splitting into too
+    # many short days.
+    unit_note = None
+    if 15.0 <= target_km <= 50.0:
+        original = target_km
+        target_km = target_km * 1.60934  # mi → km
+        unit_note = (
+            f"target_km_per_day={original} looked like miles "
+            f"({original:.0f} mi); auto-converted to {target_km:.1f} km. "
+            "Pass a km value next time to avoid the guess."
+        )
     poly = _ROUTE_CACHE.get((from_ref, to_ref, via_refs))
     if not poly:
         for (fr, tr, _via), coords in _ROUTE_CACHE.items():
@@ -1093,11 +1107,14 @@ def _tool_split_into_stages(inp: dict) -> dict:
             "km":          day_km,
             "polyline":    day_poly,
         })
-    return {
+    out = {
         "total_km": round(sum(s["km"] for s in stages), 1),
         "n_days":   len(stages),
         "stages":   stages,
     }
+    if unit_note:
+        out["note"] = unit_note
+    return out
 
 
 def _tool_pois_near_anchor(inp: dict) -> dict:
