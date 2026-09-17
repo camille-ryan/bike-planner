@@ -143,3 +143,56 @@ main {
 
 footer { color: #888; font-size: 0.75rem; margin-top: 1rem; }
 footer code { background: #efefef; padding: 0 0.2rem; border-radius: 2px; }
+
+/* ---------- Multi-agent bubbles ---------- */
+
+.chat-mode-toggle {
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  font-size: 0.75rem; color: #666; margin-top: 0.35rem;
+  cursor: pointer; user-select: none;
+}
+.chat-mode-toggle input[type="checkbox"] { margin: 0; }
+
+.chat-agent-bubble {
+  border: 1px solid #d9d5cc;
+  border-radius: 6px;
+  background: #fbfaf6;
+  padding: 0.5rem 0.65rem;
+  margin: 0.5rem 0;
+}
+.chat-agent-bubble.role-supervisor { border-color: #b7a4d9; background: #f7f2fb; }
+.chat-agent-bubble.role-merge      { border-color: #9dc8a5; background: #f2f9f3; }
+.chat-agent-bubble.done            { border-style: solid; }
+.chat-agent-bubble.failed          { border-color: #d97878; background: #fbf1f1; }
+
+.chat-agent-header {
+  font-size: 0.82rem; font-weight: 600; color: #333;
+  margin-bottom: 0.35rem;
+}
+.chat-agent-tools {
+  display: block;
+  border-left: 2px solid #e0dccf;
+  padding-left: 0.4rem;
+  margin: 0.2rem 0 0.3rem;
+  font-size: 0.8rem;
+}
+.chat-agent-tools:empty { display: none; }
+.chat-agent-tools .chat-msg.tool {
+  margin-bottom: 0.25rem;
+  padding: 0.1rem 0;
+}
+.chat-agent-text { font-size: 0.85rem; }
+.chat-agent-text:empty { display: none; }
+
+.chat-agent-error {
+  font-size: 0.78rem;
+  color: #a33;
+  margin-top: 0.3rem;
+  padding: 0.2rem 0.4rem;
+  background: #fbf1f1;
+  border-radius: 3px;
+}
+
+.chat-msg.tool.pending .running {
+  color: #888; font-style: italic; margin-left: 0.3rem;
+}

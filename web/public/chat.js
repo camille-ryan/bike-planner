@@ -66,14 +66,14 @@ function addToolCall(name, input, output) {
 // multiple tools run in one round.
 const pendingToolMsgs = new Map();
 
-function addToolPending(id, name, input) {
+function addToolPending(id, name, input, container) {
   const div = document.createElement("div");
   div.className = "chat-msg tool pending";
   const argHint = summarizeTool(name, input, null);
   div.innerHTML =
     `<span class="tool-name">🔧 ${escape(name)}</span> ` +
     `${escape(argHint)} <span class="running">(running…)</span>`;
-  logEl.appendChild(div);
+  (container || logEl).appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
   pendingToolMsgs.set(id, div);
 }
@@ -87,6 +87,92 @@ function resolveToolPending(id, name, input, output) {
   div.innerHTML =
     `<span class="tool-name">🔧 ${escape(name)}</span> ${escape(summary)}`;
   return true;
+}
+
+// ---------- multi-agent bubble tracking ----------
+// Each agent (supervisor / seg[i] / merge) gets its own bubble container
+// with a header line, an inline tool tray, and its own streaming text
+// area. `agent_start` creates it; text / tool_start / tool_call events
+// tagged with `agent_id` route to it; `agent_end` swaps the header
+// to a completed state.
+const agentBubbles = new Map();  // agent_id -> {container, header, textDiv, tools, textBuf}
+
+function _agentBubbleTitle(role, data) {
+  if (role === "supervisor") return "▸ Planning corridor…";
+  if (role === "merge")      return "▸ Merging plan…";
+  if (role === "segment") {
+    const i    = data.segment_i;
+    const from = data.from_name ?? "?";
+    const to   = data.to_name   ?? "?";
+    return `▸ Segment ${i}: ${from} → ${to}`;
+  }
+  return `▸ Agent ${data.agent_id || ""}`;
+}
+
+function _agentBubbleDone(role, data) {
+  const s = data.status === "failed" ? "✗" : "✓";
+  const wall = data.wall_ms ? ` · ${(data.wall_ms / 1000).toFixed(1)}s` : "";
+  if (role === "supervisor") return `${s} Corridor planned${wall}`;
+  if (role === "merge")      return `${s} Plan complete${wall}`;
+  if (role === "segment") {
+    const i    = data.segment_i;
+    const from = agentBubbles.get(`seg[${i}]`)?.headerData?.from_name ?? "?";
+    const to   = agentBubbles.get(`seg[${i}]`)?.headerData?.to_name   ?? "?";
+    return `${s} Segment ${i}: ${from} → ${to}${wall}`;
+  }
+  return `${s} Agent ${data.agent_id || ""}${wall}`;
+}
+
+function handleAgentStart(data) {
+  const agentId = data.agent_id;
+  if (!agentId || agentBubbles.has(agentId)) return;
+  const container = document.createElement("div");
+  container.className = `chat-agent-bubble role-${data.role}`;
+  const header = document.createElement("div");
+  header.className = "chat-agent-header";
+  header.textContent = _agentBubbleTitle(data.role, data);
+  const tools = document.createElement("div");
+  tools.className = "chat-agent-tools";
+  const textDiv = document.createElement("div");
+  textDiv.className = "chat-agent-text";
+  container.appendChild(header);
+  container.appendChild(tools);
+  container.appendChild(textDiv);
+  logEl.appendChild(container);
+  logEl.scrollTop = logEl.scrollHeight;
+  agentBubbles.set(agentId, {
+    container, header, tools, textDiv,
+    textBuf: "",
+    headerData: {
+      segment_i: data.segment_i,
+      from_name: data.from_name,
+      to_name:   data.to_name,
+      role:      data.role,
+    },
+  });
+}
+
+function handleAgentEnd(data) {
+  const agentId = data.agent_id;
+  const bubble = agentBubbles.get(agentId);
+  if (!bubble) return;
+  const role = bubble.headerData?.role || data.role;
+  bubble.header.textContent = _agentBubbleDone(role, data);
+  if (data.status === "failed") {
+    bubble.container.classList.add("failed");
+    if (data.error) {
+      const err = document.createElement("div");
+      err.className = "chat-agent-error";
+      err.textContent = `⚠️  ${data.error}`;
+      bubble.container.appendChild(err);
+    }
+  } else {
+    bubble.container.classList.add("done");
+  }
+}
+
+function clearAgentBubbles() {
+  agentBubbles.clear();
 }
 
 function escape(s) {
@@ -602,12 +688,21 @@ async function streamChat(userText) {
     return;
   }
 
+  clearAgentBubbles();
+
+  // Read the mode toggle: when checked, we ask the backend for the
+  // multi-agent supervisor/segment/merge decomposition. Element is
+  // optional; if missing (page not updated), default to single-agent.
+  const modeToggle = document.getElementById("chat-multiagent-toggle");
+  const mode = (modeToggle && modeToggle.checked) ? "multiagent" : undefined;
+
   let resp;
   try {
     resp = await fetch(`${CHAT_API_BASE}${CHAT_PATH}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: history }),
+      body: JSON.stringify(mode ? { messages: history, mode }
+                                  : { messages: history }),
       signal: controller.signal,
     });
   } catch (e) {
@@ -664,37 +759,75 @@ async function streamChat(userText) {
         buf = buf.slice(idx + 2);
         const ev = parseSSE(raw);
         if (!ev) continue;
-        if (ev.event === "round_start") {
+        // Multi-agent path: text / tool_start / tool_call events carry
+        // an `agent_id` and route to that agent's dedicated bubble.
+        // Single-agent path uses `agent_id="main"` and the same code
+        // renders it as one supervisor-less flat log (main's bubble is
+        // never created via agent_start, so we hit the addMessage
+        // fallback and behave like before).
+        const agentId  = ev.data && ev.data.agent_id;
+        const isMulti  = agentId && agentId !== "main";
+        const bubble   = isMulti ? agentBubbles.get(agentId) : null;
+
+        if (ev.event === "agent_start") {
+          handleAgentStart(ev.data);
+        } else if (ev.event === "agent_end") {
+          handleAgentEnd(ev.data);
+        } else if (ev.event === "round_start") {
           // Start a new bubble for this round's text so a "rationale
           // sentence + narrative" chunk lands right above THIS round's
           // tool rows, not glommed onto whatever the previous round
-          // wrote. `asstText` (history buffer) keeps accumulating.
-          asstDiv = null;
-          asstBubbleText = "";
+          // wrote. In multi-agent mode, each agent has its own bubble
+          // that already accumulates within-agent text — the per-round
+          // reset only applies to the single-agent flat log.
+          if (bubble) {
+            bubble.textBuf = "";
+            bubble.textDiv.innerHTML = "";
+          } else {
+            asstDiv = null;
+            asstBubbleText = "";
+          }
         } else if (ev.event === "text") {
           const delta = ev.data.delta || "";
-          asstText       += delta;
-          asstBubbleText += delta;
-          // Lazy-create the bubble on first delta of the current round
-          // so it lands below any tool calls that already streamed in.
-          if (!asstDiv) asstDiv = addMessage("assistant", "");
-          // Render as markdown so tables/lists format properly. `marked`
-          // is loaded from the CDN via a <script> tag in index.html.
-          if (typeof marked !== "undefined") {
-            asstDiv.innerHTML = marked.parse(asstBubbleText);
+          asstText += delta;
+          if (bubble) {
+            bubble.textBuf += delta;
+            if (typeof marked !== "undefined") {
+              bubble.textDiv.innerHTML = marked.parse(bubble.textBuf);
+            } else {
+              bubble.textDiv.textContent = bubble.textBuf;
+            }
+            logEl.scrollTop = logEl.scrollHeight;
           } else {
-            asstDiv.textContent = asstBubbleText;
+            asstBubbleText += delta;
+            // Lazy-create the bubble on first delta of the current
+            // round so it lands below any tool calls that already
+            // streamed in.
+            if (!asstDiv) asstDiv = addMessage("assistant", "");
+            if (typeof marked !== "undefined") {
+              asstDiv.innerHTML = marked.parse(asstBubbleText);
+            } else {
+              asstDiv.textContent = asstBubbleText;
+            }
+            logEl.scrollTop = logEl.scrollHeight;
           }
-          logEl.scrollTop = logEl.scrollHeight;
         } else if (ev.event === "tool_start") {
-          addToolPending(ev.data.id, ev.data.name, ev.data.input);
+          const container = bubble ? bubble.tools : null;
+          addToolPending(ev.data.id, ev.data.name, ev.data.input, container);
           tickStatus();
         } else if (ev.event === "tool_call") {
           // If we already showed a "(running…)" pending row for this
-          // id, mutate it in place; otherwise append a fresh bubble.
+          // id, mutate it in place; otherwise append a fresh bubble
+          // in the right container.
           if (!resolveToolPending(
                 ev.data.id, ev.data.name, ev.data.input, ev.data.output)) {
-            addToolCall(ev.data.name, ev.data.input, ev.data.output);
+            const container = bubble ? bubble.tools : null;
+            const div = document.createElement("div");
+            div.className = "chat-msg tool";
+            const summary = summarizeTool(ev.data.name, ev.data.input, ev.data.output);
+            div.innerHTML =
+              `<span class="tool-name">🔧 ${escape(ev.data.name)}</span> ${escape(summary)}`;
+            (container || logEl).appendChild(div);
           }
           handleToolResult(ev.data.name, ev.data.input, ev.data.output);
           toolCount += 1;
@@ -706,7 +839,9 @@ async function streamChat(userText) {
           if (asstDiv && !asstText) { asstDiv.remove(); asstDiv = null; }
           addMessage("error", `⚠️  ${ev.data.message || "Unknown error."}`);
         } else if (ev.event === "done") {
-          // stop_reason is on ev.data.stop_reason if we ever want to show it
+          // stop_reason is on ev.data.stop_reason if we ever want to show it.
+          // In multi-agent mode, per-agent `done` events precede the
+          // final coordinator `done`; we treat them uniformly.
         }
       }
     }

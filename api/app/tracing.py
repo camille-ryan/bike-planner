@@ -117,20 +117,39 @@ class RequestTrace:
                                  latency_ms=…)
     """
 
-    def __init__(self, model: str, prompt_head: str) -> None:
+    def __init__(self, model: str, prompt_head: str,
+                 parent_request_id: str | None = None,
+                 agent_role: str | None = None) -> None:
         self.request_id = new_request_id()
         self._model = model
         self._prompt_head = prompt_head
+        # Parent + role fields for tree tracing across the multi-agent
+        # planner: supervisor gets parent=None role="supervisor";
+        # each segment sub-agent gets parent=<supervisor's id>
+        # role=f"segment[{i}]". Downstream tooling filters by parent to
+        # reconstruct the tree. None on both keeps single-agent output
+        # byte-identical for backward compat.
+        self.parent_request_id = parent_request_id
+        self.agent_role = agent_role
         # monotonic, not wall clock — WSL2 wall time can jump on VM
         # resume, producing negative durations otherwise.
         self._t0 = time.monotonic()
         self._stop_reason: str | None = None
         self._error: str | None = None
 
+    def _base_fields(self) -> dict[str, Any]:
+        """Fields every event of this trace should carry."""
+        out: dict[str, Any] = {"request_id": self.request_id}
+        if self.parent_request_id is not None:
+            out["parent_request_id"] = self.parent_request_id
+        if self.agent_role is not None:
+            out["agent_role"] = self.agent_role
+        return out
+
     def __enter__(self) -> "RequestTrace":
         _emit(
             "request_start",
-            request_id=self.request_id,
+            **self._base_fields(),
             model=self._model,
             prompt_head=_redact(self._prompt_head, max_str=300),
         )
@@ -141,7 +160,7 @@ class RequestTrace:
             self._error = f"{type(exc).__name__}: {exc}"
         _emit(
             "request_end",
-            request_id=self.request_id,
+            **self._base_fields(),
             wall_ms=int((time.monotonic() - self._t0) * 1000),
             stop_reason=self._stop_reason,
             error=self._error,
@@ -156,7 +175,7 @@ class RequestTrace:
     def round_start(self, round_i: int, messages_len: int) -> None:
         _emit(
             "round_start",
-            request_id=self.request_id,
+            **self._base_fields(),
             round_i=round_i,
             messages_len=messages_len,
         )
@@ -166,7 +185,7 @@ class RequestTrace:
                   usage: dict | None) -> None:
         _emit(
             "round_end",
-            request_id=self.request_id,
+            **self._base_fields(),
             round_i=round_i,
             stop_reason=stop_reason,
             n_text=n_text,
@@ -179,7 +198,7 @@ class RequestTrace:
                   output: Any, latency_ms: int) -> None:
         _emit(
             "tool_call",
-            request_id=self.request_id,
+            **self._base_fields(),
             round_i=round_i,
             name=name,
             input_keys=sorted((input or {}).keys()),

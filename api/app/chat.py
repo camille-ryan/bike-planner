@@ -10,10 +10,11 @@ chat and Claude Desktop see the exact same tool set.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
-from typing import Any, Iterator
+from typing import Any, AsyncIterator
 
 import anthropic
 from fastapi import APIRouter, HTTPException
@@ -26,23 +27,30 @@ from .tracing import RequestTrace
 
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-sonnet-5")
 CHAT_MAX_TOOL_ROUNDS = int(os.environ.get("CHAT_MAX_TOOL_ROUNDS", "30"))
+# Bound how many segment sub-agents run concurrently. 5 keeps us well
+# under Anthropic's RPM / TPM limits for typical accounts and matches
+# the flagship corridor size (Graz→CPH normally decomposes to 5-7
+# hub-to-hub segments).
+MAX_PARALLEL_AGENTS = int(os.environ.get("MAX_PARALLEL_AGENTS", "5"))
 
 router = APIRouter()
 
-_client: anthropic.Anthropic | None = None
+# Async client — needed for the multi-agent fan-out. Single-agent
+# path uses it too so we don't maintain two client lifecycles.
+_client: anthropic.AsyncAnthropic | None = None
 
 
-def _get_client() -> anthropic.Anthropic:
+def _get_client() -> anthropic.AsyncAnthropic:
     global _client
     if _client is None:
         key = os.environ.get("ANTHROPIC_API_KEY")
         if not key:
             raise HTTPException(500, "ANTHROPIC_API_KEY not set in the API container's env")
         # Per-request timeout so a stalled upstream can't hang the SSE
-        # loop indefinitely. 120s covers even long extended-thinking
-        # rounds; anything longer than that is a genuine failure the
-        # client should see quickly.
-        _client = anthropic.Anthropic(api_key=key, timeout=240.0)
+        # loop indefinitely. 240 s covers long extended-thinking rounds;
+        # anything longer than that is a genuine failure the client
+        # should see quickly.
+        _client = anthropic.AsyncAnthropic(api_key=key, timeout=240.0)
     return _client
 
 
@@ -83,6 +91,11 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
+    # "single" (default) or "multiagent". When "multiagent", the
+    # request is routed to `multiagent.run_multiagent_plan`, which
+    # decomposes the corridor into a supervisor + N segment sub-
+    # agents running in parallel. Single-agent path is unchanged.
+    mode: str | None = None
 
 
 SYSTEM_PROMPT = """You are a bike-touring co-planner for a route spanning Austria, Czechia, Germany, and Denmark. The user is planning a Graz → Copenhagen tour (they can also plan sub-trips within that corridor).
@@ -141,8 +154,15 @@ Style:
   Internal reasoning is fine ("I need to check…"), but reference user concepts (cities, days, trains, waypoints), not implementation."""
 
 
-def _sse(event: str, data: Any) -> bytes:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+def _sse(event: str, data: Any, *, agent_id: str | None = None) -> bytes:
+    """SSE frame. When `agent_id` is passed, it's merged into the JSON
+    payload so the frontend can route the event to the right agent
+    bubble in the multi-agent view. Single-agent path passes
+    `agent_id="main"`; the multi-agent path passes each sub-agent's
+    id ("supervisor", "seg[3]", …). Frontend defaults to a single
+    bubble when the field is absent, keeping legacy behavior."""
+    payload = data if agent_id is None else {**data, "agent_id": agent_id}
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
 
 
 def _msg_to_api(m: ChatMessage) -> dict:
@@ -183,13 +203,34 @@ def _prompt_head(messages: list[dict]) -> str:
     return ""
 
 
-def _run_chat(req: ChatRequest, client: anthropic.Anthropic) -> Iterator[bytes]:
+async def _run_chat(
+    req: ChatRequest, client: anthropic.AsyncAnthropic,
+) -> AsyncIterator[bytes]:
     messages: list[dict] = [_msg_to_api(m) for m in req.messages]
+
+    # Multi-agent dispatch: hand off to the fan-out coordinator, which
+    # produces its own SSE stream (agent_start/agent_end + agent_id-
+    # tagged events) and manages its own child RequestTraces.
+    if req.mode == "multiagent":
+        from . import multiagent
+        with RequestTrace(model=CHAT_MODEL,
+                          prompt_head=_prompt_head(messages),
+                          agent_role="coordinator") as tr:
+            try:
+                async for chunk in multiagent.run_multiagent_plan(
+                    messages, client, tr,
+                ):
+                    yield chunk
+            except Exception as exc:
+                tr.set_error(f"{type(exc).__name__}: {exc}")
+                yield _sse("error", {"message": _friendly_error(exc)})
+        return
 
     with RequestTrace(model=CHAT_MODEL,
                       prompt_head=_prompt_head(messages)) as tr:
         try:
-            yield from _run_chat_inner(client, messages, tr)
+            async for chunk in _run_chat_inner(client, messages, tr):
+                yield chunk
         except Exception as exc:
             # Never let a mid-stream exception crash the SSE with no
             # signal to the client — emit a clean `event: error` and
@@ -198,24 +239,52 @@ def _run_chat(req: ChatRequest, client: anthropic.Anthropic) -> Iterator[bytes]:
             yield _sse("error", {"message": _friendly_error(exc)})
 
 
-def _cached_system() -> list[dict]:
+def _cached_system(prompt: str = None) -> list[dict]:
     """System prompt as a single cacheable block. Anthropic caches
     the prefix up to and including the cache_control breakpoint;
-    since SYSTEM_PROMPT is stable, marking it once means every round
+    since the prompt is stable, marking it once means every round
     after the first pays a fraction of the input-token cost and
-    lands the tokens faster."""
+    lands the tokens faster.
+
+    Optional `prompt` swaps in a role-specific prompt (supervisor /
+    segment / merge) for the multi-agent path. Each role gets its
+    own cached prefix keyed by the prompt content; sub-agents in
+    the same role share the cache write.
+    """
     return [{
         "type": "text",
-        "text": SYSTEM_PROMPT,
+        "text": prompt if prompt is not None else SYSTEM_PROMPT,
         "cache_control": {"type": "ephemeral"},
     }]
 
 
-def _cached_tools() -> list[dict]:
+def _cached_tools(tool_names: list[str] | None = None,
+                  extra_tools: list[dict] | None = None) -> list[dict]:
     """Tool schemas with a cache breakpoint at the last tool — that
-    caches the entire tool list. ~2.6k input tokens re-sent every
-    round; caching them collapses that."""
-    out = [dict(t) for t in TOOLS]
+    caches the entire tool list.
+
+    `tool_names` narrows the surface from the shared `TOOLS` list for
+    a role-scoped agent (supervisor sees only search / rail; a
+    segment agent sees the routing subset).
+
+    `extra_tools` appends AGENT-LOCAL tool schemas that aren't in the
+    shared registry. Multi-agent uses this for `finalize_segment_plan`
+    (supervisor) and `submit_segment` (each segment) — those must NOT
+    live in the global `TOOLS` because N agents run concurrently and
+    a global mutation would race.
+    """
+    if tool_names is None:
+        selected = list(TOOLS)
+    else:
+        by_name = {t["name"]: t for t in TOOLS}
+        selected = [by_name[n] for n in tool_names if n in by_name]
+    if extra_tools:
+        selected.extend(extra_tools)
+    if not selected:
+        # Defensive: an empty tools list would violate the Anthropic
+        # request schema. Return the full set as fallback.
+        selected = list(TOOLS)
+    out = [dict(t) for t in selected]
     out[-1] = {**out[-1], "cache_control": {"type": "ephemeral"}}
     return out
 
@@ -258,11 +327,37 @@ def _shift_message_cache_breakpoint(messages: list[dict]) -> None:
             block["cache_control"] = {"type": "ephemeral"}
 
 
-def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
-                    tr: RequestTrace) -> Iterator[bytes]:
-    system_blocks = _cached_system()
-    tools_cached = _cached_tools()
-    for round_i in range(CHAT_MAX_TOOL_ROUNDS):
+async def _run_chat_inner(
+    client: anthropic.AsyncAnthropic, messages: list[dict],
+    tr: RequestTrace,
+    *,
+    agent_id: str = "main",
+    system_prompt: str | None = None,
+    tool_names: list[str] | None = None,
+    max_rounds: int | None = None,
+    extra_tools: list[dict] | None = None,
+    extra_impls: dict[str, Any] | None = None,
+) -> AsyncIterator[bytes]:
+    """Async tool loop backing the /chat SSE endpoint. Also the
+    reusable per-agent runner for the multi-agent path: pass
+    `agent_id` + a scoped `system_prompt` + `tool_names` subset and
+    it drives one supervisor or segment agent inside the shared
+    coordinator stream. `max_rounds` overrides the process-level
+    cap for per-agent budgets.
+
+    `extra_tools` + `extra_impls` are per-invocation additions to the
+    shared tool registry. Multi-agent uses them for the terminal
+    tools (`finalize_segment_plan`, `submit_segment`) that are agent-
+    scoped and MUST NOT enter the shared registry — N segment agents
+    run concurrently and a global mutation would race.
+    """
+    system_blocks = _cached_system(system_prompt or SYSTEM_PROMPT)
+    tools_cached = _cached_tools(tool_names, extra_tools=extra_tools)
+    rounds_cap = max_rounds if max_rounds is not None else CHAT_MAX_TOOL_ROUNDS
+    loop = asyncio.get_running_loop()
+    local_impls = dict(extra_impls or {})
+
+    for round_i in range(rounds_cap):
         tr.round_start(round_i, messages_len=len(messages))
         _shift_message_cache_breakpoint(messages)
         # `round_start` marks a new LLM round to the client. Two jobs:
@@ -272,21 +367,22 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
         # frontend to start a fresh assistant bubble so text and tool
         # rows from consecutive rounds interleave visually instead of
         # piling into one giant paragraph followed by every tool call.
-        yield _sse("round_start", {"round_i": round_i})
+        yield _sse("round_start", {"round_i": round_i}, agent_id=agent_id)
         # `time.monotonic()`, not `time.time()` — WSL2's wall clock
         # can jump backward on VM resume, which produced negative
         # latency_ms values on the first Phase 6 smoke run.
         t_round = time.monotonic()
-        with client.messages.stream(
+        async with client.messages.stream(
             model=CHAT_MODEL,
             max_tokens=16384,
             system=system_blocks,
             tools=tools_cached,
             messages=messages,
         ) as stream:
-            for event in stream:
+            async for event in stream:
                 if event.type == "text":
-                    yield _sse("text", {"delta": event.text})
+                    yield _sse("text", {"delta": event.text},
+                               agent_id=agent_id)
                 else:
                     # Non-text SDK events (content_block_start,
                     # input_json deltas for tool_use, block_stop,
@@ -297,7 +393,7 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
                     # doesn't trip during long silent phases (e.g.
                     # tool_use input generation, extended thinking).
                     yield b": tick\n\n"
-            final = stream.get_final_message()
+            final = await stream.get_final_message()
 
         n_text = sum(1 for b in final.content if b.type == "text")
         n_tool = sum(1 for b in final.content if b.type == "tool_use")
@@ -319,7 +415,7 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
             latency_ms=round_ms,
             usage=usage_dict,
         )
-        print(f"[chat] {tr.request_id} round {round_i+1}/{CHAT_MAX_TOOL_ROUNDS}"
+        print(f"[chat] {tr.request_id} round {round_i+1}/{rounds_cap}"
               f" stop={final.stop_reason} text={n_text} tools={n_tool}"
               f" {round_ms}ms",
               flush=True)
@@ -341,9 +437,10 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
                     "The model hit its per-turn max_tokens without "
                     "finishing the answer. Raise max_tokens in chat.py "
                     "or ask for a smaller scope."
-                )})
+                )}, agent_id=agent_id)
             tr.set_stop_reason(str(final.stop_reason))
-            yield _sse("done", {"stop_reason": final.stop_reason})
+            yield _sse("done", {"stop_reason": final.stop_reason},
+                       agent_id=agent_id)
             return
 
         tool_uses = [b for b in final.content if b.type == "tool_use"]
@@ -358,14 +455,20 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
                 "id":    tu.id,
                 "name":  tu.name,
                 "input": tu.input,
-            })
+            }, agent_id=agent_id)
             t_tool = time.monotonic()
-            impl = TOOL_IMPLS.get(tu.name)
+            # Look up impls with per-invocation locals overriding the
+            # shared registry, so agent-scoped terminal tools land
+            # here without leaking into concurrent agents' loops.
+            impl = local_impls.get(tu.name) or TOOL_IMPLS.get(tu.name)
             if impl is None:
                 result = {"error": f"unknown tool: {tu.name}"}
             else:
                 try:
-                    result = impl(tu.input)
+                    # Run sync tool in a thread so we don't block the
+                    # event loop. Matters for the multi-agent path
+                    # where N sub-agents share one loop.
+                    result = await loop.run_in_executor(None, impl, tu.input)
                 except Exception as e:
                     result = {"error": f"{type(e).__name__}: {e}"}
             tool_ms = int((time.monotonic() - t_tool) * 1000)
@@ -381,7 +484,7 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
             # summarized version to keep its context small.
             yield _sse("tool_call", {
                 "id": tu.id, "name": tu.name, "input": tu.input, "output": result,
-            })
+            }, agent_id=agent_id)
             llm_result = _strip_bulk_for_llm(tu.name, result)
             tool_results.append({
                 "type": "tool_result",
@@ -391,19 +494,19 @@ def _run_chat_inner(client: anthropic.Anthropic, messages: list[dict],
         messages.append({"role": "user", "content": tool_results})
 
     tr.set_stop_reason("max_rounds")
-    print(f"[chat] {tr.request_id} hit CHAT_MAX_TOOL_ROUNDS="
-          f"{CHAT_MAX_TOOL_ROUNDS} without a final text response",
+    print(f"[chat] {tr.request_id} hit tool-loop cap {rounds_cap}"
+          f" without a final text response",
           flush=True)
     yield _sse("error", {"message": (
-        f"Ran out of tool-loop rounds ({CHAT_MAX_TOOL_ROUNDS}) before "
+        f"Ran out of tool-loop rounds ({rounds_cap}) before "
         f"finishing the plan. Try a narrower prompt, or raise "
         f"CHAT_MAX_TOOL_ROUNDS in api/.env and restart the api."
-    )})
-    yield _sse("done", {"stop_reason": "max_rounds"})
+    )}, agent_id=agent_id)
+    yield _sse("done", {"stop_reason": "max_rounds"}, agent_id=agent_id)
 
 
 @router.post("/chat")
-def chat(req: ChatRequest):
+async def chat(req: ChatRequest):
     # Resolve the API key BEFORE starting the streaming response — an
     # HTTPException raised mid-stream would just close the socket with no
     # visible error to the client. Fail cleanly here instead.
