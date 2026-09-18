@@ -182,6 +182,16 @@ function _agentBubbleDone(role, data) {
 function handleAgentStart(data) {
   const agentId = data.agent_id;
   if (!agentId || agentBubbles.has(agentId)) return;
+  // Supervisor firing means a FRESH plan is starting. If old segment
+  // state is on the map from a previous plan, clear it now so new
+  // `segment_committed` events populate a clean slate. Enrichment /
+  // extract / ask flows don't fire the supervisor and leave the
+  // map intact.
+  if (data.role === "supervisor"
+      && (chatRoutePolylines.size > 0 || chatStagesByLeg.size > 0)) {
+    clearChatRouteLayer();
+    clearChatStagesLayer();
+  }
   const container = document.createElement("div");
   container.className = `chat-agent-bubble role-${data.role}`;
   const header = document.createElement("div");

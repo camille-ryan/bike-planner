@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re as _re
 import time
 from typing import Any, AsyncIterator
 
@@ -422,6 +423,21 @@ async def run_multiagent_plan(
                     if fr == spec.from_ref and to == spec.to_ref:
                         polyline = _ROUTE_CACHE[key]
                         break
+            # Stitch detection: a precise polyline should follow real
+            # roads with consecutive-point spacing well under 1 km.
+            # A big straight-line gap between consecutive points means
+            # the router couldn't route across that gap and stitched
+            # it as a straight segment — always a bug worth logging.
+            stitches = _detect_stitches(polyline, threshold_km=0.3)
+            if stitches:
+                print(f"[stitch] segment {spec.segment_i} "
+                      f"({spec.from_name} → {spec.to_name}): "
+                      f"{len(stitches)} stitch(es)", flush=True)
+                for s in stitches[:5]:
+                    print(f"[stitch]   km={s['km']:.1f}  "
+                          f"from=({s['from'][0]:.4f},{s['from'][1]:.4f}) "
+                          f"to=({s['to'][0]:.4f},{s['to'][1]:.4f})",
+                          flush=True)
             overnights_out = []
             for i, ov in enumerate(result.overnights):
                 overnights_out.append({
@@ -439,6 +455,7 @@ async def run_multiagent_plan(
                 "overnights": overnights_out,
                 "polyline":   polyline,
                 "status":     status,
+                "stitches":   stitches,  # frontend can badge if > 0
             }))
 
         await queue.put(_sse("agent_end", {
@@ -568,48 +585,95 @@ def _assemble_merged_plan(plan, ordered_results) -> list[str]:
     return lines
 
 
-_LODGING_PREF_KEYWORDS = (
+# Preference keywords, matched as WHOLE WORDS (not substrings), so
+# "Europe" doesn't false-trigger via "eur" and "carpet" doesn't
+# false-trigger via "pet". Compiled once for cheap re-use.
+_LODGING_PREF_WORDS = [
     # Tier
-    "budget", "cheap", "affordable", "backpack", "hostel", "guest house",
-    "guest-house", "guesthouse",
-    "mid-range", "midrange", "moderate", "3-star", "3 star", "3star",
-    "4-star", "4 star", "4star", "5-star", "5 star", "5star",
-    "luxury", "upscale", "high-end", "boutique",
+    "budget", "cheap", "affordable", "backpacker", "hostel",
+    "guesthouse", "guest-house", "b&b", "bnb", "airbnb",
+    "midrange", "mid-range", "moderate", "3-star", "4-star", "5-star",
+    "luxury", "upscale", "boutique", "high-end",
     # Amenities
-    "family", "kids", "children", "wifi", "wi-fi", "parking", "pet",
-    "pet-friendly", "pets", "kitchen", "kitchenette", "breakfast",
-    "spa", "pool", "gym", "laundry",
+    "wifi", "wi-fi", "parking", "pet-friendly", "kitchenette",
+    "breakfast", "kitchen", "family-friendly", "spa", "gym",
     # Style
-    "airbnb", "b&b", "bnb", "bed and breakfast", "cabin", "camping",
-    "campground",
-    # Price cues
-    "under", "cheap", "€", "$", "eur", "usd", "per night",
+    "camping", "campground", "cabin", "hotel",
+]
+# Regex with \b word boundaries, case-insensitive. Some entries have
+# non-word chars (hyphens, ampersand), so we escape and wrap.
+_LODGING_PREF_RE = _re.compile(
+    r"(?<!\w)(" + "|".join(_re.escape(w) for w in _LODGING_PREF_WORDS) + r")(?!\w)",
+    _re.IGNORECASE,
 )
 
 
 def _detect_lodging_prefs(messages: list[dict]) -> str | None:
-    """Scan the whole conversation for any lodging-preference keyword.
-    Returns a short comma-separated summary of matched keywords, or
-    None if nothing preference-y is present.
+    """Scan the LAST USER message for lodging-preference words. If
+    the user only said "book lodging", nothing matches → we ask.
+    "book budget hostels" or "3-star hotels with parking" →
+    matches list feeds the LodgingAgent.
 
-    Idea: a plain "book lodging" carries no preferences → we ask.
-    "book budget hostels" or an earlier "50/night, kitchen preferred"
-    → we skip the ask and pass the prefs into the LodgingAgent."""
-    matches: list[str] = []
-    for m in messages:
-        content = m.get("content")
-        text = ""
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            for b in content:
-                if isinstance(b, dict) and b.get("type") == "text":
-                    text += " " + b.get("text", "")
-        text_lc = text.lower()
-        for kw in _LODGING_PREF_KEYWORDS:
-            if kw in text_lc and kw not in matches:
-                matches.append(kw)
-    return ", ".join(matches) if matches else None
+    Scans only the last user message to avoid false positives from
+    prior segment narratives ("family-owned hotel") or hub names
+    (e.g. Airbnb-style town names hypothetically). If the user said
+    it in an earlier turn and it hit the ask flow then, they've now
+    replied with prefs and this scan will catch them."""
+    if not messages:
+        return None
+    last = messages[-1]
+    if last.get("role") != "user":
+        return None
+    content = last.get("content")
+    text = ""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                text += " " + b.get("text", "")
+    # De-duplicate matches while preserving order.
+    seen: list[str] = []
+    for m in _LODGING_PREF_RE.finditer(text):
+        w = m.group(1).lower()
+        # "hotel" is a weak signal by itself — user says "book hotels"
+        # just to trigger enrichment. Ignore it unless something more
+        # specific also matched.
+        if w == "hotel":
+            continue
+        if w not in seen:
+            seen.append(w)
+    return ", ".join(seen) if seen else None
+
+
+def _detect_stitches(polyline, threshold_km: float = 0.3) -> list[dict]:
+    """Scan a precise polyline for consecutive-point gaps that are
+    LARGER than any real road-graph edge should be. Precise polylines
+    follow OSM way geometry where consecutive vertices are typically
+    5-50 m apart even on straight roads; any gap over 300 m is the
+    router giving up and stitching two disconnected parts with a
+    straight line. **Any stitch is always a bug worth logging** —
+    per user directive 2026-09-18: "stitches are ALWAYS BAD."
+    Returns a list of `{i, from, to, km}` records."""
+    if not polyline or len(polyline) < 2:
+        return []
+    import math
+    R = 6371.0
+    out: list[dict] = []
+    for i in range(1, len(polyline)):
+        a = polyline[i - 1]
+        b = polyline[i]
+        try:
+            lat1, lat2 = math.radians(a[1]), math.radians(b[1])
+            dlat = lat2 - lat1
+            dlon = math.radians(b[0] - a[0])
+            h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+            km = 2 * R * math.asin(math.sqrt(h))
+        except (TypeError, IndexError, ValueError):
+            continue
+        if km > threshold_km:
+            out.append({"i": i, "from": [a[0], a[1]], "to": [b[0], b[1]], "km": round(km, 2)})
+    return out
 
 
 def _coord_of_ref(ref: str | None) -> list[float] | None:
@@ -627,7 +691,6 @@ def _coord_of_ref(ref: str | None) -> list[float] | None:
     return [float(c["lon"]), float(c["lat"])]
 
 
-import re as _re
 _DAY_KW_RE = _re.compile(r"\bDay\s+(\d+)\b", flags=_re.IGNORECASE)
 # Match table body rows whose FIRST cell is an integer (a day
 # column). Avoids over-matching km values elsewhere in the row.
