@@ -40,6 +40,73 @@ if (!formEl || !inputEl || !sendBtn) {
 let history = [];
 let inflight = null;
 
+// ---------- Session spend tracking ----------
+// Every LLM round the backend emits a `usage` SSE event with the
+// four token counts. Multiply by the current model's per-M-token
+// prices and accumulate a running $ total for the browser session.
+// Rates from Anthropic's public pricing for Sonnet 5 as of 2026:
+//   input:       $3    / 1M tokens
+//   output:      $15   / 1M tokens
+//   cache_write: $3.75 / 1M tokens (1.25× input)
+//   cache_read:  $0.30 / 1M tokens (0.1×  input)
+// If you switch models (or Anthropic revises pricing), update here.
+const SPEND_RATES = {
+  input:       3.00e-6,
+  output:     15.00e-6,
+  cache_write: 3.75e-6,
+  cache_read:  0.30e-6,
+};
+const sessionSpend = { usd: 0, in_tok: 0, out_tok: 0, cw_tok: 0, cr_tok: 0 };
+const spendUsdEl    = document.getElementById("chat-spend-usd");
+const spendDetailEl = document.getElementById("chat-spend-detail");
+
+function _fmtUsd(v) {
+  return v < 0.01 ? `<$0.01` : `$${v.toFixed(2)}`;
+}
+
+function _fmtTokShort(n) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000)     return `${(n / 1_000).toFixed(0)}k`;
+  return String(n);
+}
+
+function _renderSpend() {
+  if (spendUsdEl) spendUsdEl.textContent = _fmtUsd(sessionSpend.usd);
+  if (spendDetailEl) {
+    const total = sessionSpend.in_tok + sessionSpend.out_tok
+                + sessionSpend.cw_tok + sessionSpend.cr_tok;
+    spendDetailEl.textContent = total > 0
+      ? ` · ${_fmtTokShort(total)} tokens`
+      : "";
+  }
+}
+
+function handleUsage(data) {
+  const inp = data.input       || 0;
+  const out = data.output      || 0;
+  const cw  = data.cache_write || 0;
+  const cr  = data.cache_read  || 0;
+  const cost =
+      inp * SPEND_RATES.input
+    + out * SPEND_RATES.output
+    + cw  * SPEND_RATES.cache_write
+    + cr  * SPEND_RATES.cache_read;
+  sessionSpend.usd    += cost;
+  sessionSpend.in_tok += inp;
+  sessionSpend.out_tok+= out;
+  sessionSpend.cw_tok += cw;
+  sessionSpend.cr_tok += cr;
+  _renderSpend();
+}
+
+function resetSpend() {
+  sessionSpend.usd = 0;
+  sessionSpend.in_tok = sessionSpend.out_tok = 0;
+  sessionSpend.cw_tok = sessionSpend.cr_tok = 0;
+  _renderSpend();
+}
+_renderSpend();
+
 // Detect the user's unit preference from their first message so map
 // pins + GPX names match. Cached across the session; recomputed only
 // when the log is cleared (Reset button).
@@ -1092,6 +1159,10 @@ async function streamChat(userText) {
           handleToolResult(ev.data.name, ev.data.input, ev.data.output, agentId);
           toolCount += 1;
           tickStatus();
+        } else if (ev.event === "usage") {
+          // Per-round token count from an LLM call; feeds the
+          // session spend badge in the chat header.
+          handleUsage(ev.data);
         } else if (ev.event === "segment_committed") {
           // Coordinator's per-segment commit: renumbered overnights +
           // final polyline. This is the SINGLE place segment map
@@ -1326,6 +1397,7 @@ resetBtn.addEventListener("click", () => {
     if (map.getSource("chat-route")) map.getSource("chat-route").setData({ type: "FeatureCollection", features: [] });
     if (map.getSource("chat-stages")) map.getSource("chat-stages").setData({ type: "FeatureCollection", features: [] });
   }
+  resetSpend();
 });
 
 if (saveBtn) {

@@ -490,6 +490,16 @@ async def _run_chat_inner(
             latency_ms=round_ms,
             usage=usage_dict,
         )
+        # Frontend cost badge — one `usage` SSE per LLM round with
+        # the four token counts. Frontend multiplies by the model's
+        # per-token prices and accumulates a session total.
+        if usage_dict:
+            yield _sse("usage", {
+                "input":       usage_dict.get("input_tokens") or 0,
+                "output":      usage_dict.get("output_tokens") or 0,
+                "cache_write": usage_dict.get("cache_creation_input_tokens") or 0,
+                "cache_read":  usage_dict.get("cache_read_input_tokens") or 0,
+            }, agent_id=agent_id)
         print(f"[chat] {tr.request_id} round {round_i+1}/{rounds_cap}"
               f" stop={final.stop_reason} text={n_text} tools={n_tool}"
               f" {round_ms}ms",
