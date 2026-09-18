@@ -155,6 +155,8 @@ footer code { background: #efefef; padding: 0 0.2rem; border-radius: 2px; }
 }
 .chat-agent-bubble.role-supervisor { border-color: #b7a4d9; background: #f7f2fb; }
 .chat-agent-bubble.role-merge      { border-color: #9dc8a5; background: #f2f9f3; }
+.chat-agent-bubble.role-ask        { border-color: #c9a06e; background: #fdf6ec; }
+.chat-agent-bubble.role-extract    { border-color: #b3b8c2; background: #f2f3f5; }
 .chat-agent-bubble.done            { border-style: solid; }
 .chat-agent-bubble.failed          { border-color: #d97878; background: #fbf1f1; }
 

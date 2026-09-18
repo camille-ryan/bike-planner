@@ -568,6 +568,50 @@ def _assemble_merged_plan(plan, ordered_results) -> list[str]:
     return lines
 
 
+_LODGING_PREF_KEYWORDS = (
+    # Tier
+    "budget", "cheap", "affordable", "backpack", "hostel", "guest house",
+    "guest-house", "guesthouse",
+    "mid-range", "midrange", "moderate", "3-star", "3 star", "3star",
+    "4-star", "4 star", "4star", "5-star", "5 star", "5star",
+    "luxury", "upscale", "high-end", "boutique",
+    # Amenities
+    "family", "kids", "children", "wifi", "wi-fi", "parking", "pet",
+    "pet-friendly", "pets", "kitchen", "kitchenette", "breakfast",
+    "spa", "pool", "gym", "laundry",
+    # Style
+    "airbnb", "b&b", "bnb", "bed and breakfast", "cabin", "camping",
+    "campground",
+    # Price cues
+    "under", "cheap", "€", "$", "eur", "usd", "per night",
+)
+
+
+def _detect_lodging_prefs(messages: list[dict]) -> str | None:
+    """Scan the whole conversation for any lodging-preference keyword.
+    Returns a short comma-separated summary of matched keywords, or
+    None if nothing preference-y is present.
+
+    Idea: a plain "book lodging" carries no preferences → we ask.
+    "book budget hostels" or an earlier "50/night, kitchen preferred"
+    → we skip the ask and pass the prefs into the LodgingAgent."""
+    matches: list[str] = []
+    for m in messages:
+        content = m.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    text += " " + b.get("text", "")
+        text_lc = text.lower()
+        for kw in _LODGING_PREF_KEYWORDS:
+            if kw in text_lc and kw not in matches:
+                matches.append(kw)
+    return ", ".join(matches) if matches else None
+
+
 def _coord_of_ref(ref: str | None) -> list[float] | None:
     """Anchor ref → [lon, lat] via the loaded profile. Used to attach
     coords to overnights in `segment_committed` events."""
@@ -637,8 +681,42 @@ async def run_enrichment_followup(
     bool flags — the caller (chat._run_chat) parses which the user
     asked for so we don't spawn agents for the other kind. Both True
     if omitted (legacy call path)."""
+    from .chat import _sse
+
     if scope is None:
         scope = {"lodging": True, "transit": True}
+
+    # Before spawning any lodging agents, check whether the user has
+    # expressed preferences (budget / mid-range / hostel / etc.). If
+    # not, ask ONCE and skip lodging this turn — a plain "book lodging"
+    # is too eager without knowing what the user wants. Preferences
+    # detected in the CURRENT user message OR anywhere in the prior
+    # conversation (so we don't re-ask if they mentioned it earlier).
+    lodging_prefs = _detect_lodging_prefs(user_messages)
+    if scope.get("lodging") and not lodging_prefs:
+        yield _sse("agent_start", {
+            "role": "ask", "from_name": None, "to_name": None,
+        }, agent_id="ask-prefs")
+        prompt_text = (
+            "Before I search hotels: what kind of lodging are you "
+            "looking for? A few examples:\n\n"
+            "- **Budget** (hostels, guest houses, under €50/night)\n"
+            "- **Mid-range** (3-star hotels, ~€70-120/night)\n"
+            "- **Upscale** (4-5 star, boutique)\n"
+            "- **Family-friendly** / with kitchen / with parking / "
+            "pet-friendly\n\n"
+            "Reply with your preference (e.g. \"budget hostels\" or "
+            "\"3-star hotels with parking\") and I'll pick options for "
+            "each overnight."
+        )
+        # Stream the ask as text so the frontend renders it under the
+        # ask-prefs bubble.
+        yield _sse("text", {"delta": prompt_text}, agent_id="ask-prefs")
+        yield _sse("agent_end", {
+            "role": "ask", "status": "ok",
+        }, agent_id="ask-prefs")
+        yield _sse("done", {"stop_reason": "end_turn"})
+        return
     from .chat import _run_chat_inner, _sse
     from . import enrichment, trunk_router
     from .settings import DEFAULT_PROFILE
@@ -712,6 +790,7 @@ async def run_enrichment_followup(
 
     async for chunk in enrichment.run_enrichment_stage(
         enriched, client, parent_trace, scope=scope,
+        lodging_prefs=lodging_prefs,
     ):
         yield chunk
 

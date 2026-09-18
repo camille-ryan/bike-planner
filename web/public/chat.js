@@ -138,6 +138,8 @@ const agentBubbles = new Map();  // agent_id -> {container, header, textDiv, too
 function _agentBubbleTitle(role, data) {
   if (role === "supervisor") return "▸ Planning corridor…";
   if (role === "merge")      return "▸ Merging plan…";
+  if (role === "ask")        return "▸ Need a bit more info";
+  if (role === "extract")    return "▸ Reading the plan…";
   if (role === "segment") {
     const i    = data.segment_i;
     const from = data.from_name ?? "?";
@@ -158,6 +160,8 @@ function _agentBubbleDone(role, data) {
   const wall = data.wall_ms ? ` · ${(data.wall_ms / 1000).toFixed(1)}s` : "";
   if (role === "supervisor") return `${s} Corridor planned${wall}`;
   if (role === "merge")      return `${s} Plan complete${wall}`;
+  if (role === "ask")        return "▸ Awaiting your reply";
+  if (role === "extract")    return `${s} Read the plan${wall}`;
   if (role === "segment") {
     const i    = data.segment_i;
     const from = agentBubbles.get(`seg[${i}]`)?.headerData?.from_name ?? "?";
@@ -853,15 +857,12 @@ async function streamChat(userText) {
     chatUnitMode = detectUnitMode(userText);
   }
 
-  // Preserve the map on enrichment follow-ups — the user is asking
-  // for hotels or trains for the plan they already see, not a new
-  // plan. Wiping the route + pins would be a regression.
-  const isEnrichment = _isEnrichmentFollowup(userText);
-  if (!isEnrichment) {
-    // Reset the map layers we own so a fresh plan starts on a clean map.
-    clearChatRouteLayer();
-    clearChatStagesLayer();
-  }
+  // NEVER preemptively wipe the map. The map should reflect the
+  // MOST RECENT state — the segment_committed events overwrite
+  // polylines / pins by segment_i as they arrive, so an iteration
+  // ("fix the Wien-Praha stretch") replaces just that segment's
+  // slot and leaves the rest of the plan visible. Users can hit
+  // Reset to clear the whole session state.
 
   sendBtn.disabled = true;
   sendBtn.textContent = "Thinking…";

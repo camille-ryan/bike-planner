@@ -198,11 +198,14 @@ async def run_enrichment_stage(
     client: anthropic.AsyncAnthropic,
     parent_trace: RequestTrace,
     scope: dict | None = None,
+    lodging_prefs: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Fan out per-overnight LodgingAgent + per-consecutive-pair
     TransitAgent. `scope = {lodging, transit}` selects which kinds
     of sub-agents to run; both True by default. When the user asks
-    "book lodging" only, transit stays off."""
+    "book lodging" only, transit stays off. `lodging_prefs` is a
+    short summary of the user's lodging preferences (budget /
+    mid-range / amenities); LodgingAgent uses it to filter."""
     from .chat import _sse
 
     if not overnights:
@@ -250,7 +253,8 @@ async def run_enrichment_stage(
             async with sem:
                 await asyncio.wait_for(
                     _drain_lodging_agent(ov, client, parent_trace,
-                                         agent_id, queue),
+                                         agent_id, queue,
+                                         prefs=lodging_prefs),
                     timeout=ENRICHMENT_TIMEOUT_S,
                 )
         except asyncio.TimeoutError:
@@ -333,6 +337,7 @@ async def _drain_lodging_agent(
     ov: dict, client: anthropic.AsyncAnthropic,
     parent_trace: RequestTrace, agent_id: str,
     queue: asyncio.Queue[bytes | None],
+    prefs: str | None = None,
 ) -> None:
     from .chat import _run_chat_inner
 
@@ -340,10 +345,15 @@ async def _drain_lodging_agent(
     tool_names = ["search_lodging"]
 
     prompt = LODGING_PROMPT
+    prefs_line = (
+        f"\n\nUser lodging preferences: {prefs}"
+        if prefs else ""
+    )
     user_msg = (
         f"Overnight #{ov.get('day', '?')}: "
         f"{ov.get('name', '?')} (ref={ov.get('ref', '?')}). "
         f"Coordinates: {ov.get('lonlat', '?')}"
+        f"{prefs_line}"
     )
     messages = [{"role": "user", "content": user_msg}]
 
